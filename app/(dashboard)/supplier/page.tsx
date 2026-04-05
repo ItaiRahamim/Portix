@@ -1,92 +1,49 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import {
-  FileWarning,
-  XCircle,
-  Upload,
-  AlertTriangle,
-  Eye,
-  Plus,
-} from "lucide-react";
+import { FileWarning, XCircle, Upload, AlertTriangle, Eye, Plus } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
-import { DocumentUploadModal } from "@/components/document-upload-modal";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
-import {
-  mockContainers,
-  getShipment,
-  getImporter,
-  getProduct,
-  getDocumentsForContainer,
-  daysBetween,
-} from "@/lib/mock-data";
+import { getContainers } from "@/lib/db";
+import type { ContainerView } from "@/lib/supabase";
+
+function daysUntil(dateStr: string): number {
+  return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
+}
+
+function formatDate(dateStr: string): string {
+  return new Date(dateStr).toLocaleDateString("en-GB", {
+    day: "2-digit", month: "short", year: "numeric",
+  });
+}
 
 export default function SupplierDashboardPage() {
   const router = useRouter();
-  const [showUpload, setShowUpload] = useState(false);
+  const [containers, setContainers] = useState<ContainerView[]>([]);
+  const [loading, setLoading] = useState(true);
   const [newShipmentOpen, setNewShipmentOpen] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
 
-  const enrichedContainers = useMemo(() => {
-    return mockContainers.map((c) => {
-      const shipment = getShipment(c.shipmentId)!;
-      const importer = getImporter(shipment.importerId);
-      const product = getProduct(shipment.productId);
-      const docs = getDocumentsForContainer(c.id);
-      const requiredDocs = docs.length;
-      const uploadedDocs = docs.filter((d) => d.status !== "missing").length;
-      const rejectedDocs = docs.filter((d) => d.status === "rejected").length;
-      const missingDocs = docs.filter((d) => d.status === "missing").length;
-      const underReviewDocs = docs.filter((d) => d.status === "under-review").length;
-      const approvedDocs = docs.filter((d) => d.status === "approved").length;
+  const loadContainers = useCallback(async () => {
+    setLoading(true);
+    const data = await getContainers();
+    setContainers(data);
+    setLoading(false);
+  }, []);
 
-      let reviewStatus = "Pending";
-      if (rejectedDocs > 0) reviewStatus = "Has Rejections";
-      else if (approvedDocs === requiredDocs && requiredDocs > 0) reviewStatus = "All Approved";
-      else if (underReviewDocs > 0) reviewStatus = "Under Review";
-      else if (missingDocs === requiredDocs) reviewStatus = "Not Started";
+  useEffect(() => { loadContainers(); }, [loadContainers]);
 
-      let nextAction = "Upload missing docs";
-      if (rejectedDocs > 0) nextAction = "Replace rejected docs";
-      else if (missingDocs === 0 && approvedDocs < requiredDocs) nextAction = "Awaiting review";
-      else if (approvedDocs === requiredDocs) nextAction = "Complete";
-
-      const daysToArrival = daysBetween(c.eta);
-
-      return {
-        ...c,
-        shipmentId: shipment.id,
-        importerName: importer?.name || "",
-        productName: product?.name || "",
-        requiredDocs,
-        uploadedDocs,
-        rejectedDocs,
-        missingDocs,
-        reviewStatus,
-        nextAction,
-        daysToArrival,
-      };
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshKey]);
-
-  const totalMissing = enrichedContainers.reduce((sum, c) => sum + c.missingDocs, 0);
-  const totalRejected = enrichedContainers.reduce((sum, c) => sum + c.rejectedDocs, 0);
-  const awaitingReupload = totalRejected;
-  const urgentContainers = enrichedContainers.filter(
-    (c) => c.daysToArrival <= 7 && (c.missingDocs > 0 || c.rejectedDocs > 0)
+  // Computed KPI values
+  const totalMissing = containers.reduce((sum, c) => sum + (c.docs_total - c.docs_uploaded), 0);
+  const totalRejected = containers.reduce((sum, c) => sum + c.docs_rejected, 0);
+  const urgentContainers = containers.filter(
+    (c) => daysUntil(c.eta) <= 7 && (c.docs_total - c.docs_uploaded > 0 || c.docs_rejected > 0)
   ).length;
 
   return (
@@ -98,18 +55,13 @@ export default function SupplierDashboardPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <KPICard label="Missing Documents" value={totalMissing} icon={FileWarning} color="text-gray-600" iconColor="text-gray-500" />
         <KPICard label="Rejected Documents" value={totalRejected} icon={XCircle} color="text-red-600" iconColor="text-red-600" />
-        <KPICard label="Awaiting Re-upload" value={awaitingReupload} icon={Upload} color="text-orange-600" iconColor="text-orange-500" />
+        <KPICard label="Awaiting Re-upload" value={totalRejected} icon={Upload} color="text-orange-600" iconColor="text-orange-500" />
         <KPICard label="Urgent Containers" value={urgentContainers} icon={AlertTriangle} color="text-amber-600" iconColor="text-amber-500" />
       </div>
 
       <div className="flex justify-end gap-2 mb-4">
-        <Button variant="outline" onClick={() => setShowUpload(true)} className="gap-1.5">
-          <Upload className="w-4 h-4" />
-          Upload Document
-        </Button>
         <Button onClick={() => setNewShipmentOpen(true)} className="gap-1.5">
-          <Plus className="w-4 h-4" />
-          New Shipment
+          <Plus className="w-4 h-4" /> New Shipment
         </Button>
       </div>
 
@@ -118,105 +70,129 @@ export default function SupplierDashboardPage() {
           <CardTitle className="text-base">Containers</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Container Number</TableHead>
-                  <TableHead>Shipment ID</TableHead>
-                  <TableHead>Importer</TableHead>
-                  <TableHead>Product</TableHead>
-                  <TableHead>ETA</TableHead>
-                  <TableHead className="text-center">Required Docs</TableHead>
-                  <TableHead>Uploaded Docs</TableHead>
-                  <TableHead>Review Status</TableHead>
-                  <TableHead className="text-center">Rejected</TableHead>
-                  <TableHead>Next Action</TableHead>
-                  <TableHead>Action</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {enrichedContainers.map((c) => (
-                  <TableRow key={c.id} className="cursor-pointer hover:bg-gray-50" onClick={() => router.push(`/supplier/containers/${c.id}`)}>
-                    <TableCell className="whitespace-nowrap">{c.containerNumber}</TableCell>
-                    <TableCell className="whitespace-nowrap text-sm text-gray-500">{c.shipmentId}</TableCell>
-                    <TableCell className="text-sm">{c.importerName}</TableCell>
-                    <TableCell className="text-sm max-w-[130px] truncate">{c.productName}</TableCell>
-                    <TableCell className="text-sm whitespace-nowrap">
-                      <span className={c.daysToArrival <= 3 && c.daysToArrival > 0 ? "text-red-600" : ""}>
-                        {c.eta}
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-center">{c.requiredDocs}</TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-blue-500 rounded-full"
-                            style={{ width: `${c.requiredDocs > 0 ? (c.uploadedDocs / c.requiredDocs) * 100 : 0}%` }}
-                          />
-                        </div>
-                        <span className="text-xs text-gray-500">{c.uploadedDocs}/{c.requiredDocs}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <span className={`text-xs px-2 py-0.5 rounded ${
-                        c.reviewStatus === "All Approved" ? "bg-green-100 text-green-700"
-                        : c.reviewStatus === "Has Rejections" ? "bg-red-100 text-red-700"
-                        : c.reviewStatus === "Under Review" ? "bg-yellow-100 text-yellow-700"
-                        : c.reviewStatus === "Not Started" ? "bg-gray-100 text-gray-500"
-                        : "bg-gray-100 text-gray-700"
-                      }`}>
-                        {c.reviewStatus}
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-center">
-                      {c.rejectedDocs > 0 ? (
-                        <span className="text-red-600 text-sm">{c.rejectedDocs}</span>
-                      ) : (
-                        <span className="text-gray-400">0</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <span className={`text-xs ${
-                        c.nextAction === "Replace rejected docs" ? "text-red-600"
-                        : c.nextAction === "Complete" ? "text-green-600"
-                        : "text-gray-600"
-                      }`}>
-                        {c.nextAction}
-                      </span>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-                        <Button variant="outline" size="sm" onClick={() => router.push(`/supplier/containers/${c.id}`)}>
-                          <Eye className="w-3.5 h-3.5 mr-1" />
-                          View
-                        </Button>
-                        {c.missingDocs > 0 && (
-                          <Button variant="outline" size="sm" className="text-blue-600 border-blue-200" onClick={() => setShowUpload(true)}>
-                            <Upload className="w-3.5 h-3.5" />
-                          </Button>
-                        )}
-                        {c.rejectedDocs > 0 && (
-                          <Button variant="outline" size="sm" className="text-red-600 border-red-200" onClick={() => router.push(`/supplier/containers/${c.id}`)}>
-                            <XCircle className="w-3.5 h-3.5" />
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
+          {loading ? (
+            <div className="py-12 text-center text-gray-400 text-sm">Loading containers…</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Container</TableHead>
+                    <TableHead>Shipment</TableHead>
+                    <TableHead>Importer</TableHead>
+                    <TableHead>Product</TableHead>
+                    <TableHead>ETA</TableHead>
+                    <TableHead className="text-center">Required</TableHead>
+                    <TableHead>Uploaded</TableHead>
+                    <TableHead>Review Status</TableHead>
+                    <TableHead className="text-center">Rejected</TableHead>
+                    <TableHead>Next Action</TableHead>
+                    <TableHead>Action</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {containers.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={11} className="text-center py-10 text-gray-400">
+                        No containers assigned
+                      </TableCell>
+                    </TableRow>
+                  ) : containers.map((c) => {
+                    const docsMissing = c.docs_total - c.docs_uploaded;
+                    const docsPending = c.docs_uploaded - c.docs_approved - c.docs_rejected;
+                    const daysToArrival = daysUntil(c.eta);
+
+                    let reviewStatus = "Not Started";
+                    if (c.docs_rejected > 0) reviewStatus = "Has Rejections";
+                    else if (c.docs_approved === c.docs_total && c.docs_total > 0) reviewStatus = "All Approved";
+                    else if (docsPending > 0) reviewStatus = "Under Review";
+                    else if (c.docs_uploaded > 0) reviewStatus = "Pending";
+
+                    let nextAction = "Upload missing docs";
+                    if (c.docs_rejected > 0) nextAction = "Replace rejected docs";
+                    else if (docsMissing === 0 && c.docs_approved < c.docs_total) nextAction = "Awaiting review";
+                    else if (c.docs_approved === c.docs_total && c.docs_total > 0) nextAction = "Complete";
+
+                    return (
+                      <TableRow
+                        key={c.id}
+                        className="cursor-pointer hover:bg-gray-50"
+                        onClick={() => router.push(`/supplier/containers/${c.id}`)}
+                      >
+                        <TableCell className="whitespace-nowrap font-medium">{c.container_number}</TableCell>
+                        <TableCell className="whitespace-nowrap text-sm text-gray-500">{c.shipment_number}</TableCell>
+                        <TableCell className="text-sm">{c.importer_company}</TableCell>
+                        <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>
+                        <TableCell className="text-sm whitespace-nowrap">
+                          <span className={daysToArrival <= 3 && daysToArrival > 0 ? "text-red-600" : ""}>
+                            {formatDate(c.eta)}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-center text-sm">{c.docs_total}</TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-blue-500 rounded-full"
+                                style={{ width: `${c.docs_total > 0 ? (c.docs_uploaded / c.docs_total) * 100 : 0}%` }}
+                              />
+                            </div>
+                            <span className="text-xs text-gray-500">{c.docs_uploaded}/{c.docs_total}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <span className={`text-xs px-2 py-0.5 rounded ${
+                            reviewStatus === "All Approved" ? "bg-green-100 text-green-700"
+                            : reviewStatus === "Has Rejections" ? "bg-red-100 text-red-700"
+                            : reviewStatus === "Under Review" ? "bg-yellow-100 text-yellow-700"
+                            : reviewStatus === "Not Started" ? "bg-gray-100 text-gray-500"
+                            : "bg-gray-100 text-gray-700"
+                          }`}>
+                            {reviewStatus}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-center">
+                          {c.docs_rejected > 0 ? (
+                            <span className="text-red-600 text-sm">{c.docs_rejected}</span>
+                          ) : (
+                            <span className="text-gray-400">0</span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <span className={`text-xs ${
+                            nextAction === "Replace rejected docs" ? "text-red-600"
+                            : nextAction === "Complete" ? "text-green-600"
+                            : "text-gray-600"
+                          }`}>
+                            {nextAction}
+                          </span>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
+                            <Button variant="outline" size="sm" onClick={() => router.push(`/supplier/containers/${c.id}`)}>
+                              <Eye className="w-3.5 h-3.5 mr-1" />View
+                            </Button>
+                            {c.docs_rejected > 0 && (
+                              <Button variant="outline" size="sm" className="text-red-600 border-red-200" onClick={() => router.push(`/supplier/containers/${c.id}`)}>
+                                <XCircle className="w-3.5 h-3.5" />
+                              </Button>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
         </CardContent>
       </Card>
 
-      <DocumentUploadModal open={showUpload} onClose={() => setShowUpload(false)} />
       <NewShipmentModal
         open={newShipmentOpen}
         onClose={() => setNewShipmentOpen(false)}
-        onCreated={() => setRefreshKey((k) => k + 1)}
+        onCreated={loadContainers}
         role="supplier"
       />
     </DashboardLayout>

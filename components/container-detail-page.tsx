@@ -1,56 +1,269 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import {
-  ArrowLeft,
-  FileText,
-  CheckCircle,
-  XCircle,
-  Clock,
-  Upload,
-  Eye,
-  AlertTriangle,
-  Camera,
-  ImageIcon,
-  Video,
-  MessageSquare,
+  ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
+  AlertTriangle, Camera, ImageIcon, Video, MessageSquare,
+  Package, Anchor, Ship, Globe, CheckCheck, Truck,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { DocStatusBadge, ClearanceBadge } from "@/components/status-badge";
+import { DocStatusBadge, ContainerStatusBadge } from "@/components/status-badge";
 import { DocumentUploadModal } from "@/components/document-upload-modal";
 import { RejectDocumentModal } from "@/components/reject-document-modal";
+import { DOCUMENT_TYPE_LABELS } from "@/lib/supabase";
+import type { Document, DocumentType, ContainerView } from "@/lib/supabase";
 import {
-  getContainer,
-  getShipment,
-  getSupplier,
-  getImporter,
-  getProduct,
+  getContainerById,
   getDocumentsForContainer,
-  getCargoPhotosForContainer,
-  type Document,
-  type DocumentType,
-} from "@/lib/mock-data";
+  getCargoMediaForContainer,
+  updateDocumentStatus,
+  getCurrentUserId,
+  type CargoMedia,
+} from "@/lib/db";
 import { toast } from "sonner";
 
 interface ContainerDetailPageProps {
   role: "importer" | "supplier" | "customs-agent";
 }
 
+// ─── Logistics Timeline ───────────────────────────────────────────────────────
+
+type TimelineStage =
+  | "created"
+  | "loaded"
+  | "sailed"
+  | "arrived"
+  | "docs_approved"
+  | "in_clearance"
+  | "released";
+
+interface TimelineStep {
+  key: TimelineStage;
+  label: string;
+  icon: React.ElementType;
+  description: string;
+}
+
+const TIMELINE_STEPS: TimelineStep[] = [
+  { key: "created",      label: "Created",           icon: Package,     description: "Container created & documents requested" },
+  { key: "loaded",       label: "Loaded at Port",    icon: Anchor,      description: "Cargo loaded onto vessel" },
+  { key: "sailed",       label: "Sailed (ETD)",      icon: Ship,        description: "Vessel departed port of loading" },
+  { key: "arrived",      label: "Arrived (ETA)",     icon: Globe,       description: "Vessel arrived at destination port" },
+  { key: "docs_approved",label: "Docs Approved",     icon: CheckCheck,  description: "All 7 documents reviewed and approved" },
+  { key: "in_clearance", label: "In Clearance",      icon: FileText,    description: "Customs clearance process underway" },
+  { key: "released",     label: "Released",          icon: Truck,       description: "Container released from customs" },
+];
+
+function getCompletedStages(container: ContainerView): Set<TimelineStage> {
+  const now = Date.now();
+  const etd = new Date(container.etd).getTime();
+  const eta = new Date(container.eta).getTime();
+  const completed = new Set<TimelineStage>();
+
+  completed.add("created");
+  if (now > etd - 3 * 86400000) completed.add("loaded");
+  if (now > etd) completed.add("sailed");
+  if (now > eta) completed.add("arrived");
+
+  const s = container.status;
+  if (s === "ready_for_clearance" || s === "in_clearance" || s === "released") {
+    completed.add("docs_approved");
+  }
+  if (s === "in_clearance" || s === "released") {
+    completed.add("in_clearance");
+  }
+  if (s === "released") {
+    completed.add("released");
+  }
+
+  return completed;
+}
+
+function LogisticsTimeline({ container }: { container: ContainerView }) {
+  const completed = getCompletedStages(container);
+
+  // Find current active step index
+  const lastCompleted = [...TIMELINE_STEPS].reverse().findIndex(
+    (s) => completed.has(s.key)
+  );
+  const currentIdx = lastCompleted >= 0
+    ? TIMELINE_STEPS.length - 1 - lastCompleted
+    : 0;
+
+  return (
+    <Card className="mt-6">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Ship className="w-4 h-4" />
+          Logistics Timeline
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="relative">
+          {/* Connector line */}
+          <div className="absolute top-5 left-5 right-5 h-0.5 bg-gray-200" />
+
+          <div className="relative flex justify-between">
+            {TIMELINE_STEPS.map((step, idx) => {
+              const Icon = step.icon;
+              const done = completed.has(step.key);
+              const active = !done && idx === currentIdx + 1;
+
+              return (
+                <div key={step.key} className="flex flex-col items-center gap-2 flex-1">
+                  <div
+                    className={`relative z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 transition-all ${
+                      done
+                        ? "bg-green-500 border-green-500 text-white"
+                        : active
+                        ? "bg-white border-blue-500 text-blue-600"
+                        : "bg-white border-gray-300 text-gray-400"
+                    }`}
+                  >
+                    {done ? (
+                      <CheckCircle className="w-5 h-5" />
+                    ) : (
+                      <Icon className="w-4 h-4" />
+                    )}
+                  </div>
+                  <div className="text-center">
+                    <p className={`text-[11px] font-medium leading-tight ${
+                      done ? "text-green-700" : active ? "text-blue-700" : "text-gray-400"
+                    }`}>
+                      {step.label}
+                    </p>
+                    {(step.key === "sailed") && (
+                      <p className="text-[10px] text-gray-400 mt-0.5">
+                        {new Date(container.etd).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
+                      </p>
+                    )}
+                    {(step.key === "arrived") && (
+                      <p className="text-[10px] text-gray-400 mt-0.5">
+                        {new Date(container.eta).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Cargo Photos Sub-component ───────────────────────────────────────────────
+
+function CargoPhotosSection({
+  containerId,
+  role,
+}: {
+  containerId: string;
+  role: "importer" | "supplier";
+}) {
+  const [photos, setPhotos] = useState<CargoMedia[]>([]);
+
+  useEffect(() => {
+    getCargoMediaForContainer(containerId).then(setPhotos);
+  }, [containerId]);
+
+  return (
+    <Card className="mt-6">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Camera className="w-4 h-4" />
+            Pre-Loading Cargo Photos
+          </CardTitle>
+          {role === "supplier" && (
+            <div className="flex gap-2">
+              <label>
+                <Button variant="outline" size="sm" className="gap-1.5" asChild>
+                  <span><ImageIcon className="w-4 h-4" />Upload Images</span>
+                </Button>
+                <input
+                  type="file"
+                  className="hidden"
+                  accept="image/*"
+                  multiple
+                  onChange={() => toast.success("Images uploaded.")}
+                />
+              </label>
+              <label>
+                <Button variant="outline" size="sm" className="gap-1.5" asChild>
+                  <span><Video className="w-4 h-4" />Upload Video</span>
+                </Button>
+                <input
+                  type="file"
+                  className="hidden"
+                  accept="video/*"
+                  onChange={() => toast.success("Video uploaded.")}
+                />
+              </label>
+            </div>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent>
+        {photos.length === 0 ? (
+          <div className="text-center py-8 text-gray-400">
+            <Camera className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-sm">No cargo photos uploaded yet.</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {photos.map((p) => (
+              <div key={p.id} className="rounded-lg border overflow-hidden">
+                <div className="aspect-square bg-gray-100 flex items-center justify-center">
+                  {p.media_type === "image"
+                    ? <ImageIcon className="w-8 h-8 text-gray-300" />
+                    : <Video className="w-8 h-8 text-gray-300" />}
+                </div>
+                <div className="p-2">
+                  <p className="text-xs text-gray-500">
+                    {new Date(p.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+                  </p>
+                  {p.caption && <p className="text-xs text-gray-700 mt-0.5 line-clamp-2">{p.caption}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {role === "supplier" && (
+          <div className="mt-4 pt-4 border-t flex gap-2">
+            <input
+              type="text"
+              placeholder="Add a comment about the cargo…"
+              className="flex-1 rounded-md border px-3 py-2 text-sm"
+            />
+            <Button size="sm">
+              <MessageSquare className="w-4 h-4 mr-1" />Add
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+
 export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const params = useParams();
   const router = useRouter();
   const containerId = params.containerId as string;
+
+  const [container, setContainer] = useState<ContainerView | null>(null);
+  const [docs, setDocs] = useState<Document[]>([]);
+  const [loading, setLoading] = useState(true);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadPreselect, setUploadPreselect] = useState<{
     docType?: DocumentType;
@@ -58,18 +271,61 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   }>({});
   const [rejectDoc, setRejectDoc] = useState<Document | null>(null);
 
-  const container = getContainer(containerId || "");
-  const shipment = container ? getShipment(container.shipmentId) : null;
-  const supplier = shipment ? getSupplier(shipment.supplierId) : null;
-  const importer = shipment ? getImporter(shipment.importerId) : null;
-  const product = shipment ? getProduct(shipment.productId) : null;
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    const [c, d] = await Promise.all([
+      getContainerById(containerId),
+      getDocumentsForContainer(containerId, role === "customs-agent"),
+    ]);
+    setContainer(c);
+    setDocs(d);
+    setLoading(false);
+  }, [containerId, role]);
 
-  if (!container || !shipment) {
+  useEffect(() => { loadData(); }, [loadData]);
+
+  async function handleApproveDoc(doc: Document) {
+    const userId = await getCurrentUserId();
+    const ok = await updateDocumentStatus(doc.id, "approved", { reviewedBy: userId });
+    if (ok) {
+      toast.success(`${DOCUMENT_TYPE_LABELS[doc.document_type]} approved.`);
+      loadData();
+    } else {
+      toast.error("Failed to approve document.");
+    }
+  }
+
+  async function handleRejectDoc(docId: string, reason: string, internalNote: string) {
+    const userId = await getCurrentUserId();
+    const ok = await updateDocumentStatus(docId, "rejected", {
+      rejectionReason: reason,
+      internalNote: internalNote || null,
+      reviewedBy: userId,
+    });
+    if (ok) {
+      toast.error("Document rejected.");
+      loadData();
+    } else {
+      toast.error("Failed to reject document.");
+    }
+  }
+
+  const basePath = `/${role}`;
+
+  if (loading) {
+    return (
+      <DashboardLayout role={role} title="Loading…" subtitle="">
+        <div className="py-12 text-center text-gray-400 text-sm">Loading container data…</div>
+      </DashboardLayout>
+    );
+  }
+
+  if (!container) {
     return (
       <DashboardLayout role={role} title="Container Not Found" subtitle="">
         <div className="text-center py-20">
-          <p className="text-gray-500">Container not found.</p>
-          <Button variant="outline" className="mt-4" onClick={() => router.back()}>
+          <p className="text-gray-500">Container not found or access denied.</p>
+          <Button variant="outline" className="mt-4" onClick={() => router.push(basePath)}>
             Go Back
           </Button>
         </div>
@@ -77,31 +333,18 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     );
   }
 
-  const docs = getDocumentsForContainer(container.id);
-  const totalRequired = docs.length;
-  const uploadedCount = docs.filter((d) => d.status !== "missing").length;
-  const approvedCount = docs.filter((d) => d.status === "approved").length;
-  const rejectedCount = docs.filter((d) => d.status === "rejected").length;
-  const pendingCount = docs.filter(
-    (d) => d.status === "under-review" || d.status === "uploaded"
-  ).length;
-  const missingCount = docs.filter((d) => d.status === "missing").length;
-
-  const handleApproveDoc = (doc: Document) => {
-    toast.success(`${doc.type} approved successfully.`);
-  };
-
-  const handleRejectDoc = (docId: string, reason: string) => {
-    toast.error(`Document rejected: ${reason}`);
-  };
-
-  const basePath = `/${role}`;
+  const docsApproved = docs.filter((d) => d.status === "approved").length;
+  const docsRejected = docs.filter((d) => d.status === "rejected").length;
+  const docsUploaded = docs.filter((d) => d.status !== "missing").length;
+  const docsPending = docs.filter((d) => d.status === "uploaded" || d.status === "under_review").length;
+  const docsMissing = docs.filter((d) => d.status === "missing").length;
+  const docsTotal = docs.length || container.docs_total;
 
   return (
     <DashboardLayout
       role={role}
-      title={`Container ${container.containerNumber}`}
-      subtitle={`Shipment ${shipment.id} · ${supplier?.name}`}
+      title={`Container ${container.container_number}`}
+      subtitle={`${container.shipment_number} · ${container.supplier_company}`}
     >
       <Button
         variant="ghost"
@@ -113,54 +356,54 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         Back to Dashboard
       </Button>
 
-      {/* Header Information */}
+      {/* Header Info Card */}
       <Card className="mb-6">
         <CardContent className="pt-6">
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
             <div>
               <p className="text-gray-500 text-xs">Container Number</p>
-              <p className="mt-0.5">{container.containerNumber}</p>
+              <p className="mt-0.5 font-medium">{container.container_number}</p>
             </div>
             <div>
-              <p className="text-gray-500 text-xs">Shipment ID</p>
-              <p className="mt-0.5">{shipment.id}</p>
+              <p className="text-gray-500 text-xs">Shipment</p>
+              <p className="mt-0.5">{container.shipment_number}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Importer</p>
-              <p className="mt-0.5">{importer?.name}</p>
+              <p className="mt-0.5">{container.importer_company}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Supplier</p>
-              <p className="mt-0.5">{supplier?.name}</p>
+              <p className="mt-0.5">{container.supplier_company}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Product</p>
-              <p className="mt-0.5">{product?.name}</p>
+              <p className="mt-0.5">{container.product_name}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Vessel</p>
-              <p className="mt-0.5">{shipment.vesselName}</p>
+              <p className="mt-0.5">{container.vessel_name}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">ETD</p>
-              <p className="mt-0.5">{shipment.etd}</p>
+              <p className="mt-0.5">{new Date(container.etd).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">ETA</p>
-              <p className="mt-0.5">{container.eta}</p>
+              <p className="mt-0.5">{new Date(container.eta).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Port of Loading</p>
-              <p className="mt-0.5">{container.portOfLoading}</p>
+              <p className="mt-0.5">{container.port_of_loading}</p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Port of Destination</p>
-              <p className="mt-0.5">{container.portOfDestination}</p>
+              <p className="mt-0.5">{container.port_of_destination}</p>
             </div>
           </div>
           <div className="mt-4 pt-4 border-t flex items-center gap-2">
-            <span className="text-xs text-gray-500">Clearance Status:</span>
-            <ClearanceBadge status={container.clearanceStatus} />
+            <span className="text-xs text-gray-500">Status:</span>
+            <ContainerStatusBadge status={container.status} />
           </div>
         </CardContent>
       </Card>
@@ -174,32 +417,32 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <div className="grid grid-cols-3 md:grid-cols-6 gap-4">
             <div className="text-center p-3 rounded-lg bg-gray-50">
               <FileText className="w-5 h-5 mx-auto text-gray-500 mb-1" />
-              <p className="text-2xl text-gray-900">{totalRequired}</p>
+              <p className="text-2xl text-gray-900">{docsTotal}</p>
               <p className="text-xs text-gray-500 mt-0.5">Total Required</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-blue-50">
               <Upload className="w-5 h-5 mx-auto text-blue-500 mb-1" />
-              <p className="text-2xl text-blue-600">{uploadedCount}</p>
+              <p className="text-2xl text-blue-600">{docsUploaded}</p>
               <p className="text-xs text-gray-500 mt-0.5">Uploaded</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-green-50">
               <CheckCircle className="w-5 h-5 mx-auto text-green-500 mb-1" />
-              <p className="text-2xl text-green-600">{approvedCount}</p>
+              <p className="text-2xl text-green-600">{docsApproved}</p>
               <p className="text-xs text-gray-500 mt-0.5">Approved</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-red-50">
               <XCircle className="w-5 h-5 mx-auto text-red-500 mb-1" />
-              <p className="text-2xl text-red-600">{rejectedCount}</p>
+              <p className="text-2xl text-red-600">{docsRejected}</p>
               <p className="text-xs text-gray-500 mt-0.5">Rejected</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-yellow-50">
               <Clock className="w-5 h-5 mx-auto text-yellow-500 mb-1" />
-              <p className="text-2xl text-yellow-600">{pendingCount}</p>
+              <p className="text-2xl text-yellow-600">{docsPending}</p>
               <p className="text-xs text-gray-500 mt-0.5">Pending Review</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-gray-50">
               <AlertTriangle className="w-5 h-5 mx-auto text-gray-400 mb-1" />
-              <p className="text-2xl text-gray-600">{missingCount}</p>
+              <p className="text-2xl text-gray-600">{docsMissing}</p>
               <p className="text-xs text-gray-500 mt-0.5">Missing</p>
             </div>
           </div>
@@ -207,17 +450,17 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <div className="mt-4">
             <div className="flex items-center justify-between text-xs text-gray-500 mb-1">
               <span>Overall Progress</span>
-              <span>{approvedCount}/{totalRequired} approved</span>
+              <span>{docsApproved}/{docsTotal} approved</span>
             </div>
             <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden flex">
-              {approvedCount > 0 && (
-                <div className="h-full bg-green-500" style={{ width: `${(approvedCount / totalRequired) * 100}%` }} />
+              {docsApproved > 0 && (
+                <div className="h-full bg-green-500" style={{ width: `${(docsApproved / docsTotal) * 100}%` }} />
               )}
-              {pendingCount > 0 && (
-                <div className="h-full bg-yellow-400" style={{ width: `${(pendingCount / totalRequired) * 100}%` }} />
+              {docsPending > 0 && (
+                <div className="h-full bg-yellow-400" style={{ width: `${(docsPending / docsTotal) * 100}%` }} />
               )}
-              {rejectedCount > 0 && (
-                <div className="h-full bg-red-400" style={{ width: `${(rejectedCount / totalRequired) * 100}%` }} />
+              {docsRejected > 0 && (
+                <div className="h-full bg-red-400" style={{ width: `${(docsRejected / docsTotal) * 100}%` }} />
               )}
             </div>
             <div className="flex gap-4 mt-2 text-[10px] text-gray-500">
@@ -239,10 +482,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               <Button
                 size="sm"
                 className="gap-1.5"
-                onClick={() => {
-                  setUploadPreselect({});
-                  setUploadOpen(true);
-                }}
+                onClick={() => { setUploadPreselect({}); setUploadOpen(true); }}
               >
                 <Upload className="w-4 h-4" />
                 Upload Document
@@ -256,10 +496,10 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               <TableHeader>
                 <TableRow>
                   <TableHead>Document Type</TableHead>
-                  <TableHead>Upload Status</TableHead>
+                  <TableHead>Status</TableHead>
                   <TableHead>Upload Date</TableHead>
-                  <TableHead>Review Status</TableHead>
                   <TableHead>Rejection Reason</TableHead>
+                  {role === "customs-agent" && <TableHead>Internal Note</TableHead>}
                   <TableHead>File</TableHead>
                   <TableHead>Action</TableHead>
                 </TableRow>
@@ -267,109 +507,81 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               <TableBody>
                 {docs.map((doc) => (
                   <TableRow key={doc.id}>
-                    <TableCell className="text-sm">{doc.type}</TableCell>
-                    <TableCell>
-                      <DocStatusBadge status={doc.status} />
+                    <TableCell className="text-sm font-medium">
+                      {DOCUMENT_TYPE_LABELS[doc.document_type] ?? doc.document_type}
                     </TableCell>
+                    <TableCell><DocStatusBadge status={doc.status} /></TableCell>
                     <TableCell className="text-sm text-gray-500">
-                      {doc.uploadedAt || "-"}
+                      {doc.uploaded_at
+                        ? new Date(doc.uploaded_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+                        : "—"}
                     </TableCell>
                     <TableCell>
-                      {doc.reviewStatus ? (
-                        <span className={`text-xs px-2 py-0.5 rounded ${
-                          doc.reviewStatus === "approved" ? "bg-green-100 text-green-700"
-                          : doc.reviewStatus === "rejected" ? "bg-red-100 text-red-700"
-                          : "bg-yellow-100 text-yellow-700"
-                        }`}>
-                          {doc.reviewStatus}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-400">-</span>
-                      )}
+                      {doc.rejection_reason ? (
+                        <span className="text-xs text-red-600 max-w-[200px] block">{doc.rejection_reason}</span>
+                      ) : <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
+                    {role === "customs-agent" && (
+                      <TableCell>
+                        {"internal_note" in doc && (doc as Document & { internal_note?: string }).internal_note ? (
+                          <span className="text-xs text-gray-600 italic max-w-[180px] block">
+                            {(doc as Document & { internal_note?: string }).internal_note}
+                          </span>
+                        ) : <span className="text-xs text-gray-400">—</span>}
+                      </TableCell>
+                    )}
                     <TableCell>
-                      {doc.rejectionReason ? (
-                        <span className="text-xs text-red-600 max-w-[220px] block">
-                          {doc.rejectionReason}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-400">-</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {doc.status !== "missing" ? (
+                      {doc.status !== "missing" && doc.storage_path ? (
                         <Button variant="ghost" size="sm" className="text-blue-600 gap-1 h-auto py-1 px-2">
-                          <Eye className="w-3 h-3" />
-                          <span className="text-xs">View</span>
+                          <Eye className="w-3 h-3" /><span className="text-xs">View</span>
                         </Button>
-                      ) : (
-                        <span className="text-xs text-gray-400">-</span>
-                      )}
+                      ) : <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
                     <TableCell>
                       {/* Supplier Actions */}
                       {role === "supplier" && doc.status === "missing" && (
                         <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setUploadPreselect({ docType: doc.type });
-                            setUploadOpen(true);
-                          }}
+                          variant="outline" size="sm"
+                          onClick={() => { setUploadPreselect({ docType: doc.document_type }); setUploadOpen(true); }}
                         >
-                          <Upload className="w-3.5 h-3.5 mr-1" />
-                          Upload
+                          <Upload className="w-3.5 h-3.5 mr-1" />Upload
                         </Button>
                       )}
                       {role === "supplier" && doc.status === "rejected" && (
                         <Button
-                          variant="outline"
-                          size="sm"
-                          className="text-red-600 border-red-200"
-                          onClick={() => {
-                            setUploadPreselect({ docType: doc.type, isReplacement: true });
-                            setUploadOpen(true);
-                          }}
+                          variant="outline" size="sm" className="text-red-600 border-red-200"
+                          onClick={() => { setUploadPreselect({ docType: doc.document_type, isReplacement: true }); setUploadOpen(true); }}
                         >
-                          <Upload className="w-3.5 h-3.5 mr-1" />
-                          Replace
+                          <Upload className="w-3.5 h-3.5 mr-1" />Replace
                         </Button>
                       )}
                       {role === "supplier" && doc.status !== "missing" && doc.status !== "rejected" && (
-                        <span className="text-xs text-gray-400">-</span>
+                        <span className="text-xs text-gray-400">—</span>
                       )}
 
                       {/* Customs Agent Actions */}
-                      {role === "customs-agent" && (doc.status === "under-review" || doc.status === "uploaded") && (
+                      {role === "customs-agent" && (doc.status === "uploaded" || doc.status === "under_review") && (
                         <div className="flex gap-1">
                           <Button
-                            variant="outline"
-                            size="sm"
-                            className="text-green-600 border-green-200"
+                            variant="outline" size="sm" className="text-green-600 border-green-200"
                             onClick={() => handleApproveDoc(doc)}
                           >
-                            <CheckCircle className="w-3.5 h-3.5 mr-1" />
-                            Approve
+                            <CheckCircle className="w-3.5 h-3.5 mr-1" />Approve
                           </Button>
                           <Button
-                            variant="outline"
-                            size="sm"
-                            className="text-red-600 border-red-200"
+                            variant="outline" size="sm" className="text-red-600 border-red-200"
                             onClick={() => setRejectDoc(doc)}
                           >
-                            <XCircle className="w-3.5 h-3.5 mr-1" />
-                            Reject
+                            <XCircle className="w-3.5 h-3.5 mr-1" />Reject
                           </Button>
                         </div>
                       )}
-                      {role === "customs-agent" && doc.status !== "under-review" && doc.status !== "uploaded" && (
-                        <span className="text-xs text-gray-400">-</span>
+                      {role === "customs-agent" && doc.status !== "uploaded" && doc.status !== "under_review" && (
+                        <span className="text-xs text-gray-400">—</span>
                       )}
 
                       {/* Importer (read-only) */}
-                      {role === "importer" && (
-                        <span className="text-xs text-gray-400">-</span>
-                      )}
+                      {role === "importer" && <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -379,141 +591,32 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         </CardContent>
       </Card>
 
-      {/* Pre-Loading Cargo Photos */}
-      {(role === "supplier" || role === "importer") && (
-        <CargoPhotosSection containerId={container.id} role={role} />
+      {/* Logistics Timeline */}
+      <LogisticsTimeline container={container} />
+
+      {/* Pre-Loading Cargo Photos — not for customs agent */}
+      {role !== "customs-agent" && (
+        <CargoPhotosSection containerId={container.id} role={role as "importer" | "supplier"} />
       )}
 
       {/* Modals */}
       <DocumentUploadModal
         open={uploadOpen}
         onClose={() => setUploadOpen(false)}
-        preselectedShipmentId={shipment.id}
         preselectedContainerId={container.id}
+        preselectedContainerNumber={container.container_number}
+        preselectedShipmentNumber={container.shipment_number}
         preselectedDocType={uploadPreselect.docType}
         isReplacement={uploadPreselect.isReplacement}
+        onUploaded={loadData}
       />
       <RejectDocumentModal
         document={rejectDoc}
-        containerNumber={container.containerNumber}
+        containerNumber={container.container_number}
         open={!!rejectDoc}
         onClose={() => setRejectDoc(null)}
         onReject={handleRejectDoc}
       />
     </DashboardLayout>
-  );
-}
-
-// Pre-Loading Cargo Photos Sub-component
-function CargoPhotosSection({
-  containerId,
-  role,
-}: {
-  containerId: string;
-  role: "importer" | "supplier";
-}) {
-  const photos = getCargoPhotosForContainer(containerId);
-  const [comment, setComment] = useState("");
-
-  return (
-    <Card className="mt-6">
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Camera className="w-4 h-4" />
-            Pre-Loading Cargo Photos
-          </CardTitle>
-          {role === "supplier" && (
-            <div className="flex gap-2">
-              <label>
-                <Button variant="outline" size="sm" className="gap-1.5" asChild>
-                  <span>
-                    <ImageIcon className="w-4 h-4" />
-                    Upload Images
-                  </span>
-                </Button>
-                <input
-                  type="file"
-                  className="hidden"
-                  accept="image/*"
-                  multiple
-                  onChange={() => toast.success("Images uploaded successfully.")}
-                />
-              </label>
-              <label>
-                <Button variant="outline" size="sm" className="gap-1.5" asChild>
-                  <span>
-                    <Video className="w-4 h-4" />
-                    Upload Videos
-                  </span>
-                </Button>
-                <input
-                  type="file"
-                  className="hidden"
-                  accept="video/*"
-                  multiple
-                  onChange={() => toast.success("Videos uploaded successfully.")}
-                />
-              </label>
-            </div>
-          )}
-        </div>
-      </CardHeader>
-      <CardContent>
-        {photos.length === 0 ? (
-          <div className="text-center py-8 text-gray-400">
-            <Camera className="w-8 h-8 mx-auto mb-2 opacity-50" />
-            <p className="text-sm">No cargo photos uploaded yet.</p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              {photos.map((photo) => (
-                <div key={photo.id} className="rounded-lg border overflow-hidden">
-                  <div className="aspect-square bg-gray-100 flex items-center justify-center">
-                    {photo.type === "image" ? (
-                      <ImageIcon className="w-8 h-8 text-gray-300" />
-                    ) : (
-                      <Video className="w-8 h-8 text-gray-300" />
-                    )}
-                  </div>
-                  <div className="p-2">
-                    <p className="text-xs text-gray-500">{photo.uploadedAt}</p>
-                    <p className="text-xs text-gray-700 mt-0.5 line-clamp-2">{photo.comment}</p>
-                    <p className="text-[10px] text-gray-400 mt-1">By: {photo.uploadedBy}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {role === "supplier" && (
-          <div className="mt-4 pt-4 border-t">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                placeholder="Add a comment about the cargo..."
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-                className="flex-1 rounded-md border px-3 py-2 text-sm"
-              />
-              <Button
-                size="sm"
-                onClick={() => {
-                  if (comment.trim()) {
-                    toast.success("Comment added.");
-                    setComment("");
-                  }
-                }}
-              >
-                <MessageSquare className="w-4 h-4 mr-1" />
-                Add
-              </Button>
-            </div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
   );
 }

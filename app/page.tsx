@@ -43,7 +43,7 @@ export default function LandingPage() {
             <Ship className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="text-2xl text-gray-900">KILO</h1>
+            <h1 className="text-2xl text-gray-900">Portix</h1>
             <p className="text-gray-500 text-sm">Import/Export Logistics Management Platform</p>
           </div>
         </div>

@@ -1,80 +1,49 @@
 "use client";
 
-import { useMemo } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import {
-  Ship,
-  XCircle,
-  CheckCircle,
-  Clock,
-  Eye,
-} from "lucide-react";
+import { Ship, XCircle, CheckCircle, Clock, Eye } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
-import { ClearanceBadge } from "@/components/status-badge";
-import {
-  mockContainers,
-  getShipment,
-  getSupplier,
-  getImporter,
-  getProduct,
-  getDocumentsForContainer,
-} from "@/lib/mock-data";
+import { ContainerStatusBadge } from "@/components/status-badge";
+import { getContainers } from "@/lib/db";
+import type { ContainerView } from "@/lib/supabase";
+
+function formatDate(dateStr: string): string {
+  return new Date(dateStr).toLocaleDateString("en-GB", {
+    day: "2-digit", month: "short", year: "numeric",
+  });
+}
 
 export default function CustomsAgentDashboardPage() {
   const router = useRouter();
+  const [containers, setContainers] = useState<ContainerView[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const enrichedContainers = useMemo(() => {
-    return mockContainers.map((c) => {
-      const shipment = getShipment(c.shipmentId)!;
-      const supplier = getSupplier(shipment.supplierId);
-      const importer = getImporter(shipment.importerId);
-      const product = getProduct(shipment.productId);
-      const docs = getDocumentsForContainer(c.id);
-      const totalDocs = docs.length;
-      const uploadedDocs = docs.filter((d) => d.status !== "missing").length;
-      const pendingReviewDocs = docs.filter(
-        (d) => d.status === "under-review" || d.status === "uploaded"
-      ).length;
-      const rejectedDocs = docs.filter((d) => d.status === "rejected").length;
-
-      return {
-        ...c,
-        shipmentId: shipment.id,
-        importerName: importer?.name || "",
-        supplierName: supplier?.name || "",
-        productName: product?.name || "",
-        totalDocs,
-        uploadedDocs,
-        pendingReviewDocs,
-        rejectedDocs,
-      };
-    });
+  const loadContainers = useCallback(async () => {
+    setLoading(true);
+    const data = await getContainers();
+    setContainers(data);
+    setLoading(false);
   }, []);
 
-  const containersAwaitingReview = enrichedContainers.filter(
-    (c) => c.pendingReviewDocs > 0
+  useEffect(() => { loadContainers(); }, [loadContainers]);
+
+  const containersAwaitingReview = containers.filter(
+    (c) => c.docs_uploaded - c.docs_approved - c.docs_rejected > 0
   ).length;
-  const totalPendingReviewDocs = enrichedContainers.reduce(
-    (sum, c) => sum + c.pendingReviewDocs, 0
+  const totalPendingDocs = containers.reduce(
+    (sum, c) => sum + Math.max(0, c.docs_uploaded - c.docs_approved - c.docs_rejected),
+    0
   );
-  const totalRejectedDocs = enrichedContainers.reduce(
-    (sum, c) => sum + c.rejectedDocs, 0
-  );
-  const containersReady = enrichedContainers.filter(
-    (c) =>
-      c.clearanceStatus === "ready-for-clearance" ||
-      c.clearanceStatus === "released"
+  const totalRejectedDocs = containers.reduce((sum, c) => sum + c.docs_rejected, 0);
+  const containersReady = containers.filter(
+    (c) => c.status === "ready_for_clearance" || c.status === "released"
   ).length;
 
   return (
@@ -85,7 +54,7 @@ export default function CustomsAgentDashboardPage() {
     >
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <KPICard label="Containers Awaiting Review" value={containersAwaitingReview} icon={Ship} color="text-yellow-600" iconColor="text-yellow-600" />
-        <KPICard label="Documents Pending Review" value={totalPendingReviewDocs} icon={Clock} color="text-blue-600" iconColor="text-blue-600" />
+        <KPICard label="Documents Pending Review" value={totalPendingDocs} icon={Clock} color="text-blue-600" iconColor="text-blue-600" />
         <KPICard label="Rejected Documents" value={totalRejectedDocs} icon={XCircle} color="text-red-600" iconColor="text-red-600" />
         <KPICard label="Containers Ready for Clearance" value={containersReady} icon={CheckCircle} color="text-green-600" iconColor="text-green-600" />
       </div>
@@ -95,77 +64,87 @@ export default function CustomsAgentDashboardPage() {
           <CardTitle className="text-base">Container Review List</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Container Number</TableHead>
-                  <TableHead>Shipment ID</TableHead>
-                  <TableHead>Importer</TableHead>
-                  <TableHead>Supplier</TableHead>
-                  <TableHead>Product</TableHead>
-                  <TableHead>ETA</TableHead>
-                  <TableHead>Uploaded Docs</TableHead>
-                  <TableHead className="text-center">Pending Review</TableHead>
-                  <TableHead className="text-center">Rejected</TableHead>
-                  <TableHead>Clearance Status</TableHead>
-                  <TableHead>Action</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {enrichedContainers.map((c) => (
-                  <TableRow key={c.id} className="cursor-pointer hover:bg-gray-50" onClick={() => router.push(`/customs-agent/containers/${c.id}`)}>
-                    <TableCell className="whitespace-nowrap">{c.containerNumber}</TableCell>
-                    <TableCell className="whitespace-nowrap text-sm text-gray-500">{c.shipmentId}</TableCell>
-                    <TableCell className="text-sm">{c.importerName}</TableCell>
-                    <TableCell className="text-sm">{c.supplierName}</TableCell>
-                    <TableCell className="text-sm max-w-[130px] truncate">{c.productName}</TableCell>
-                    <TableCell className="text-sm whitespace-nowrap">{c.eta}</TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-green-500 rounded-full"
-                            style={{ width: `${c.totalDocs > 0 ? (c.uploadedDocs / c.totalDocs) * 100 : 0}%` }}
-                          />
-                        </div>
-                        <span className="text-xs text-gray-500">{c.uploadedDocs}/{c.totalDocs}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-center">
-                      {c.pendingReviewDocs > 0 ? (
-                        <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-yellow-100 text-yellow-700 text-xs">
-                          {c.pendingReviewDocs}
-                        </span>
-                      ) : (
-                        <span className="text-gray-400 text-sm">0</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-center">
-                      {c.rejectedDocs > 0 ? (
-                        <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 text-xs">
-                          {c.rejectedDocs}
-                        </span>
-                      ) : (
-                        <span className="text-gray-400 text-sm">0</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <ClearanceBadge status={c.clearanceStatus} />
-                    </TableCell>
-                    <TableCell>
-                      <div onClick={(e) => e.stopPropagation()}>
-                        <Button variant="outline" size="sm" onClick={() => router.push(`/customs-agent/containers/${c.id}`)}>
-                          <Eye className="w-3.5 h-3.5 mr-1" />
-                          Review
-                        </Button>
-                      </div>
-                    </TableCell>
+          {loading ? (
+            <div className="py-12 text-center text-gray-400 text-sm">Loading containers…</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Container</TableHead>
+                    <TableHead>Shipment</TableHead>
+                    <TableHead>Importer</TableHead>
+                    <TableHead>Supplier</TableHead>
+                    <TableHead>Product</TableHead>
+                    <TableHead>ETA</TableHead>
+                    <TableHead>Uploaded</TableHead>
+                    <TableHead className="text-center">Pending Review</TableHead>
+                    <TableHead className="text-center">Rejected</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Action</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {containers.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={11} className="text-center py-10 text-gray-400">
+                        No containers found
+                      </TableCell>
+                    </TableRow>
+                  ) : containers.map((c) => {
+                    const docsPending = Math.max(0, c.docs_uploaded - c.docs_approved - c.docs_rejected);
+                    return (
+                      <TableRow
+                        key={c.id}
+                        className="cursor-pointer hover:bg-gray-50"
+                        onClick={() => router.push(`/customs-agent/containers/${c.id}`)}
+                      >
+                        <TableCell className="whitespace-nowrap font-medium">{c.container_number}</TableCell>
+                        <TableCell className="whitespace-nowrap text-sm text-gray-500">{c.shipment_number}</TableCell>
+                        <TableCell className="text-sm">{c.importer_company}</TableCell>
+                        <TableCell className="text-sm">{c.supplier_company}</TableCell>
+                        <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>
+                        <TableCell className="text-sm whitespace-nowrap">{formatDate(c.eta)}</TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-green-500 rounded-full"
+                                style={{ width: `${c.docs_total > 0 ? (c.docs_uploaded / c.docs_total) * 100 : 0}%` }}
+                              />
+                            </div>
+                            <span className="text-xs text-gray-500">{c.docs_uploaded}/{c.docs_total}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-center">
+                          {docsPending > 0 ? (
+                            <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-yellow-100 text-yellow-700 text-xs">
+                              {docsPending}
+                            </span>
+                          ) : <span className="text-gray-400 text-sm">0</span>}
+                        </TableCell>
+                        <TableCell className="text-center">
+                          {c.docs_rejected > 0 ? (
+                            <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 text-xs">
+                              {c.docs_rejected}
+                            </span>
+                          ) : <span className="text-gray-400 text-sm">0</span>}
+                        </TableCell>
+                        <TableCell><ContainerStatusBadge status={c.status} /></TableCell>
+                        <TableCell>
+                          <div onClick={(e) => e.stopPropagation()}>
+                            <Button variant="outline" size="sm" onClick={() => router.push(`/customs-agent/containers/${c.id}`)}>
+                              <Eye className="w-3.5 h-3.5 mr-1" />Review
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
         </CardContent>
       </Card>
     </DashboardLayout>

@@ -1,34 +1,118 @@
 "use client";
 
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import { Eye } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { getAccountsForRole } from "@/lib/mock-data";
+import { getInvoices, getAccountProfiles } from "@/lib/db";
+import type { Invoice, Profile, UserRole } from "@/lib/supabase";
 
 interface AccountsPageProps {
   role: "importer" | "supplier" | "customs-agent";
 }
 
+interface AccountSummary {
+  profile: Profile;
+  totalInvoices: number;
+  totalAmount: number;
+  paidAmount: number;
+  remainingBalance: number;
+  lastPaymentDate: string | null;
+}
+
+function buildAccountSummaries(
+  invoices: Invoice[],
+  profiles: Profile[],
+  currentRole: UserRole
+): AccountSummary[] {
+  const profileMap = new Map(profiles.map((p) => [p.id, p]));
+
+  // Group invoices by counterpart ID
+  const grouped = new Map<string, Invoice[]>();
+  for (const inv of invoices) {
+    // counterpart is the "other side" from the current user's role
+    const counterpartId =
+      currentRole === "importer" ? inv.supplier_id : inv.importer_id;
+    const group = grouped.get(counterpartId) ?? [];
+    group.push(inv);
+    grouped.set(counterpartId, group);
+  }
+
+  const summaries: AccountSummary[] = [];
+  for (const [id, invs] of grouped.entries()) {
+    const profile = profileMap.get(id);
+    if (!profile) continue;
+
+    const totalAmount = invs.reduce((s, i) => s + (i.amount ?? 0), 0);
+    const paidAmount = invs.reduce((s, i) => s + (i.paid_amount ?? 0), 0);
+    const sortedByDate = [...invs].sort(
+      (a, b) => new Date(b.invoice_date).getTime() - new Date(a.invoice_date).getTime()
+    );
+
+    summaries.push({
+      profile,
+      totalInvoices: invs.length,
+      totalAmount,
+      paidAmount,
+      remainingBalance: totalAmount - paidAmount,
+      lastPaymentDate: sortedByDate[0]?.invoice_date ?? null,
+    });
+  }
+
+  // Ensure all profiles appear even with no invoices
+  for (const profile of profiles) {
+    if (!grouped.has(profile.id)) {
+      summaries.push({
+        profile,
+        totalInvoices: 0,
+        totalAmount: 0,
+        paidAmount: 0,
+        remainingBalance: 0,
+        lastPaymentDate: null,
+      });
+    }
+  }
+
+  return summaries.sort((a, b) =>
+    a.profile.full_name.localeCompare(b.profile.full_name)
+  );
+}
+
 export function AccountsPage({ role }: AccountsPageProps) {
   const router = useRouter();
-  const accounts = getAccountsForRole(role);
+  const [summaries, setSummaries] = useState<AccountSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Determine which role to look up as counterparts
+  const counterpartRole: UserRole =
+    role === "importer" ? "supplier"
+    : role === "supplier" ? "importer"
+    : "importer"; // customs agent sees importers
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    const [invoices, profiles] = await Promise.all([
+      getInvoices(),
+      getAccountProfiles(counterpartRole),
+    ]);
+
+    const currentRole: UserRole =
+      role === "customs-agent" ? "customs_agent" : role as UserRole;
+    setSummaries(buildAccountSummaries(invoices, profiles, currentRole));
+    setLoading(false);
+  }, [role, counterpartRole]);
+
+  useEffect(() => { loadData(); }, [loadData]);
 
   const columnLabel =
-    role === "importer"
-      ? "Supplier Name"
-      : role === "supplier"
-      ? "Importer Name"
-      : "Client Name";
+    role === "importer" ? "Supplier"
+    : role === "supplier" ? "Importer"
+    : "Client";
 
   const basePath = `/${role}/accounts`;
 
@@ -36,7 +120,7 @@ export function AccountsPage({ role }: AccountsPageProps) {
     <DashboardLayout
       role={role}
       title="Accounts"
-      subtitle={`Manage financial relationships with your ${role === "importer" ? "suppliers" : role === "supplier" ? "importers" : "clients"}`}
+      subtitle={`Manage financial relationships with your ${columnLabel.toLowerCase()}s`}
     >
       <Card>
         <CardHeader className="pb-3">
@@ -45,63 +129,76 @@ export function AccountsPage({ role }: AccountsPageProps) {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>{columnLabel}</TableHead>
-                  <TableHead className="text-center">Total Invoices</TableHead>
-                  <TableHead className="text-right">Total Amount</TableHead>
-                  <TableHead className="text-right">Paid Amount</TableHead>
-                  <TableHead className="text-right">Remaining Balance</TableHead>
-                  <TableHead>Last Payment Date</TableHead>
-                  <TableHead>Action</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {accounts.map((acc) => (
-                  <TableRow
-                    key={acc.id}
-                    className="cursor-pointer hover:bg-gray-50"
-                    onClick={() => router.push(`${basePath}/${acc.id}`)}
-                  >
-                    <TableCell className="text-sm">{acc.name}</TableCell>
-                    <TableCell className="text-center">{acc.totalInvoices}</TableCell>
-                    <TableCell className="text-right text-sm">
-                      ${acc.totalAmount.toLocaleString()}
-                    </TableCell>
-                    <TableCell className="text-right text-sm text-green-600">
-                      ${acc.paidAmount.toLocaleString()}
-                    </TableCell>
-                    <TableCell className="text-right text-sm">
-                      {acc.remainingBalance > 0 ? (
-                        <span className="text-red-600">
-                          ${acc.remainingBalance.toLocaleString()}
-                        </span>
-                      ) : (
-                        <span className="text-green-600">$0</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-sm text-gray-500">
-                      {acc.lastPaymentDate}
-                    </TableCell>
-                    <TableCell>
-                      <div onClick={(e) => e.stopPropagation()}>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => router.push(`${basePath}/${acc.id}`)}
-                        >
-                          <Eye className="w-3.5 h-3.5 mr-1" />
-                          View
-                        </Button>
-                      </div>
-                    </TableCell>
+          {loading ? (
+            <div className="py-10 text-center text-gray-400 text-sm">Loading accounts…</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{columnLabel}</TableHead>
+                    <TableHead>Company</TableHead>
+                    <TableHead className="text-center">Total Invoices</TableHead>
+                    <TableHead className="text-right">Total Amount</TableHead>
+                    <TableHead className="text-right">Paid</TableHead>
+                    <TableHead className="text-right">Remaining</TableHead>
+                    <TableHead>Last Invoice</TableHead>
+                    <TableHead>Action</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {summaries.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={8} className="text-center py-10 text-gray-400">
+                        No accounts found
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    summaries.map(({ profile, totalInvoices, totalAmount, paidAmount, remainingBalance, lastPaymentDate }) => (
+                      <TableRow
+                        key={profile.id}
+                        className="cursor-pointer hover:bg-gray-50"
+                        onClick={() => router.push(`${basePath}/${profile.id}`)}
+                      >
+                        <TableCell className="text-sm font-medium">{profile.full_name}</TableCell>
+                        <TableCell className="text-sm text-gray-600">{profile.company_name}</TableCell>
+                        <TableCell className="text-center text-sm">{totalInvoices}</TableCell>
+                        <TableCell className="text-right text-sm">
+                          {totalAmount > 0 ? `$${totalAmount.toLocaleString()}` : "—"}
+                        </TableCell>
+                        <TableCell className="text-right text-sm text-green-600">
+                          {paidAmount > 0 ? `$${paidAmount.toLocaleString()}` : "—"}
+                        </TableCell>
+                        <TableCell className="text-right text-sm">
+                          {remainingBalance > 0 ? (
+                            <span className="text-red-600">${remainingBalance.toLocaleString()}</span>
+                          ) : (
+                            <span className="text-gray-400">$0</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-sm text-gray-500">
+                          {lastPaymentDate
+                            ? new Date(lastPaymentDate).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+                            : "—"}
+                        </TableCell>
+                        <TableCell>
+                          <div onClick={(e) => e.stopPropagation()}>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => router.push(`${basePath}/${profile.id}`)}
+                            >
+                              <Eye className="w-3.5 h-3.5 mr-1" />View
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          )}
         </CardContent>
       </Card>
     </DashboardLayout>

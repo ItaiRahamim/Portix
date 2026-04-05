@@ -1,13 +1,497 @@
-import { PrismaClient } from "@prisma/client";
+/**
+ * Portix — Supabase Query Layer
+ *
+ * All database interactions go through here.
+ * Pages/components import from this file, NOT from mock-data.ts.
+ *
+ * All queries use the browser Supabase client (client-side).
+ * For server-side queries (RSC / Route Handlers), call createServerSupabaseClient
+ * directly from the page file.
+ *
+ * Schema: portix (configured on the client via db.schema option)
+ */
 
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
+import { createBrowserSupabaseClient } from "@/lib/supabase";
+import type {
+  ContainerView,
+  ContainerStatus,
+  Document,
+  DocumentType,
+  DocumentStatus,
+  Invoice,
+  Claim,
+  ImportLicenseView,
+  Profile,
+  UserRole,
+} from "@/lib/supabase";
 
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: process.env.NODE_ENV === "development" ? ["query", "error", "warn"] : ["error"],
-  });
+// ─── Current user ─────────────────────────────────────────────────────────────
 
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+export async function getCurrentProfile(): Promise<Profile | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  const { data } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("id", user.id)
+    .single();
+
+  return data ?? null;
+}
+
+export async function getCurrentUserId(): Promise<string | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  return user?.id ?? null;
+}
+
+// ─── Containers ───────────────────────────────────────────────────────────────
+
+/**
+ * Returns enriched containers for the current user's role.
+ * RLS automatically filters by role — importer sees their containers,
+ * supplier sees theirs, customs agent sees all.
+ * Uses v_containers view which joins shipment + party names.
+ */
+export async function getContainers(): Promise<ContainerView[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("v_containers")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getContainers:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function getContainerById(id: string): Promise<ContainerView | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("v_containers")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) {
+    console.error("[db] getContainerById:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+export async function updateContainerStatus(
+  containerId: string,
+  status: ContainerStatus
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("containers")
+    .update({ status })
+    .eq("id", containerId);
+
+  if (error) {
+    console.error("[db] updateContainerStatus:", error.message);
+    return false;
+  }
+  return true;
+}
+
+// ─── Documents ────────────────────────────────────────────────────────────────
+
+/**
+ * Returns all 7 documents for a container.
+ * - customs_agent: queries 'documents' table directly (has internal_note via RLS)
+ * - importer/supplier: queries 'v_documents_public' (internal_note excluded)
+ */
+export async function getDocumentsForContainer(
+  containerId: string,
+  includeInternalNote = false
+): Promise<Document[]> {
+  const supabase = createBrowserSupabaseClient();
+  const view = includeInternalNote ? "documents" : "v_documents_public";
+
+  const { data, error } = await supabase
+    .from(view)
+    .select("*")
+    .eq("container_id", containerId)
+    .order("document_type");
+
+  if (error) {
+    console.error("[db] getDocumentsForContainer:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function updateDocumentStatus(
+  documentId: string,
+  status: DocumentStatus,
+  opts?: {
+    rejectionReason?: string | null;
+    internalNote?: string | null;
+    reviewedBy?: string | null;
+  }
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("documents")
+    .update({
+      status,
+      rejection_reason: opts?.rejectionReason ?? null,
+      internal_note: opts?.internalNote ?? null,
+      reviewed_by: opts?.reviewedBy ?? null,
+      reviewed_at: new Date().toISOString(),
+    })
+    .eq("id", documentId);
+
+  if (error) {
+    console.error("[db] updateDocumentStatus:", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function uploadDocumentRecord(opts: {
+  containerId: string;
+  documentType: DocumentType;
+  storagePath: string;
+  fileName: string;
+  fileSizeBytes: number;
+  mimeType: string;
+  uploadedBy: string;
+  documentNumber?: string;
+  issueDate?: string;
+  notes?: string;
+}): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("documents")
+    .update({
+      status: "uploaded",
+      storage_path: opts.storagePath,
+      file_name: opts.fileName,
+      file_size_bytes: opts.fileSizeBytes,
+      mime_type: opts.mimeType,
+      uploaded_by: opts.uploadedBy,
+      uploaded_at: new Date().toISOString(),
+      document_number: opts.documentNumber ?? null,
+      issue_date: opts.issueDate ?? null,
+      notes: opts.notes ?? null,
+      rejection_reason: null,
+      reviewed_by: null,
+      reviewed_at: null,
+    })
+    .eq("container_id", opts.containerId)
+    .eq("document_type", opts.documentType);
+
+  if (error) {
+    console.error("[db] uploadDocumentRecord:", error.message);
+    return false;
+  }
+  return true;
+}
+
+// ─── Invoices ─────────────────────────────────────────────────────────────────
+
+export async function getInvoices(): Promise<Invoice[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("invoices")
+    .select("*")
+    .order("invoice_date", { ascending: false });
+
+  if (error) {
+    console.error("[db] getInvoices:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function getInvoicesByAccount(accountId: string): Promise<Invoice[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("invoices")
+    .select("*")
+    .or(`importer_id.eq.${accountId},supplier_id.eq.${accountId}`)
+    .order("invoice_date", { ascending: false });
+
+  if (error) {
+    console.error("[db] getInvoicesByAccount:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+// ─── Claims ───────────────────────────────────────────────────────────────────
+
+export async function getClaims(): Promise<Claim[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claims")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getClaims:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function getClaimById(claimId: string): Promise<Claim | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claims")
+    .select("*")
+    .eq("id", claimId)
+    .single();
+
+  if (error) {
+    console.error("[db] getClaimById:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+export interface ClaimMessage {
+  id: string;
+  claim_id: string;
+  sender_id: string;
+  message: string;
+  created_at: string;
+}
+
+export async function getClaimMessages(claimId: string): Promise<ClaimMessage[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claim_messages")
+    .select("*")
+    .eq("claim_id", claimId)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    console.error("[db] getClaimMessages:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function sendClaimMessage(
+  claimId: string,
+  message: string
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return false;
+
+  const { error } = await supabase
+    .from("claim_messages")
+    .insert({ claim_id: claimId, sender_id: user.id, message });
+
+  if (error) {
+    console.error("[db] sendClaimMessage:", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function createClaim(opts: {
+  containerId: string;
+  importerId: string;
+  supplierId: string;
+  claimType: string;
+  description: string;
+  amount?: number;
+  currency?: string;
+}): Promise<Claim | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claims")
+    .insert({
+      container_id: opts.containerId,
+      importer_id: opts.importerId,
+      supplier_id: opts.supplierId,
+      claim_type: opts.claimType,
+      description: opts.description,
+      amount: opts.amount ?? null,
+      currency: opts.currency ?? "USD",
+      status: "open",
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[db] createClaim:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+// ─── Import Licenses ──────────────────────────────────────────────────────────
+
+export async function getImportLicenses(): Promise<ImportLicenseView[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("v_import_licenses")
+    .select("*")
+    .order("expiration_date", { ascending: true });
+
+  if (error) {
+    console.error("[db] getImportLicenses:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+// ─── Profiles / Accounts ──────────────────────────────────────────────────────
+
+export async function getAccountProfiles(
+  counterpartRole: UserRole
+): Promise<Profile[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("role", counterpartRole)
+    .order("full_name");
+
+  if (error) {
+    console.error("[db] getAccountProfiles:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+export async function getProfileById(id: string): Promise<Profile | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) {
+    console.error("[db] getProfileById:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+// ─── Cargo Media ──────────────────────────────────────────────────────────────
+
+export interface CargoMedia {
+  id: string;
+  container_id: string;
+  uploaded_by: string;
+  storage_path: string;
+  file_name: string;
+  file_size_bytes: number | null;
+  media_type: "image" | "video" | "document";
+  caption: string | null;
+  created_at: string;
+}
+
+export async function getCargoMediaForContainer(
+  containerId: string
+): Promise<CargoMedia[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("pre_loading_media")
+    .select("*")
+    .eq("container_id", containerId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getCargoMediaForContainer:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+// ─── Shipments ────────────────────────────────────────────────────────────────
+
+export interface Shipment {
+  id: string;
+  shipment_number: string;
+  vessel_name: string;
+  voyage_number: string | null;
+  origin_country: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function createShipment(opts: {
+  shipmentNumber: string;
+  vesselName: string;
+  voyageNumber?: string;
+  originCountry?: string;
+}): Promise<Shipment | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  const { data, error } = await supabase
+    .from("shipments")
+    .insert({
+      shipment_number: opts.shipmentNumber,
+      vessel_name: opts.vesselName,
+      voyage_number: opts.voyageNumber ?? null,
+      origin_country: opts.originCountry ?? null,
+      created_by: user.id,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[db] createShipment:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+export async function createContainer(opts: {
+  shipmentId: string;
+  importerId: string;
+  supplierId: string;
+  containerNumber: string;
+  containerType: string;
+  productName: string;
+  portOfLoading: string;
+  portOfDestination: string;
+  etd: string;
+  eta: string;
+  hsCode?: string;
+  temperatureSetting?: string;
+}): Promise<{ id: string } | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("containers")
+    .insert({
+      shipment_id: opts.shipmentId,
+      importer_id: opts.importerId,
+      supplier_id: opts.supplierId,
+      container_number: opts.containerNumber,
+      container_type: opts.containerType,
+      product_name: opts.productName,
+      port_of_loading: opts.portOfLoading,
+      port_of_destination: opts.portOfDestination,
+      etd: opts.etd,
+      eta: opts.eta,
+      hs_code: opts.hsCode ?? null,
+      temperature_setting: opts.temperatureSetting ?? null,
+    })
+    .select("id")
+    .single();
+
+  if (error) {
+    console.error("[db] createContainer:", error.message);
+    return null;
+  }
+  return data ?? null;
+}

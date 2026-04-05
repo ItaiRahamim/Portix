@@ -310,7 +310,9 @@ let browserClient: ReturnType<typeof createBrowserClient> | null = null
 export function createBrowserSupabaseClient() {
   if (browserClient) return browserClient
 
-  browserClient = createBrowserClient(supabaseUrl!, supabaseAnonKey!)
+  browserClient = createBrowserClient(supabaseUrl!, supabaseAnonKey!, {
+    db: { schema: 'portix' },
+  })
   return browserClient
 }
 
@@ -330,14 +332,15 @@ export function createBrowserSupabaseClient() {
  */
 export function createServerSupabaseClient(cookieStore: ReadonlyRequestCookies) {
   return createServerClient(supabaseUrl!, supabaseAnonKey!, {
+    db: { schema: 'portix' },
     cookies: {
       get(name: string) {
         return cookieStore.get(name)?.value
       },
       set(name: string, value: string, options: CookieOptions) {
         try {
-          // @ts-expect-error — ReadonlyRequestCookies.set is available at runtime
-          cookieStore.set({ name, value, ...options })
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ;(cookieStore as any).set({ name, value, ...options })
         } catch {
           // Server Components cannot set cookies — this is expected in RSC context.
           // The middleware handles cookie refresh instead.
@@ -345,8 +348,8 @@ export function createServerSupabaseClient(cookieStore: ReadonlyRequestCookies) 
       },
       remove(name: string, options: CookieOptions) {
         try {
-          // @ts-expect-error — ReadonlyRequestCookies.set is available at runtime
-          cookieStore.set({ name, value: '', ...options })
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ;(cookieStore as any).set({ name, value: '', ...options })
         } catch {
           // Server Components cannot remove cookies — expected in RSC context.
         }

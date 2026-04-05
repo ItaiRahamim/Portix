@@ -6,18 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "db:generate": "prisma generate",
-    "db:push": "prisma db push",
-    "db:migrate": "prisma migrate dev",
-    "db:studio": "prisma studio"
+    "lint": "next lint"
   },
   "dependencies": {
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "next": "^15.5.12",
-    "@prisma/client": "^5.22.0",
-    "@tanstack/react-query": "^5.62.0",
     "@radix-ui/react-accordion": "1.2.3",
     "@radix-ui/react-alert-dialog": "1.1.6",
     "@radix-ui/react-aspect-ratio": "1.1.2",
@@ -41,9 +32,12 @@
     "@radix-ui/react-slot": "1.1.2",
     "@radix-ui/react-switch": "1.1.3",
     "@radix-ui/react-tabs": "1.1.3",
-    "@radix-ui/react-toggle-group": "1.1.2",
     "@radix-ui/react-toggle": "1.1.2",
+    "@radix-ui/react-toggle-group": "1.1.2",
     "@radix-ui/react-tooltip": "1.1.8",
+    "@supabase/ssr": "^0.10.0",
+    "@supabase/supabase-js": "^2.101.1",
+    "@tanstack/react-query": "^5.62.0",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "cmdk": "1.1.1",
@@ -52,8 +46,11 @@
     "input-otp": "1.4.2",
     "lucide-react": "0.487.0",
     "motion": "12.23.24",
+    "next": "^15.5.12",
     "next-themes": "0.4.6",
+    "react": "18.3.1",
     "react-day-picker": "8.10.1",
+    "react-dom": "18.3.1",
     "react-hook-form": "7.55.0",
     "react-resizable-panels": "2.1.7",
     "recharts": "2.15.2",
@@ -63,15 +60,14 @@
     "vaul": "1.1.2"
   },
   "devDependencies": {
-    "prisma": "^5.22.0",
-    "typescript": "^5.7.0",
+    "@tailwindcss/postcss": "^4.2.1",
     "@types/node": "^20.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
-    "@tailwindcss/postcss": "^4.2.1",
-    "tailwindcss": "4.1.12",
+    "autoprefixer": "^10.4.20",
     "eslint": "^9.0.0",
     "eslint-config-next": "^15.5.12",
-    "autoprefixer": "^10.4.20"
+    "tailwindcss": "4.1.12",
+    "typescript": "^5.7.0"
   }
 }

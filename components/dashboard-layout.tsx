@@ -2,19 +2,30 @@
 
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
-  ArrowLeft,
   Package,
   FileText,
   ShieldCheck,
-  FileWarning,
   Ship,
   Users,
   AlertTriangle,
   Award,
   Calculator,
+  LogOut,
+  ChevronDown,
 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { createBrowserSupabaseClient } from "@/lib/supabase";
+import { toast } from "sonner";
 
 interface DashboardLayoutProps {
   role: "importer" | "supplier" | "customs-agent";
@@ -62,23 +73,54 @@ export function DashboardLayout({ role, title, subtitle, children }: DashboardLa
   const pathname = usePathname();
   const config = roleConfig[role];
   const RoleIcon = config.icon;
+  const [userName, setUserName] = useState<string | null>(null);
+
+  useEffect(() => {
+    const supabase = createBrowserSupabaseClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    supabase.auth.getUser().then((res: any) => {
+      const user = res?.data?.user;
+      if (user) {
+        supabase
+          .from("profiles")
+          .select("full_name")
+          .eq("id", user.id)
+          .single()
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .then((pd: any) => {
+            setUserName(pd?.data?.full_name ?? user.email ?? null);
+          });
+      }
+    });
+  }, []);
+
+  async function handleLogout() {
+    const supabase = createBrowserSupabaseClient();
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      toast.error("Failed to sign out");
+    } else {
+      toast.success("Signed out");
+      router.push("/login");
+      router.refresh();
+    }
+  }
 
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b sticky top-0 z-30">
         <div className="container mx-auto px-4">
           <div className="flex items-center gap-4 py-3">
-            <Button variant="ghost" size="sm" onClick={() => router.push("/")} className="shrink-0">
-              <ArrowLeft className="w-4 h-4 mr-1" />
-              Home
-            </Button>
-            <div className="h-6 w-px bg-gray-200" />
-            <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${config.color} text-white`}>
+            {/* Role badge */}
+            <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${config.color} text-white shrink-0`}>
               <RoleIcon className="w-4 h-4" />
               <span className="text-sm">{config.label}</span>
             </div>
-            <div className="flex-1" />
-            <nav className="flex gap-1 overflow-x-auto">
+
+            <div className="h-6 w-px bg-gray-200" />
+
+            {/* Nav */}
+            <nav className="flex gap-1 overflow-x-auto flex-1">
               {config.nav.map((item) => {
                 const Icon = item.icon;
                 const isActive =
@@ -98,9 +140,38 @@ export function DashboardLayout({ role, title, subtitle, children }: DashboardLa
                 );
               })}
             </nav>
+
+            {/* User menu */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="sm" className="gap-1.5 shrink-0">
+                  <div className="w-6 h-6 rounded-full bg-gray-200 flex items-center justify-center text-xs text-gray-600">
+                    {userName ? userName[0].toUpperCase() : "?"}
+                  </div>
+                  <span className="hidden sm:block text-sm text-gray-700 max-w-[140px] truncate">
+                    {userName ?? "Loading…"}
+                  </span>
+                  <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuLabel className="text-xs text-gray-500 font-normal truncate">
+                  {userName}
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={handleLogout}
+                  className="text-red-600 cursor-pointer"
+                >
+                  <LogOut className="w-4 h-4 mr-2" />
+                  Sign out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </header>
+
       <div className="container mx-auto px-4 py-4">
         <div className="mb-6">
           <h1 className="text-2xl text-gray-900">{title}</h1>
