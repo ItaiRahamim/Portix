@@ -1,0 +1,328 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  IMPORTER
+  SUPPLIER
+  CUSTOMS_AGENT
+}
+
+enum ContainerStatus {
+  DOCUMENTS_MISSING
+  WAITING_CUSTOMS_REVIEW
+  REJECTED_DOCUMENTS
+  READY_FOR_CLEARANCE
+  IN_CLEARANCE
+  RELEASED
+  CLAIM_OPEN
+}
+
+enum DocumentType {
+  BILL_OF_LADING
+  COMMERCIAL_INVOICE
+  PACKING_LIST
+  CERTIFICATE_OF_ORIGIN
+  CUSTOMS_DECLARATION
+  INSURANCE_CERTIFICATE
+  PHYTOSANITARY_CERTIFICATE
+  IMPORT_LICENSE
+  INSPECTION_CERTIFICATE
+  DANGEROUS_GOODS_DECLARATION
+  COOLING_REPORT
+  OTHER
+}
+
+enum DocumentStatus {
+  MISSING
+  UPLOADED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+enum ClaimStatus {
+  OPEN
+  UNDER_REVIEW
+  NEGOTIATION
+  RESOLVED
+  CLOSED
+}
+
+enum ClaimType {
+  DAMAGED_GOODS
+  MISSING_GOODS
+  SHORT_SHIPMENT
+  QUALITY_ISSUE
+  DOCUMENTATION_ERROR
+  DELAY
+  OTHER
+}
+
+enum LicenseStatus {
+  VALID
+  EXPIRING_SOON
+  EXPIRED
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  DOCUMENT
+}
+
+// ─────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  password    String
+  name        String
+  companyName String
+  role        UserRole
+  phone       String?
+  avatar      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  containersAsImporter Container[]     @relation("ContainerImporter")
+  containersAsSupplier Container[]     @relation("ContainerSupplier")
+  documentsUploaded    Document[]      @relation("DocumentUploader")
+  documentsReviewed    Document[]      @relation("DocumentReviewer")
+  preLoadingMedia      PreLoadingMedia[]
+  claimsAsImporter     Claim[]         @relation("ClaimImporter")
+  claimsAsSupplier     Claim[]         @relation("ClaimSupplier")
+  claimMessages        ClaimMessage[]
+  licensesAsImporter   ImportLicense[] @relation("LicenseImporter")
+  licensesAsSupplier   ImportLicense[] @relation("LicenseSupplier")
+  invoicesAsImporter   Invoice[]       @relation("InvoiceImporter")
+  invoicesAsSupplier   Invoice[]       @relation("InvoiceSupplier")
+
+  @@index([role])
+}
+
+// Vessel / Shipment — metadata grouping containers
+model Shipment {
+  id              String   @id @default(cuid())
+  shipmentNumber  String   @unique
+  vesselName      String
+  originPort      String
+  destinationPort String
+  etd             DateTime
+  eta             DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  containers Container[]
+}
+
+// PRIMARY ENTITY
+model Container {
+  id                String          @id @default(cuid())
+  containerNumber   String          @unique
+  shipmentId        String
+  importerId        String
+  supplierId        String
+  product           String
+  portOfLoading     String
+  portOfDestination String
+  etd               DateTime
+  eta               DateTime
+  status            ContainerStatus @default(DOCUMENTS_MISSING)
+  notes             String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  shipment        Shipment         @relation(fields: [shipmentId], references: [id])
+  importer        User             @relation("ContainerImporter", fields: [importerId], references: [id])
+  supplier        User             @relation("ContainerSupplier", fields: [supplierId], references: [id])
+  documents       Document[]
+  preLoadingMedia PreLoadingMedia[]
+  claims          Claim[]
+  invoices        Invoice[]
+
+  @@index([status])
+  @@index([importerId])
+  @@index([supplierId])
+  @@index([shipmentId])
+}
+
+model Document {
+  id              String         @id @default(cuid())
+  containerId     String
+  documentType    DocumentType
+  status          DocumentStatus @default(MISSING)
+  fileUrl         String?
+  fileName        String?
+  fileSize        Int?
+  uploadedById    String?
+  reviewedById    String?
+  rejectionReason String?
+  uploadedAt      DateTime?
+  reviewedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  container  Container @relation(fields: [containerId], references: [id], onDelete: Cascade)
+  uploadedBy User?     @relation("DocumentUploader", fields: [uploadedById], references: [id])
+  reviewedBy User?     @relation("DocumentReviewer", fields: [reviewedById], references: [id])
+
+  @@unique([containerId, documentType])
+  @@index([containerId, status])
+}
+
+// Pre-loading cargo photos/videos uploaded by Supplier
+model PreLoadingMedia {
+  id           String    @id @default(cuid())
+  containerId  String
+  uploadedById String
+  fileUrl      String
+  fileName     String
+  fileSize     Int?
+  mediaType    MediaType
+  comment      String?
+  createdAt    DateTime  @default(now())
+
+  container  Container @relation(fields: [containerId], references: [id], onDelete: Cascade)
+  uploadedBy User      @relation(fields: [uploadedById], references: [id])
+
+  @@index([containerId])
+}
+
+// ─────────────────────────────────────────────
+// FINANCIAL MODULE
+// ─────────────────────────────────────────────
+
+model Invoice {
+  id            String        @id @default(cuid())
+  invoiceNumber String        @unique
+  importerId    String
+  supplierId    String
+  containerId   String?
+  amount        Decimal       @db.Decimal(18, 2)
+  paidAmount    Decimal       @default(0) @db.Decimal(18, 2)
+  status        InvoiceStatus @default(UNPAID)
+  invoiceDate   DateTime
+  dueDate       DateTime?
+  swiftDocUrl   String?
+  swiftFileName String?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  importer  User       @relation("InvoiceImporter", fields: [importerId], references: [id])
+  supplier  User       @relation("InvoiceSupplier", fields: [supplierId], references: [id])
+  container Container? @relation(fields: [containerId], references: [id])
+  payments  Payment[]
+
+  @@index([importerId, supplierId])
+  @@index([status])
+}
+
+model Payment {
+  id        String   @id @default(cuid())
+  invoiceId String
+  amount    Decimal  @db.Decimal(18, 2)
+  paidAt    DateTime
+  reference String?
+  notes     String?
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+// ─────────────────────────────────────────────
+// CLAIMS MODULE
+// ─────────────────────────────────────────────
+
+model Claim {
+  id          String      @id @default(cuid())
+  containerId String
+  importerId  String
+  supplierId  String
+  claimType   ClaimType
+  description String
+  amount      Decimal?    @db.Decimal(18, 2)
+  status      ClaimStatus @default(OPEN)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  container Container      @relation(fields: [containerId], references: [id])
+  importer  User           @relation("ClaimImporter", fields: [importerId], references: [id])
+  supplier  User           @relation("ClaimSupplier", fields: [supplierId], references: [id])
+  messages  ClaimMessage[]
+
+  @@index([containerId])
+  @@index([importerId, supplierId])
+  @@index([status])
+}
+
+model ClaimMessage {
+  id        String   @id @default(cuid())
+  claimId   String
+  senderId  String
+  message   String
+  createdAt DateTime @default(now())
+
+  claim       Claim             @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  sender      User              @relation(fields: [senderId], references: [id])
+  attachments ClaimAttachment[]
+
+  @@index([claimId])
+}
+
+model ClaimAttachment {
+  id             String    @id @default(cuid())
+  claimMessageId String
+  fileUrl        String
+  fileName       String
+  fileSize       Int?
+  mediaType      MediaType
+  createdAt      DateTime  @default(now())
+
+  message ClaimMessage @relation(fields: [claimMessageId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────
+// IMPORT LICENSE MODULE
+// ─────────────────────────────────────────────
+
+model ImportLicense {
+  id             String        @id @default(cuid())
+  importerId     String
+  supplierId     String
+  licenseNumber  String
+  fileUrl        String?
+  fileName       String?
+  issueDate      DateTime
+  expirationDate DateTime
+  status         LicenseStatus @default(VALID)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  importer User @relation("LicenseImporter", fields: [importerId], references: [id])
+  supplier User @relation("LicenseSupplier", fields: [supplierId], references: [id])
+
+  @@index([importerId, supplierId])
+  @@index([expirationDate])
+  @@index([status])
+}
