@@ -20,7 +20,8 @@ import {
   Weight, BarChart3, Info,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { mockSuppliers, mockProducts } from "@/lib/mock-data";
+import { getAccountProfiles } from "@/lib/db";
+import type { Profile } from "@/lib/supabase";
 import { toast } from "sonner";
 
 // ─── Types ──────────────────────────────────────────────────────
@@ -141,17 +142,17 @@ export default function CalculatorPage() {
   // ── Section 4: Profit Simulation ──
   const [targetSellingPricePerKg, setTargetSellingPricePerKg] = useState(0);
 
+  // ── Supplier profiles ──
+  const [supplierProfiles, setSupplierProfiles] = useState<Profile[]>([]);
+  useEffect(() => {
+    getAccountProfiles("supplier").then(setSupplierProfiles);
+  }, []);
+
   // ── Route Templates ──
   const [savedTemplates, setSavedTemplates] = useState<RouteTemplate[]>(DEFAULT_TEMPLATES);
   const [templateName, setTemplateName] = useState("");
 
-  // ── Auto-fill origin country when supplier changes ──
-  useEffect(() => {
-    if (supplierId) {
-      const supplier = mockSuppliers.find((s) => s.id === supplierId);
-      if (supplier) setOriginCountry(supplier.country);
-    }
-  }, [supplierId]);
+  // No origin country auto-fill — Profile has no country field; user enters manually
 
   // ── Product line handlers ──
   const updateProductLine = useCallback((id: string, field: keyof ProductLine, value: string | number) => {
@@ -160,10 +161,7 @@ export default function CalculatorPage() {
         if (pl.id !== id) return pl;
         const updated = { ...pl, [field]: value };
         // Auto-fill HS code when product selected
-        if (field === "productId") {
-          const product = mockProducts.find((p) => p.id === value);
-          if (product) updated.hsCode = product.hsCode;
-        }
+        // No product auto-fill — product name is free text
         return updated;
       })
     );
@@ -385,8 +383,8 @@ export default function CalculatorPage() {
                     <Select value={supplierId} onValueChange={setSupplierId}>
                       <SelectTrigger className="h-9"><SelectValue placeholder="Select supplier" /></SelectTrigger>
                       <SelectContent>
-                        {mockSuppliers.map((s) => (
-                          <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                        {supplierProfiles.map((s) => (
+                          <SelectItem key={s.id} value={s.id}>{s.company_name || s.full_name}</SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
@@ -470,14 +468,12 @@ export default function CalculatorPage() {
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                       <div className="space-y-1">
                         <Label className="text-xs">Product</Label>
-                        <Select value={pl.productId} onValueChange={(v) => updateProductLine(pl.id, "productId", v)}>
-                          <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Select product" /></SelectTrigger>
-                          <SelectContent>
-                            {mockProducts.map((p) => (
-                              <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                        <Input
+                          className="h-8 text-xs"
+                          placeholder="e.g. Citrus Fruits"
+                          value={pl.productId}
+                          onChange={(e) => updateProductLine(pl.id, "productId", e.target.value)}
+                        />
                       </div>
                       <div className="space-y-1">
                         <Label className="text-xs">HS Code</Label>

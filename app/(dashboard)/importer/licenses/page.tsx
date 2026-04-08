@@ -63,6 +63,22 @@ export default function ImporterLicensesPage() {
   const expiringSoonCount = licenses.filter((l) => l.license_status === "expiring_soon").length;
   const expiredCount = licenses.filter((l) => l.license_status === "expired").length;
 
+  async function handleViewLicense(lic: ImportLicenseView) {
+    if (!lic.storage_path) {
+      toast.error("No file attached to this license.");
+      return;
+    }
+    const supabase = createBrowserSupabaseClient();
+    const { data, error } = await supabase.storage
+      .from(STORAGE_BUCKETS.licenseFiles)
+      .createSignedUrl(lic.storage_path, 3600);
+    if (error || !data?.signedUrl) {
+      toast.error("Could not generate a view link. Please try again.");
+      return;
+    }
+    window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+  }
+
   async function handleAddLicense() {
     if (!formSupplierId || !formLicenseNumber || !formIssueDate || !formExpDate) {
       toast.error("Please fill in all required fields.");
@@ -169,7 +185,11 @@ export default function ImporterLicensesPage() {
                       <TableCell className="text-sm font-medium">{lic.license_number}</TableCell>
                       <TableCell>
                         {lic.file_name ? (
-                          <Button variant="ghost" size="sm" className="text-blue-600 gap-1 h-auto py-1 px-2">
+                          <Button
+                            variant="ghost" size="sm"
+                            className="text-blue-600 gap-1 h-auto py-1 px-2"
+                            onClick={() => handleViewLicense(lic)}
+                          >
                             <Eye className="w-3 h-3" />
                             <span className="text-xs truncate max-w-[120px]">{lic.file_name}</span>
                           </Button>
@@ -196,8 +216,13 @@ export default function ImporterLicensesPage() {
                         </span>
                       </TableCell>
                       <TableCell>
-                        <Button variant="outline" size="sm">
-                          <Eye className="w-3.5 h-3.5 mr-1" />View
+                        <Button
+                          variant="outline" size="sm"
+                          disabled={!lic.storage_path}
+                          onClick={() => handleViewLicense(lic)}
+                        >
+                          <Eye className="w-3.5 h-3.5 mr-1" />
+                          {lic.storage_path ? "View" : "No File"}
                         </Button>
                       </TableCell>
                     </TableRow>

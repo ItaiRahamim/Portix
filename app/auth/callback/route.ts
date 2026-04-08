@@ -2,10 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerSupabaseClient } from "@/lib/supabase";
 
+/**
+ * Sanitises the `next` query-param to prevent open-redirect attacks.
+ * Only allows relative paths that start with "/" and do not start with "//",
+ * which would be interpreted as a protocol-relative URL by the browser.
+ */
+function safeRedirectPath(raw: string | null): string {
+  if (!raw) return "/";
+  // Must be a relative path: starts with "/" but NOT "//"
+  if (raw.startsWith("/") && !raw.startsWith("//")) return raw;
+  return "/";
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get("code");
-  const next = searchParams.get("next") ?? "/";
+  const next = safeRedirectPath(searchParams.get("next"));
 
   if (code) {
     const cookieStore = await cookies();
@@ -29,10 +41,13 @@ export async function GET(request: NextRequest) {
             supplier: "/supplier",
             customs_agent: "/customs-agent",
           };
-          return NextResponse.redirect(new URL(roleRoutes[profile.role] ?? next, origin));
+          // Role-based route takes priority; fall back to sanitised `next`
+          const destination = roleRoutes[profile.role] ?? next;
+          return NextResponse.redirect(new URL(destination, origin));
         }
       }
 
+      // No profile yet — send to sanitised `next`
       return NextResponse.redirect(new URL(next, origin));
     }
   }

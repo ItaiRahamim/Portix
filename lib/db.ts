@@ -138,6 +138,20 @@ export async function updateDocumentStatus(
   }
 ): Promise<boolean> {
   const supabase = createBrowserSupabaseClient();
+
+  // ── Role assertion ────────────────────────────────────────────────────────
+  // Only customs_agent may approve or reject. Any other role calling this with
+  // a review status is a client-side bug or a tampered request — reject early.
+  if (status === "approved" || status === "rejected") {
+    const profile = await getCurrentProfile();
+    if (profile?.role !== "customs_agent") {
+      console.error("[db] updateDocumentStatus: permission denied — only customs_agent may approve/reject");
+      return false;
+    }
+    // Always stamp the real reviewer from the session — never trust the client
+    opts = { ...opts, reviewedBy: profile.id };
+  }
+
   const { error } = await supabase
     .from("documents")
     .update({
@@ -258,11 +272,20 @@ export async function getClaimById(claimId: string): Promise<Claim | null> {
   return data ?? null;
 }
 
+export interface ClaimAttachment {
+  storage_path: string;
+  file_name: string;
+  media_type: "image" | "video" | "document";
+  file_size_bytes: number;
+}
+
 export interface ClaimMessage {
   id: string;
   claim_id: string;
   sender_id: string;
   message: string;
+  // Requires: ALTER TABLE portix.claim_messages ADD COLUMN attachments JSONB DEFAULT NULL;
+  attachments: ClaimAttachment[] | null;
   created_at: string;
 }
 
@@ -278,12 +301,16 @@ export async function getClaimMessages(claimId: string): Promise<ClaimMessage[]>
     console.error("[db] getClaimMessages:", error.message);
     return [];
   }
-  return data ?? [];
+  return (data ?? []).map((row: any) => ({
+    ...row,
+    attachments: row.attachments ?? null,
+  }));
 }
 
 export async function sendClaimMessage(
   claimId: string,
-  message: string
+  message: string,
+  attachments?: ClaimAttachment[]
 ): Promise<boolean> {
   const supabase = createBrowserSupabaseClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -291,7 +318,12 @@ export async function sendClaimMessage(
 
   const { error } = await supabase
     .from("claim_messages")
-    .insert({ claim_id: claimId, sender_id: user.id, message });
+    .insert({
+      claim_id: claimId,
+      sender_id: user.id,
+      message,
+      attachments: attachments && attachments.length > 0 ? attachments : null,
+    });
 
   if (error) {
     console.error("[db] sendClaimMessage:", error.message);
@@ -300,21 +332,74 @@ export async function sendClaimMessage(
   return true;
 }
 
+/**
+ * Uploads a single file to the claim-attachments path in the documents bucket.
+ * Returns the ClaimAttachment metadata on success, null on failure.
+ *
+ * Storage path: claims/{claimId}/{timestamp}-{random}.{ext}
+ */
+export async function uploadClaimAttachment(
+  claimId: string,
+  file: File
+): Promise<ClaimAttachment | null> {
+  const supabase = createBrowserSupabaseClient();
+
+  const ext = file.name.split(".").pop() ?? "bin";
+  const storagePath = `claims/${claimId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+  const { error } = await supabase.storage
+    .from("documents")
+    .upload(storagePath, file, { upsert: false });
+
+  if (error) {
+    console.error("[db] uploadClaimAttachment:", error.message);
+    return null;
+  }
+
+  const mediaType: ClaimAttachment["media_type"] = file.type.startsWith("video/")
+    ? "video"
+    : file.type.startsWith("image/")
+    ? "image"
+    : "document";
+
+  return {
+    storage_path: storagePath,
+    file_name: file.name,
+    media_type: mediaType,
+    file_size_bytes: file.size,
+  };
+}
+
 export async function createClaim(opts: {
   containerId: string;
-  importerId: string;
   supplierId: string;
   claimType: string;
   description: string;
   amount?: number;
   currency?: string;
+  // importerId is intentionally NOT accepted from the caller —
+  // it is always derived from the authenticated session below.
 }): Promise<Claim | null> {
   const supabase = createBrowserSupabaseClient();
+
+  // ── Role + identity assertion ─────────────────────────────────────────────
+  // Claims can only be opened by importers. We source importerId from the
+  // session so callers cannot impersonate another importer.
+  const profile = await getCurrentProfile();
+  if (!profile) {
+    console.error("[db] createClaim: not authenticated");
+    return null;
+  }
+  if (profile.role !== "importer") {
+    console.error("[db] createClaim: permission denied — only importers may open claims");
+    return null;
+  }
+
   const { data, error } = await supabase
     .from("claims")
     .insert({
       container_id: opts.containerId,
-      importer_id: opts.importerId,
+      importer_id: profile.id,           // always from session
       supplier_id: opts.supplierId,
       claim_type: opts.claimType,
       description: opts.description,
@@ -411,6 +496,56 @@ export async function getCargoMediaForContainer(
     return [];
   }
   return data ?? [];
+}
+
+export async function uploadCargoMedia(opts: {
+  containerId: string;
+  file: File;
+  storagePath: string;
+  caption?: string;
+}): Promise<CargoMedia | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  // 1. Upload to Storage
+  const { error: uploadError } = await supabase.storage
+    .from("cargo-media")
+    .upload(opts.storagePath, opts.file, { upsert: false });
+
+  if (uploadError) {
+    console.error("[db] uploadCargoMedia (storage):", uploadError.message);
+    return null;
+  }
+
+  // 2. Determine media type
+  const mediaType: CargoMedia["media_type"] = opts.file.type.startsWith("video/")
+    ? "video"
+    : opts.file.type.startsWith("image/")
+    ? "image"
+    : "document";
+
+  // 3. Insert DB record
+  const { data, error: insertError } = await supabase
+    .from("pre_loading_media")
+    .insert({
+      container_id: opts.containerId,
+      uploaded_by: user.id,
+      storage_path: opts.storagePath,
+      file_name: opts.file.name,
+      file_size_bytes: opts.file.size,
+      media_type: mediaType,
+      caption: opts.caption ?? null,
+    })
+    .select()
+    .single();
+
+  if (insertError) {
+    console.error("[db] uploadCargoMedia (insert):", insertError.message);
+    return null;
+  }
+
+  return data ?? null;
 }
 
 // ─── Shipments ────────────────────────────────────────────────────────────────

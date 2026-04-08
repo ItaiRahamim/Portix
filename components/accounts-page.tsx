@@ -22,7 +22,7 @@ interface AccountSummary {
   totalAmount: number;
   paidAmount: number;
   remainingBalance: number;
-  lastPaymentDate: string | null;
+  lastInvoiceDate: string | null;
 }
 
 function buildAccountSummaries(
@@ -60,7 +60,7 @@ function buildAccountSummaries(
       totalAmount,
       paidAmount,
       remainingBalance: totalAmount - paidAmount,
-      lastPaymentDate: sortedByDate[0]?.invoice_date ?? null,
+      lastInvoiceDate: sortedByDate[0]?.invoice_date ?? null,
     });
   }
 
@@ -73,7 +73,7 @@ function buildAccountSummaries(
         totalAmount: 0,
         paidAmount: 0,
         remainingBalance: 0,
-        lastPaymentDate: null,
+        lastInvoiceDate: null,
       });
     }
   }
@@ -154,7 +154,7 @@ export function AccountsPage({ role }: AccountsPageProps) {
                       </TableCell>
                     </TableRow>
                   ) : (
-                    summaries.map(({ profile, totalInvoices, totalAmount, paidAmount, remainingBalance, lastPaymentDate }) => (
+                    summaries.map(({ profile, totalInvoices, totalAmount, paidAmount, remainingBalance, lastInvoiceDate }) => (
                       <TableRow
                         key={profile.id}
                         className="cursor-pointer hover:bg-gray-50"
@@ -177,8 +177,8 @@ export function AccountsPage({ role }: AccountsPageProps) {
                           )}
                         </TableCell>
                         <TableCell className="text-sm text-gray-500">
-                          {lastPaymentDate
-                            ? new Date(lastPaymentDate).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+                          {lastInvoiceDate
+                            ? new Date(lastInvoiceDate).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
                             : "—"}
                         </TableCell>
                         <TableCell>

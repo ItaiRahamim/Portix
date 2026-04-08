@@ -14,6 +14,23 @@ import {
 } from "@/components/ui/select";
 import { Upload } from "lucide-react";
 import { toast } from "sonner";
+
+// ─── Allowed MIME types for document uploads ──────────────────────────────────
+// This is server-side-style validation on the client.
+// Supabase Storage RLS is the ultimate gatekeeper, but this prevents obvious misuse
+// and gives immediate, clear user feedback before any network round-trip.
+const ALLOWED_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/msword",                                                          // .doc
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",    // .docx
+  "application/vnd.ms-excel",                                                   // .xls
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",          // .xlsx
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+const MAX_DOC_SIZE_BYTES = 15 * 1024 * 1024; // 15 MB
 import {
   REQUIRED_DOCUMENT_TYPES,
   DOCUMENT_TYPE_LABELS,
@@ -60,6 +77,24 @@ export function DocumentUploadModal({
   async function handleUpload() {
     if (!preselectedContainerId || !docType || !file) {
       toast.error("Please select a document type and choose a file.");
+      return;
+    }
+
+    // ── Security: MIME type allowlist ──────────────────────────────────────
+    if (!ALLOWED_MIME_TYPES.has(file.type)) {
+      toast.error(
+        `File type "${file.type || "unknown"}" is not allowed. ` +
+        "Please upload a PDF, Word document, Excel spreadsheet, or image (JPG/PNG)."
+      );
+      return;
+    }
+
+    // ── Size guard ─────────────────────────────────────────────────────────
+    if (file.size > MAX_DOC_SIZE_BYTES) {
+      toast.error(
+        `File is too large (${(file.size / (1024 * 1024)).toFixed(1)} MB). ` +
+        "Maximum allowed size is 15 MB. Please compress the document before uploading."
+      );
       return;
     }
 

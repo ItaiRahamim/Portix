@@ -96,7 +96,6 @@ export default function ImporterClaimsPage() {
 
       const claim = await createClaim({
         containerId: selectedContainerId,
-        importerId: profile.id,
         supplierId: container.supplier_id,
         claimType,
         description: description.trim(),

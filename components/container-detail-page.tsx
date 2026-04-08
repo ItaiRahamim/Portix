@@ -9,7 +9,7 @@ import {
 } from "@/components/ui/table";
 import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
-  AlertTriangle, Camera, ImageIcon, Video, MessageSquare,
+  AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
@@ -22,10 +22,14 @@ import {
   getContainerById,
   getDocumentsForContainer,
   getCargoMediaForContainer,
+  uploadCargoMedia,
   updateDocumentStatus,
+  updateContainerStatus,
   getCurrentUserId,
   type CargoMedia,
 } from "@/lib/db";
+import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
+import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/lib/supabase";
 import { toast } from "sonner";
 
 interface ContainerDetailPageProps {
@@ -169,10 +173,82 @@ function CargoPhotosSection({
   role: "importer" | "supplier";
 }) {
   const [photos, setPhotos] = useState<CargoMedia[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [caption, setCaption] = useState("");
+  const [signedUrls, setSignedUrls] = useState<Record<string, string>>({});
+  const imageInputRef = useState<React.RefObject<HTMLInputElement>>(() => ({ current: null }))[0];
+  const videoInputRef = useState<React.RefObject<HTMLInputElement>>(() => ({ current: null }))[0];
 
-  useEffect(() => {
-    getCargoMediaForContainer(containerId).then(setPhotos);
+  const loadPhotos = useCallback(async () => {
+    const media = await getCargoMediaForContainer(containerId);
+    setPhotos(media);
+
+    // Generate signed URLs for viewing
+    const supabase = createBrowserSupabaseClient();
+    const urls: Record<string, string> = {};
+    await Promise.all(
+      media.map(async (m) => {
+        const url = await getSignedUrl(supabase, STORAGE_BUCKETS.cargoMedia, m.storage_path, 3600);
+        if (url) urls[m.id] = url;
+      })
+    );
+    setSignedUrls(urls);
   }, [containerId]);
+
+  useEffect(() => { loadPhotos(); }, [loadPhotos]);
+
+  async function handleFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const rawFile of Array.from(files)) {
+      const { file, error } = await processFileForUpload(rawFile);
+      if (!file || error) {
+        toast.error(error ?? `Could not process ${rawFile.name}`);
+        failed++;
+        continue;
+      }
+
+      const ext = file.name.split(".").pop() ?? "jpg";
+      const storagePath = `${containerId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+      const result = await uploadCargoMedia({
+        containerId,
+        file,
+        storagePath,
+        caption: caption.trim() || undefined,
+      });
+
+      if (result) {
+        succeeded++;
+        // Fire Make webhook (no-op until NEXT_PUBLIC_MAKE_WEBHOOK_URL is set)
+        triggerMakeWebhook({
+          event: "cargo_media_uploaded",
+          containerId,
+          storagePath,
+          fileName: file.name,
+          mediaType: result.media_type,
+          uploadedAt: result.created_at,
+        });
+      } else {
+        failed++;
+      }
+    }
+
+    if (succeeded > 0) {
+      toast.success(`${succeeded} file${succeeded > 1 ? "s" : ""} uploaded.`);
+      setCaption("");
+      loadPhotos();
+    }
+    if (failed > 0) {
+      toast.error(`${failed} file${failed > 1 ? "s" : ""} failed to upload.`);
+    }
+
+    setUploading(false);
+  }
 
   return (
     <Card className="mt-6">
@@ -185,26 +261,31 @@ function CargoPhotosSection({
           {role === "supplier" && (
             <div className="flex gap-2">
               <label>
-                <Button variant="outline" size="sm" className="gap-1.5" asChild>
-                  <span><ImageIcon className="w-4 h-4" />Upload Images</span>
+                <Button variant="outline" size="sm" className="gap-1.5" asChild disabled={uploading}>
+                  <span><ImageIcon className="w-4 h-4" />{uploading ? "Uploading…" : "Upload Images"}</span>
                 </Button>
                 <input
+                  ref={imageInputRef}
                   type="file"
                   className="hidden"
                   accept="image/*"
                   multiple
-                  onChange={() => toast.success("Images uploaded.")}
+                  disabled={uploading}
+                  onChange={(e) => handleFiles(e.target.files)}
                 />
               </label>
               <label>
-                <Button variant="outline" size="sm" className="gap-1.5" asChild>
-                  <span><Video className="w-4 h-4" />Upload Video</span>
+                <Button variant="outline" size="sm" className="gap-1.5" asChild disabled={uploading}>
+                  <span><Video className="w-4 h-4" />{uploading ? "Uploading…" : "Upload Video"}</span>
                 </Button>
                 <input
+                  ref={videoInputRef}
                   type="file"
                   className="hidden"
                   accept="video/*"
-                  onChange={() => toast.success("Video uploaded.")}
+                  multiple
+                  disabled={uploading}
+                  onChange={(e) => handleFiles(e.target.files)}
                 />
               </label>
             </div>
@@ -219,34 +300,52 @@ function CargoPhotosSection({
           </div>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {photos.map((p) => (
-              <div key={p.id} className="rounded-lg border overflow-hidden">
-                <div className="aspect-square bg-gray-100 flex items-center justify-center">
-                  {p.media_type === "image"
-                    ? <ImageIcon className="w-8 h-8 text-gray-300" />
-                    : <Video className="w-8 h-8 text-gray-300" />}
+            {photos.map((p) => {
+              const url = signedUrls[p.id];
+              return (
+                <div key={p.id} className="rounded-lg border overflow-hidden group">
+                  <a href={url ?? "#"} target="_blank" rel="noopener noreferrer" className="block">
+                    <div className="aspect-square bg-gray-100 flex items-center justify-center overflow-hidden relative">
+                      {p.media_type === "image" && url ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={url} alt={p.file_name ?? "cargo photo"} className="object-cover w-full h-full group-hover:opacity-90 transition-opacity" />
+                      ) : p.media_type === "video" ? (
+                        <Video className="w-8 h-8 text-gray-400" />
+                      ) : (
+                        <ImageIcon className="w-8 h-8 text-gray-300" />
+                      )}
+                    </div>
+                  </a>
+                  <div className="p-2">
+                    <p className="text-xs text-gray-500">
+                      {new Date(p.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+                    </p>
+                    {p.caption && <p className="text-xs text-gray-700 mt-0.5 line-clamp-2">{p.caption}</p>}
+                    {p.file_size_bytes && (
+                      <p className="text-[10px] text-gray-400 mt-0.5">{(p.file_size_bytes / 1024).toFixed(0)} KB</p>
+                    )}
+                  </div>
                 </div>
-                <div className="p-2">
-                  <p className="text-xs text-gray-500">
-                    {new Date(p.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
-                  </p>
-                  {p.caption && <p className="text-xs text-gray-700 mt-0.5 line-clamp-2">{p.caption}</p>}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
         {role === "supplier" && (
-          <div className="mt-4 pt-4 border-t flex gap-2">
-            <input
-              type="text"
-              placeholder="Add a comment about the cargo…"
-              className="flex-1 rounded-md border px-3 py-2 text-sm"
-            />
-            <Button size="sm">
-              <MessageSquare className="w-4 h-4 mr-1" />Add
-            </Button>
+          <div className="mt-4 pt-4 border-t">
+            <p className="text-xs text-gray-500 mb-2">Optional caption for next upload:</p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="e.g. Loaded and secured in container, Row A"
+                className="flex-1 rounded-md border px-3 py-2 text-sm"
+                value={caption}
+                onChange={(e) => setCaption(e.target.value)}
+              />
+            </div>
+            <p className="text-[11px] text-gray-400 mt-1.5">
+              Images are compressed to ≤1 MB automatically · Videos max 15 MB · Caption applies to the next batch you upload
+            </p>
           </div>
         )}
       </CardContent>
@@ -270,6 +369,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     isReplacement?: boolean;
   }>({});
   const [rejectDoc, setRejectDoc] = useState<Document | null>(null);
+  const [advancingStatus, setAdvancingStatus] = useState(false);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -308,6 +408,31 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     } else {
       toast.error("Failed to reject document.");
     }
+  }
+
+  async function handleViewDoc(doc: Document) {
+    if (!doc.storage_path) return;
+    const supabase = createBrowserSupabaseClient();
+    const url = await getSignedUrl(supabase, STORAGE_BUCKETS.documents, doc.storage_path, 3600);
+    if (url) {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } else {
+      toast.error("Could not generate a view link. Please try again.");
+    }
+  }
+
+  async function handleAdvanceStatus(nextStatus: "in_clearance" | "released") {
+    if (!container) return;
+    setAdvancingStatus(true);
+    const ok = await updateContainerStatus(container.id, nextStatus);
+    if (ok) {
+      const label = nextStatus === "in_clearance" ? "In Clearance" : "Released";
+      toast.success(`Container moved to ${label}.`);
+      loadData();
+    } else {
+      toast.error("Failed to update container status.");
+    }
+    setAdvancingStatus(false);
   }
 
   const basePath = `/${role}`;
@@ -401,9 +526,37 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               <p className="mt-0.5">{container.port_of_destination}</p>
             </div>
           </div>
-          <div className="mt-4 pt-4 border-t flex items-center gap-2">
+          <div className="mt-4 pt-4 border-t flex items-center gap-3 flex-wrap">
             <span className="text-xs text-gray-500">Status:</span>
             <ContainerStatusBadge status={container.status} />
+
+            {/* Customs agent: advance container through clearance flow */}
+            {role === "customs-agent" && container.status === "ready_for_clearance" && (
+              <Button
+                size="sm"
+                className="gap-1.5 ml-auto bg-blue-600 hover:bg-blue-700"
+                disabled={advancingStatus}
+                onClick={() => handleAdvanceStatus("in_clearance")}
+              >
+                {advancingStatus
+                  ? <Loader2 className="w-4 h-4 animate-spin" />
+                  : <PlayCircle className="w-4 h-4" />}
+                Move to Clearance
+              </Button>
+            )}
+            {role === "customs-agent" && container.status === "in_clearance" && (
+              <Button
+                size="sm"
+                className="gap-1.5 ml-auto bg-green-600 hover:bg-green-700"
+                disabled={advancingStatus}
+                onClick={() => handleAdvanceStatus("released")}
+              >
+                {advancingStatus
+                  ? <Loader2 className="w-4 h-4 animate-spin" />
+                  : <CheckSquare className="w-4 h-4" />}
+                Mark as Released
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -532,7 +685,11 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                     )}
                     <TableCell>
                       {doc.status !== "missing" && doc.storage_path ? (
-                        <Button variant="ghost" size="sm" className="text-blue-600 gap-1 h-auto py-1 px-2">
+                        <Button
+                          variant="ghost" size="sm"
+                          className="text-blue-600 gap-1 h-auto py-1 px-2"
+                          onClick={() => handleViewDoc(doc)}
+                        >
                           <Eye className="w-3 h-3" /><span className="text-xs">View</span>
                         </Button>
                       ) : <span className="text-xs text-gray-400">—</span>}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog";
@@ -10,21 +10,14 @@ import { Label } from "@/components/ui/label";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
-import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2 } from "lucide-react";
-import {
-  mockSuppliers, mockImporters, mockProducts,
-  mockShipments, mockContainers, mockDocuments,
-  ALL_DOCUMENT_TYPES, type Container, type Shipment, type Document,
-} from "@/lib/mock-data";
+import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2, Loader2 } from "lucide-react";
+import { createShipment, createContainer, getCurrentProfile, getAccountProfiles } from "@/lib/db";
+import type { Profile } from "@/lib/supabase";
 import { toast } from "sonner";
-
-// ─── Logged-in mock identities ────────────────────────────────
-const CURRENT_IMPORTER_ID = "IMP001";
-const CURRENT_SUPPLIER_ID = "SUP001";
 
 interface NewContainerFields {
   containerNumber: string;
-  containerType: "20ft" | "40ft" | "40ft HC" | "Reefer 40ft" | "";
+  containerType: "20ft" | "40ft" | "40ft_hc" | "reefer_40ft" | "";
   temperature: string;
   portOfLoading: string;
   portOfDestination: string;
@@ -50,51 +43,64 @@ export function NewShipmentModal({
   open, onClose, onCreated, role = "importer",
 }: NewShipmentModalProps) {
   const [step, setStep] = useState<1 | 2>(1);
+  const [submitting, setSubmitting] = useState(false);
+  const [partyProfiles, setPartyProfiles] = useState<Profile[]>([]);
+  const [loadingParties, setLoadingParties] = useState(false);
 
   // Step 1 – Shipment fields
-  // When importer: supplierId is chosen, importerId is auto
-  // When supplier: importerId is chosen, supplierId is auto
-  const [chosenPartyId, setChosenPartyId] = useState(""); // supplier (importer role) OR importer (supplier role)
-  const [productId, setProductId] = useState("");
+  const [chosenPartyId, setChosenPartyId] = useState("");
+  const [productName, setProductName] = useState("");
   const [vesselName, setVesselName] = useState("");
+  const [voyageNumber, setVoyageNumber] = useState("");
   const [etd, setEtd] = useState("");
   const [eta, setEta] = useState("");
-  const [originCountry, setOriginCountry] = useState(() =>
-    // Supplier always knows their own origin country
-    role === "supplier"
-      ? (mockSuppliers.find((s) => s.id === CURRENT_SUPPLIER_ID)?.country ?? "")
-      : ""
-  );
+  const [originCountry, setOriginCountry] = useState("");
   const [destinationPort, setDestinationPort] = useState("");
 
   // Step 2 – Containers list
   const [containers, setContainers] = useState<NewContainerFields[]>([emptyContainer()]);
 
+  // Load counterpart profiles when modal opens
+  const counterpartRole = role === "importer" ? "supplier" : "importer";
+
+  const loadParties = useCallback(async () => {
+    setLoadingParties(true);
+    const profiles = await getAccountProfiles(counterpartRole);
+    setPartyProfiles(profiles);
+    setLoadingParties(false);
+  }, [counterpartRole]);
+
+  useEffect(() => {
+    if (open) {
+      loadParties();
+      // If supplier, pre-fill their own country via profile
+      if (role === "supplier") {
+        getCurrentProfile().then((p) => {
+          // suppliers can update this field manually
+          setOriginCountry("");
+        });
+      }
+    }
+  }, [open, role, loadParties]);
+
   const resetForm = () => {
     setStep(1);
     setChosenPartyId("");
-    setProductId("");
+    setProductName("");
     setVesselName("");
+    setVoyageNumber("");
     setEtd("");
     setEta("");
-    setOriginCountry(
-      role === "supplier"
-        ? (mockSuppliers.find((s) => s.id === CURRENT_SUPPLIER_ID)?.country ?? "")
-        : ""
-    );
+    setOriginCountry("");
     setDestinationPort("");
     setContainers([emptyContainer()]);
   };
 
   const handleClose = () => { resetForm(); onClose(); };
 
-  // When importer picks a supplier → auto-fill origin country
+  // When importer picks a supplier → could auto-fill origin country if we had it
   const handlePartyChange = (id: string) => {
     setChosenPartyId(id);
-    if (role === "importer") {
-      const supplier = mockSuppliers.find((s) => s.id === id);
-      if (supplier) setOriginCountry(supplier.country);
-    }
   };
 
   const handleDestinationPortChange = (value: string) => {
@@ -116,7 +122,7 @@ export function NewShipmentModal({
 
   // ── Validation ──────────────────────────────────────────────
   const step1Valid =
-    chosenPartyId && productId && vesselName.trim() &&
+    chosenPartyId && productName.trim() && vesselName.trim() &&
     etd && eta && originCountry.trim() && destinationPort.trim();
 
   const step2Valid = containers.every(
@@ -125,68 +131,74 @@ export function NewShipmentModal({
   );
 
   // ── Submit ───────────────────────────────────────────────────
-  const handleSubmit = () => {
-    const supplierId = role === "importer" ? chosenPartyId : CURRENT_SUPPLIER_ID;
-    const importerId = role === "supplier" ? chosenPartyId : CURRENT_IMPORTER_ID;
+  const handleSubmit = async () => {
+    setSubmitting(true);
+    try {
+      const profile = await getCurrentProfile();
+      if (!profile) {
+        toast.error("Could not identify current user. Please log in again.");
+        return;
+      }
 
-    const nextShipmentNum = mockShipments.length + 1;
-    const shipmentId = `SHP-2026-${String(nextShipmentNum).padStart(3, "0")}`;
+      const supplierId = role === "importer" ? chosenPartyId : profile.id;
+      const importerId = role === "supplier" ? chosenPartyId : profile.id;
 
-    const newShipment: Shipment = {
-      id: shipmentId,
-      supplierId,
-      importerId,
-      productId,
-      originCountry,
-      destinationPort,
-      vesselName,
-      etd,
-      eta,
-      status: "in-transit",
-      createdAt: new Date().toISOString().split("T")[0],
-    };
-    mockShipments.push(newShipment);
+      // Generate a unique shipment number
+      const shipmentNumber = `SHP-${new Date().getFullYear()}-${Date.now().toString().slice(-5)}`;
 
-    containers.forEach((cf) => {
-      const containerId = `CNT${String(mockContainers.length + 1).padStart(3, "0")}`;
-
-      const newContainer: Container = {
-        id: containerId,
-        shipmentId,
-        containerNumber: cf.containerNumber.toUpperCase(),
-        containerType: cf.containerType as Container["containerType"],
-        temperature: cf.temperature || undefined,
-        eta,
-        clearanceStatus: "missing-documents",
-        portOfLoading: cf.portOfLoading,
-        portOfDestination: cf.portOfDestination,
-      };
-      mockContainers.push(newContainer);
-
-      ALL_DOCUMENT_TYPES.forEach((docType) => {
-        const newDoc: Document = {
-          id: `DOC${String(mockDocuments.length + 1).padStart(3, "0")}`,
-          type: docType,
-          status: "missing",
-          containerId,
-          shipmentId,
-        };
-        mockDocuments.push(newDoc);
+      const shipment = await createShipment({
+        shipmentNumber,
+        vesselName: vesselName.trim(),
+        voyageNumber: voyageNumber.trim() || undefined,
+        originCountry: originCountry.trim() || undefined,
       });
-    });
 
-    toast.success(
-      `Shipment ${shipmentId} created with ${containers.length} container${containers.length > 1 ? "s" : ""}.`
-    );
-    onCreated();
-    handleClose();
+      if (!shipment) {
+        toast.error("Failed to create shipment. Please try again.");
+        return;
+      }
+
+      // Create all containers in parallel
+      const results = await Promise.all(
+        containers.map((cf) =>
+          createContainer({
+            shipmentId: shipment.id,
+            importerId,
+            supplierId,
+            containerNumber: cf.containerNumber.toUpperCase().trim(),
+            containerType: cf.containerType as string,
+            productName: productName.trim(),
+            portOfLoading: cf.portOfLoading.trim(),
+            portOfDestination: cf.portOfDestination.trim(),
+            etd,
+            eta,
+            temperatureSetting: cf.temperature.trim() || undefined,
+          })
+        )
+      );
+
+      const failed = results.filter((r) => r === null).length;
+      if (failed > 0) {
+        toast.warning(
+          `Shipment ${shipmentNumber} created, but ${failed} container(s) failed. Please check and retry.`
+        );
+      } else {
+        toast.success(
+          `Shipment ${shipmentNumber} created with ${containers.length} container${containers.length > 1 ? "s" : ""}.`
+        );
+      }
+
+      onCreated();
+      handleClose();
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   // ── Derived labels ───────────────────────────────────────────
   const isSupplier = role === "supplier";
   const partyLabel = isSupplier ? "Importer" : "Supplier";
   const partyPlaceholder = isSupplier ? "Select importer" : "Select supplier";
-  const partyOptions = isSupplier ? mockImporters : mockSuppliers;
 
   const docNoteText = isSupplier
     ? "You can start uploading the required documents right away from the container page."
@@ -209,29 +221,30 @@ export function NewShipmentModal({
           <div className="space-y-4 py-2">
             <div className="grid grid-cols-2 gap-4">
 
-              {/* Supplier/Importer picker (depends on role) */}
+              {/* Supplier/Importer picker */}
               <div className="space-y-1.5">
                 <Label>{partyLabel} <span className="text-red-500">*</span></Label>
-                <Select value={chosenPartyId} onValueChange={handlePartyChange}>
-                  <SelectTrigger><SelectValue placeholder={partyPlaceholder} /></SelectTrigger>
+                <Select value={chosenPartyId} onValueChange={handlePartyChange} disabled={loadingParties}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={loadingParties ? "Loading…" : partyPlaceholder} />
+                  </SelectTrigger>
                   <SelectContent>
-                    {partyOptions.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                    {partyProfiles.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.company_name || p.full_name}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
 
               <div className="space-y-1.5">
-                <Label>Product <span className="text-red-500">*</span></Label>
-                <Select value={productId} onValueChange={setProductId}>
-                  <SelectTrigger><SelectValue placeholder="Select product" /></SelectTrigger>
-                  <SelectContent>
-                    {mockProducts.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label>Product Name <span className="text-red-500">*</span></Label>
+                <Input
+                  placeholder="e.g. Citrus Fruits"
+                  value={productName}
+                  onChange={(e) => setProductName(e.target.value)}
+                />
               </div>
 
               <div className="space-y-1.5">
@@ -240,13 +253,22 @@ export function NewShipmentModal({
               </div>
 
               <div className="space-y-1.5">
+                <Label>Voyage Number</Label>
+                <Input placeholder="e.g. 241W" value={voyageNumber} onChange={(e) => setVoyageNumber(e.target.value)} />
+              </div>
+
+              <div className="space-y-1.5">
                 <Label>Origin Country <span className="text-red-500">*</span></Label>
                 <Input
                   placeholder="e.g. South Africa"
                   value={originCountry}
                   onChange={(e) => setOriginCountry(e.target.value)}
-                  // Supplier's own country is auto-filled but still editable
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Destination Port <span className="text-red-500">*</span></Label>
+                <Input placeholder="e.g. Rotterdam, NL" value={destinationPort} onChange={(e) => handleDestinationPortChange(e.target.value)} />
               </div>
 
               <div className="space-y-1.5">
@@ -257,11 +279,6 @@ export function NewShipmentModal({
               <div className="space-y-1.5">
                 <Label>ETA (Estimated Arrival) <span className="text-red-500">*</span></Label>
                 <Input type="date" value={eta} onChange={(e) => setEta(e.target.value)} />
-              </div>
-
-              <div className="space-y-1.5 col-span-2">
-                <Label>Destination Port <span className="text-red-500">*</span></Label>
-                <Input placeholder="e.g. Rotterdam, NL" value={destinationPort} onChange={(e) => handleDestinationPortChange(e.target.value)} />
               </div>
             </div>
           </div>
@@ -298,15 +315,15 @@ export function NewShipmentModal({
                       <SelectContent>
                         <SelectItem value="20ft">20ft</SelectItem>
                         <SelectItem value="40ft">40ft</SelectItem>
-                        <SelectItem value="40ft HC">40ft HC</SelectItem>
-                        <SelectItem value="Reefer 40ft">Reefer 40ft</SelectItem>
+                        <SelectItem value="40ft_hc">40ft HC</SelectItem>
+                        <SelectItem value="reefer_40ft">Reefer 40ft</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
 
-                  {c.containerType === "Reefer 40ft" && (
+                  {c.containerType === "reefer_40ft" && (
                     <div className="space-y-1.5">
-                      <Label className="text-xs">Temperature (optional)</Label>
+                      <Label className="text-xs">Temperature Setting (optional)</Label>
                       <Input placeholder="e.g. -1°C" value={c.temperature} onChange={(e) => updateContainer(idx, "temperature", e.target.value)} />
                     </div>
                   )}
@@ -342,19 +359,23 @@ export function NewShipmentModal({
         <DialogFooter className="flex justify-between sm:justify-between">
           <div>
             {step === 2 && (
-              <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
+              <Button variant="outline" onClick={() => setStep(1)} disabled={submitting}>Back</Button>
             )}
           </div>
           <div className="flex gap-2">
-            <Button variant="ghost" onClick={handleClose}>Cancel</Button>
+            <Button variant="ghost" onClick={handleClose} disabled={submitting}>Cancel</Button>
             {step === 1 && (
               <Button disabled={!step1Valid} onClick={() => setStep(2)}>
                 Next: Containers →
               </Button>
             )}
             {step === 2 && (
-              <Button disabled={!step2Valid} onClick={handleSubmit}>
-                Create Shipment
+              <Button disabled={!step2Valid || submitting} onClick={handleSubmit}>
+                {submitting ? (
+                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Creating…</>
+                ) : (
+                  "Create Shipment"
+                )}
               </Button>
             )}
           </div>

@@ -14,9 +14,9 @@ import {
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import {
-  getClaimById, getClaimMessages, sendClaimMessage, getContainerById,
-  getCurrentUserId, getProfileById,
-  type ClaimMessage,
+  getClaimById, getClaimMessages, sendClaimMessage, uploadClaimAttachment,
+  getContainerById, getCurrentUserId, getProfileById,
+  type ClaimMessage, type ClaimAttachment,
 } from "@/lib/db";
 import type { Claim, ContainerView, Profile } from "@/lib/supabase";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
@@ -52,6 +52,7 @@ const CLAIM_TYPE_LABELS: Record<string, string> = {
 // ── Attachment helpers ────────────────────────────────────────────────────────
 
 interface PendingFile {
+  file: File;
   name: string;
   type: "image" | "video" | "document";
 }
@@ -67,6 +68,42 @@ function AttachmentIcon({ type, className }: { type: "image" | "video" | "docume
   if (type === "image") return <ImageIcon className={cn("text-blue-500", className)} />;
   if (type === "video") return <FileVideo className={cn("text-purple-500", className)} />;
   return <FileText className={cn("text-gray-500", className)} />;
+}
+
+function AttachmentChip({ attachment, isMe }: { attachment: ClaimAttachment; isMe: boolean }) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    const supabase = createBrowserSupabaseClient();
+    supabase.storage
+      .from("documents")
+      .createSignedUrl(attachment.storage_path, 3600)
+      .then((res: any) => { if (res?.data?.signedUrl) setUrl(res.data.signedUrl); });
+  }, [attachment.storage_path]);
+
+  const sizeMB = attachment.file_size_bytes
+    ? `${(attachment.file_size_bytes / 1024).toFixed(0)} KB`
+    : "";
+
+  return (
+    <a
+      href={url ?? "#"}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => { if (!url) e.preventDefault(); }}
+      className={cn(
+        "flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-xl border max-w-[220px] truncate transition-opacity",
+        isMe
+          ? "bg-blue-500 border-blue-400 text-white hover:opacity-80"
+          : "bg-white border-gray-200 text-gray-700 hover:bg-gray-50",
+        !url && "opacity-60 cursor-wait"
+      )}
+    >
+      <AttachmentIcon type={attachment.media_type} className="w-3.5 h-3.5 shrink-0" />
+      <span className="truncate">{attachment.file_name}</span>
+      {sizeMB && <span className="shrink-0 opacity-60">{sizeMB}</span>}
+    </a>
+  );
 }
 
 // ── Props ────────────────────────────────────────────────────────────────────
@@ -143,7 +180,7 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
     const files = Array.from(e.target.files ?? []);
     setPendingFiles((prev) => [
       ...prev,
-      ...files.map((f) => ({ name: f.name, type: inferType(f.name) })),
+      ...files.map((f) => ({ file: f, name: f.name, type: inferType(f.name) })),
     ]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
@@ -151,9 +188,29 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
   const canSend = messageText.trim().length > 0 || pendingFiles.length > 0;
 
   async function handleSend() {
-    if (!canSend || !messageText.trim()) return;
+    if (!canSend) return;
     setSending(true);
-    const ok = await sendClaimMessage(claimId, messageText.trim());
+
+    // 1. Upload any pending files first
+    let attachments: ClaimAttachment[] = [];
+    if (pendingFiles.length > 0) {
+      const results = await Promise.all(
+        pendingFiles.map((pf) => uploadClaimAttachment(claimId, pf.file))
+      );
+      attachments = results.filter((r): r is ClaimAttachment => r !== null);
+      const failed = results.filter((r) => r === null).length;
+      if (failed > 0) {
+        toast.error(`${failed} attachment${failed > 1 ? "s" : ""} failed to upload.`);
+      }
+    }
+
+    // 2. Send the message (text may be empty if only attachments)
+    const ok = await sendClaimMessage(
+      claimId,
+      messageText.trim(),
+      attachments.length > 0 ? attachments : undefined
+    );
+
     if (ok) {
       setMessageText("");
       setPendingFiles([]);
@@ -377,6 +434,19 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
                           : "bg-gray-100 text-gray-900 rounded-tl-sm"
                       )}>
                         {msg.message}
+                      </div>
+                    )}
+
+                    {/* Attachments */}
+                    {msg.attachments && msg.attachments.length > 0 && (
+                      <div className="flex flex-col gap-1 mt-0.5">
+                        {msg.attachments.map((att, i) => (
+                          <AttachmentChip
+                            key={i}
+                            attachment={att}
+                            isMe={isMe}
+                          />
+                        ))}
                       </div>
                     )}
                   </div>
