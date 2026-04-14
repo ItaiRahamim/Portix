@@ -7,12 +7,15 @@ import { Button } from "@/components/ui/button";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import { FileWarning, XCircle, Upload, AlertTriangle, Eye, Plus } from "lucide-react";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import { FileWarning, XCircle, Upload, AlertTriangle, Eye, Plus, Filter } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
 import { getContainers } from "@/lib/db";
-import type { ContainerView } from "@/lib/supabase";
+import type { ContainerView, ContainerStatus } from "@/lib/supabase";
 
 function daysUntil(dateStr: string): number {
   return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
@@ -29,6 +32,9 @@ export default function SupplierDashboardPage() {
   const [containers, setContainers] = useState<ContainerView[]>([]);
   const [loading, setLoading] = useState(true);
   const [newShipmentOpen, setNewShipmentOpen] = useState(false);
+  const [importerFilter, setImporterFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<ContainerStatus | "all">("all");
+  const [showFilters, setShowFilters] = useState(false);
 
   const loadContainers = useCallback(async () => {
     setLoading(true);
@@ -38,6 +44,16 @@ export default function SupplierDashboardPage() {
   }, []);
 
   useEffect(() => { loadContainers(); }, [loadContainers]);
+
+  const uniqueImporters = Array.from(
+    new Map(containers.map((c) => [c.importer_id, c.importer_company])).entries()
+  );
+
+  const filtered = containers.filter((c) => {
+    if (importerFilter !== "all" && c.importer_id !== importerFilter) return false;
+    if (statusFilter !== "all" && c.status !== statusFilter) return false;
+    return true;
+  });
 
   // Computed KPI values
   const totalMissing = containers.reduce((sum, c) => sum + (c.docs_total - c.docs_uploaded), 0);
@@ -59,15 +75,55 @@ export default function SupplierDashboardPage() {
         <KPICard label="Urgent Containers" value={urgentContainers} icon={AlertTriangle} color="text-amber-600" iconColor="text-amber-500" />
       </div>
 
-      <div className="flex justify-end gap-2 mb-4">
-        <Button onClick={() => setNewShipmentOpen(true)} className="gap-1.5">
-          <Plus className="w-4 h-4" /> New Shipment
-        </Button>
-      </div>
-
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Containers</CardTitle>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base">Containers</CardTitle>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)} className="gap-1.5">
+                <Filter className="w-4 h-4" /> Filters
+              </Button>
+              <Button size="sm" onClick={() => setNewShipmentOpen(true)} className="gap-1.5">
+                <Plus className="w-4 h-4" /> New Shipment
+              </Button>
+            </div>
+          </div>
+
+          {showFilters && (
+            <div className="flex flex-wrap items-center gap-3 pt-3">
+              <Select value={importerFilter} onValueChange={setImporterFilter}>
+                <SelectTrigger className="w-[200px]"><SelectValue placeholder="Importer" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Importers</SelectItem>
+                  {uniqueImporters.map(([id, name]) => (
+                    <SelectItem key={id} value={id}>{name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as ContainerStatus | "all")}>
+                <SelectTrigger className="w-[220px]"><SelectValue placeholder="Status" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Statuses</SelectItem>
+                  <SelectItem value="documents_missing">Documents Missing</SelectItem>
+                  <SelectItem value="waiting_customs_review">Waiting Customs Review</SelectItem>
+                  <SelectItem value="rejected_documents">Rejected Documents</SelectItem>
+                  <SelectItem value="ready_for_clearance">Ready for Clearance</SelectItem>
+                  <SelectItem value="in_clearance">In Clearance</SelectItem>
+                  <SelectItem value="released">Released</SelectItem>
+                </SelectContent>
+              </Select>
+              {(importerFilter !== "all" || statusFilter !== "all") && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-gray-500 h-9"
+                  onClick={() => { setImporterFilter("all"); setStatusFilter("all"); }}
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          )}
         </CardHeader>
         <CardContent>
           {loading ? (
@@ -91,13 +147,13 @@ export default function SupplierDashboardPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {containers.length === 0 ? (
+                  {filtered.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={11} className="text-center py-10 text-gray-400">
-                        No containers assigned
+                        {containers.length === 0 ? "No containers assigned" : "No containers match the current filters"}
                       </TableCell>
                     </TableRow>
-                  ) : containers.map((c) => {
+                  ) : filtered.map((c) => {
                     const docsMissing = c.docs_total - c.docs_uploaded;
                     const docsPending = c.docs_uploaded - c.docs_approved - c.docs_rejected;
                     const daysToArrival = daysUntil(c.eta);

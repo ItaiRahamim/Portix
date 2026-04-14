@@ -11,7 +11,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2, Loader2 } from "lucide-react";
-import { createShipment, createContainer, getCurrentProfile, getAccountProfiles } from "@/lib/db";
+import { createShipmentWithContainers, getCurrentProfile, getAccountProfiles } from "@/lib/db";
 import type { Profile } from "@/lib/supabase";
 import { toast } from "sonner";
 
@@ -146,47 +146,34 @@ export function NewShipmentModal({
       // Generate a unique shipment number
       const shipmentNumber = `SHP-${new Date().getFullYear()}-${Date.now().toString().slice(-5)}`;
 
-      const shipment = await createShipment({
+      // Atomic: shipment + all containers + 7 docs per container in one transaction
+      const result = await createShipmentWithContainers({
         shipmentNumber,
         vesselName: vesselName.trim(),
         voyageNumber: voyageNumber.trim() || undefined,
         originCountry: originCountry.trim() || undefined,
+        importerId,
+        supplierId,
+        productName: productName.trim(),
+        etd,
+        eta,
+        containers: containers.map((cf) => ({
+          containerNumber:    cf.containerNumber.toUpperCase().trim(),
+          containerType:      cf.containerType as string,
+          portOfLoading:      cf.portOfLoading.trim(),
+          portOfDestination:  cf.portOfDestination.trim(),
+          temperatureSetting: cf.temperature.trim() || undefined,
+        })),
       });
 
-      if (!shipment) {
+      if (!result) {
         toast.error("Failed to create shipment. Please try again.");
         return;
       }
 
-      // Create all containers in parallel
-      const results = await Promise.all(
-        containers.map((cf) =>
-          createContainer({
-            shipmentId: shipment.id,
-            importerId,
-            supplierId,
-            containerNumber: cf.containerNumber.toUpperCase().trim(),
-            containerType: cf.containerType as string,
-            productName: productName.trim(),
-            portOfLoading: cf.portOfLoading.trim(),
-            portOfDestination: cf.portOfDestination.trim(),
-            etd,
-            eta,
-            temperatureSetting: cf.temperature.trim() || undefined,
-          })
-        )
+      toast.success(
+        `Shipment ${shipmentNumber} created with ${containers.length} container${containers.length > 1 ? "s" : ""}.`
       );
-
-      const failed = results.filter((r) => r === null).length;
-      if (failed > 0) {
-        toast.warning(
-          `Shipment ${shipmentNumber} created, but ${failed} container(s) failed. Please check and retry.`
-        );
-      } else {
-        toast.success(
-          `Shipment ${shipmentNumber} created with ${containers.length} container${containers.length > 1 ? "s" : ""}.`
-        );
-      }
 
       onCreated();
       handleClose();

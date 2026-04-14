@@ -39,13 +39,21 @@ export default function SupplierClaimsPage() {
   const [claims, setClaims] = useState<Claim[]>([]);
   const [containers, setContainers] = useState<ContainerView[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const [c, containers] = await Promise.all([getClaims(), getContainers()]);
-    setClaims(c);
-    setContainers(containers);
-    setLoading(false);
+    setError(null);
+    try {
+      const [c, ctrs] = await Promise.all([getClaims(), getContainers()]);
+      setClaims(c);
+      setContainers(ctrs);
+    } catch (err) {
+      setError("Failed to load claims. Please try again.");
+      console.error("[claims] loadData:", err);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -77,6 +85,11 @@ export default function SupplierClaimsPage() {
         <CardContent>
           {loading ? (
             <div className="py-10 text-center text-gray-400 text-sm">Loading claims…</div>
+          ) : error ? (
+            <div className="py-10 text-center">
+              <p className="text-red-600 text-sm mb-3">{error}</p>
+              <button className="text-sm text-blue-600 underline" onClick={loadData}>Try again</button>
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <Table>

@@ -550,6 +550,64 @@ export async function uploadCargoMedia(opts: {
 
 // ─── Shipments ────────────────────────────────────────────────────────────────
 
+export interface CreateShipmentResult {
+  shipment_id: string;
+  container_ids: string[];
+}
+
+/**
+ * Atomically creates a shipment + containers + 7 document rows per container
+ * via a Supabase RPC (single DB transaction — no partial failures).
+ *
+ * Run migration 00305_rpc_create_shipment.sql in Supabase SQL editor first.
+ */
+export async function createShipmentWithContainers(opts: {
+  shipmentNumber: string;
+  vesselName: string;
+  voyageNumber?: string;
+  originCountry?: string;
+  importerId: string;
+  supplierId: string;
+  productName: string;
+  etd: string;
+  eta: string;
+  containers: {
+    containerNumber: string;
+    containerType: string;
+    portOfLoading: string;
+    portOfDestination: string;
+    temperatureSetting?: string;
+  }[];
+}): Promise<CreateShipmentResult | null> {
+  const supabase = createBrowserSupabaseClient();
+
+  const { data, error } = await supabase.rpc("create_shipment_with_containers", {
+    p_shipment_number: opts.shipmentNumber,
+    p_vessel_name:     opts.vesselName,
+    p_voyage_number:   opts.voyageNumber ?? "",
+    p_origin_country:  opts.originCountry ?? "",
+    p_importer_id:     opts.importerId,
+    p_supplier_id:     opts.supplierId,
+    p_product_name:    opts.productName,
+    p_etd:             opts.etd,
+    p_eta:             opts.eta,
+    p_containers:      opts.containers.map((c) => ({
+      container_number:    c.containerNumber,
+      container_type:      c.containerType,
+      port_of_loading:     c.portOfLoading,
+      port_of_destination: c.portOfDestination,
+      temperature_setting: c.temperatureSetting ?? "",
+    })),
+  });
+
+  if (error) {
+    console.error("[db] createShipmentWithContainers:", error.message);
+    return null;
+  }
+
+  return data as CreateShipmentResult;
+}
+
 export interface Shipment {
   id: string;
   shipment_number: string;

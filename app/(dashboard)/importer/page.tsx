@@ -97,7 +97,7 @@ export default function ImporterDashboardPage() {
           </div>
 
           {showFilters && (
-            <div className="flex flex-wrap gap-3 pt-3">
+            <div className="flex flex-wrap items-center gap-3 pt-3">
               <Select value={supplierFilter} onValueChange={setSupplierFilter}>
                 <SelectTrigger className="w-[200px]"><SelectValue placeholder="Supplier" /></SelectTrigger>
                 <SelectContent>
@@ -119,6 +119,16 @@ export default function ImporterDashboardPage() {
                   <SelectItem value="released">Released</SelectItem>
                 </SelectContent>
               </Select>
+              {(supplierFilter !== "all" || statusFilter !== "all") && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-gray-500 h-9"
+                  onClick={() => { setSupplierFilter("all"); setStatusFilter("all"); }}
+                >
+                  Clear filters
+                </Button>
+              )}
             </div>
           )}
         </CardHeader>

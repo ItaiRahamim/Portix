@@ -7,12 +7,15 @@ import { Button } from "@/components/ui/button";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import { Ship, XCircle, CheckCircle, Clock, Eye } from "lucide-react";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import { Ship, XCircle, CheckCircle, Clock, Eye, Filter } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
 import { ContainerStatusBadge } from "@/components/status-badge";
 import { getContainers } from "@/lib/db";
-import type { ContainerView } from "@/lib/supabase";
+import type { ContainerView, ContainerStatus } from "@/lib/supabase";
 
 function formatDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString("en-GB", {
@@ -24,6 +27,8 @@ export default function CustomsAgentDashboardPage() {
   const router = useRouter();
   const [containers, setContainers] = useState<ContainerView[]>([]);
   const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState<ContainerStatus | "all">("waiting_customs_review");
+  const [showFilters, setShowFilters] = useState(false);
 
   const loadContainers = useCallback(async () => {
     setLoading(true);
@@ -33,6 +38,10 @@ export default function CustomsAgentDashboardPage() {
   }, []);
 
   useEffect(() => { loadContainers(); }, [loadContainers]);
+
+  const filtered = statusFilter === "all"
+    ? containers
+    : containers.filter((c) => c.status === statusFilter);
 
   const containersAwaitingReview = containers.filter(
     (c) => c.docs_uploaded - c.docs_approved - c.docs_rejected > 0
@@ -61,7 +70,39 @@ export default function CustomsAgentDashboardPage() {
 
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Container Review List</CardTitle>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base">Container Review List</CardTitle>
+            <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)} className="gap-1.5">
+              <Filter className="w-4 h-4" /> Filters
+            </Button>
+          </div>
+
+          {showFilters && (
+            <div className="flex flex-wrap items-center gap-3 pt-3">
+              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as ContainerStatus | "all")}>
+                <SelectTrigger className="w-[240px]"><SelectValue placeholder="Status" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Statuses</SelectItem>
+                  <SelectItem value="waiting_customs_review">Waiting Customs Review</SelectItem>
+                  <SelectItem value="documents_missing">Documents Missing</SelectItem>
+                  <SelectItem value="rejected_documents">Rejected Documents</SelectItem>
+                  <SelectItem value="ready_for_clearance">Ready for Clearance</SelectItem>
+                  <SelectItem value="in_clearance">In Clearance</SelectItem>
+                  <SelectItem value="released">Released</SelectItem>
+                </SelectContent>
+              </Select>
+              {statusFilter !== "all" && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-gray-500 h-9"
+                  onClick={() => setStatusFilter("all")}
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          )}
         </CardHeader>
         <CardContent>
           {loading ? (
@@ -85,13 +126,13 @@ export default function CustomsAgentDashboardPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {containers.length === 0 ? (
+                  {filtered.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={11} className="text-center py-10 text-gray-400">
-                        No containers found
+                        {containers.length === 0 ? "No containers found" : "No containers match the current filter"}
                       </TableCell>
                     </TableRow>
-                  ) : containers.map((c) => {
+                  ) : filtered.map((c) => {
                     const docsPending = Math.max(0, c.docs_uploaded - c.docs_approved - c.docs_rejected);
                     return (
                       <TableRow
