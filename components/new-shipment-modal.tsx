@@ -134,6 +134,22 @@ export function NewShipmentModal({
   );
 
   // ── AI Auto-fill ─────────────────────────────────────────────
+
+  /** Case-insensitive partial match: returns the profile whose company_name or
+   *  full_name contains the AI string, or whose AI string contains the name. */
+  function matchPartyByName(aiName: string): string | null {
+    if (!aiName?.trim()) return null;
+    const needle = aiName.trim().toLowerCase();
+    const match = partyProfiles.find((p) => {
+      const haystack = (p.company_name || p.full_name).toLowerCase();
+      return haystack.includes(needle) || needle.includes(haystack);
+    });
+    if (!match) {
+      console.warn(`[AI autofill] No profile match for "${aiName}". Leaving party unset.`);
+    }
+    return match?.id ?? null;
+  }
+
   async function handleAiAutofill(file: File) {
     setAiParsing(true);
     try {
@@ -147,19 +163,32 @@ export function NewShipmentModal({
       }
       const { shipment, containers: parsedContainers } = await res.json();
 
-      // Map Make response → form state (all fields remain editable)
-      if (shipment.vesselName)      setVesselName(shipment.vesselName);
-      if (shipment.voyageNumber)    setVoyageNumber(shipment.voyageNumber);
-      if (shipment.originCountry)   setOriginCountry(shipment.originCountry);
+      // ── Party (supplier / importer) — fuzzy match name → UUID ──────────────
+      const partyRawName = shipment.supplierName ?? shipment.importerName ?? null;
+      if (partyRawName) {
+        const matched = matchPartyByName(partyRawName);
+        if (matched) {
+          setChosenPartyId(matched);
+        } else {
+          toast.warning(`Could not match "${partyRawName}" to a known ${isSupplier ? "importer" : "supplier"}. Select manually.`);
+        }
+      }
+
+      // ── Scalar fields ───────────────────────────────────────────────────────
+      if (shipment.productName)    setProductName(shipment.productName);
+      if (shipment.vesselName)     setVesselName(shipment.vesselName);
+      if (shipment.voyageNumber)   setVoyageNumber(shipment.voyageNumber);
+      if (shipment.originCountry)  setOriginCountry(shipment.originCountry);
+      if (shipment.etd)            setEtd(shipment.etd);
+      if (shipment.eta)            setEta(shipment.eta);
       if (shipment.destinationPort) {
         setDestinationPort(shipment.destinationPort);
         setContainers((prev) =>
           prev.map((c) => ({ ...c, portOfDestination: shipment.destinationPort }))
         );
       }
-      if (shipment.etd) setEtd(shipment.etd);
-      if (shipment.eta) setEta(shipment.eta);
 
+      // ── Containers ─────────────────────────────────────────────────────────
       if (Array.isArray(parsedContainers) && parsedContainers.length > 0) {
         setContainers(
           parsedContainers.map((pc: {
@@ -169,17 +198,17 @@ export function NewShipmentModal({
             portOfDestination?: string;
             temperature?: string;
           }) => ({
-            containerNumber: pc.containerNumber ?? "",
-            containerType: (pc.containerType as NewContainerFields["containerType"]) ?? "",
-            portOfLoading:    pc.portOfLoading    ?? "",
+            containerNumber:   pc.containerNumber  ?? "",
+            containerType:     (pc.containerType as NewContainerFields["containerType"]) ?? "",
+            portOfLoading:     pc.portOfLoading    ?? "",
             portOfDestination: pc.portOfDestination ?? shipment.destinationPort ?? "",
-            temperature:      pc.temperature      ?? "",
+            temperature:       pc.temperature      ?? "",
           }))
         );
       }
 
       toast.success("Form filled from document — review and adjust before submitting.");
-    } catch (err) {
+    } catch {
       toast.error("AI parsing failed. Fill manually.");
     } finally {
       setAiParsing(false);
