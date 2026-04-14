@@ -10,8 +10,9 @@ import { Label } from "@/components/ui/label";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
-import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2, Loader2 } from "lucide-react";
+import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2, Loader2, Sparkles } from "lucide-react";
 import { createShipmentWithContainers, getCurrentProfile, getAccountProfiles } from "@/lib/db";
+import { useRef } from "react";
 import type { Profile } from "@/lib/supabase";
 import { toast } from "sonner";
 
@@ -44,6 +45,8 @@ export function NewShipmentModal({
 }: NewShipmentModalProps) {
   const [step, setStep] = useState<1 | 2>(1);
   const [submitting, setSubmitting] = useState(false);
+  const [aiParsing, setAiParsing] = useState(false);
+  const aiFileRef = useRef<HTMLInputElement>(null);
   const [partyProfiles, setPartyProfiles] = useState<Profile[]>([]);
   const [loadingParties, setLoadingParties] = useState(false);
 
@@ -130,6 +133,60 @@ export function NewShipmentModal({
             c.portOfLoading.trim() && c.portOfDestination.trim()
   );
 
+  // ── AI Auto-fill ─────────────────────────────────────────────
+  async function handleAiAutofill(file: File) {
+    setAiParsing(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/parse-shipment", { method: "POST", body: form });
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "AI parsing failed" }));
+        toast.error(error ?? "AI parsing failed");
+        return;
+      }
+      const { shipment, containers: parsedContainers } = await res.json();
+
+      // Map Make response → form state (all fields remain editable)
+      if (shipment.vesselName)      setVesselName(shipment.vesselName);
+      if (shipment.voyageNumber)    setVoyageNumber(shipment.voyageNumber);
+      if (shipment.originCountry)   setOriginCountry(shipment.originCountry);
+      if (shipment.destinationPort) {
+        setDestinationPort(shipment.destinationPort);
+        setContainers((prev) =>
+          prev.map((c) => ({ ...c, portOfDestination: shipment.destinationPort }))
+        );
+      }
+      if (shipment.etd) setEtd(shipment.etd);
+      if (shipment.eta) setEta(shipment.eta);
+
+      if (Array.isArray(parsedContainers) && parsedContainers.length > 0) {
+        setContainers(
+          parsedContainers.map((pc: {
+            containerNumber?: string;
+            containerType?: string;
+            portOfLoading?: string;
+            portOfDestination?: string;
+            temperature?: string;
+          }) => ({
+            containerNumber: pc.containerNumber ?? "",
+            containerType: (pc.containerType as NewContainerFields["containerType"]) ?? "",
+            portOfLoading:    pc.portOfLoading    ?? "",
+            portOfDestination: pc.portOfDestination ?? shipment.destinationPort ?? "",
+            temperature:      pc.temperature      ?? "",
+          }))
+        );
+      }
+
+      toast.success("Form filled from document — review and adjust before submitting.");
+    } catch (err) {
+      toast.error("AI parsing failed. Fill manually.");
+    } finally {
+      setAiParsing(false);
+      if (aiFileRef.current) aiFileRef.current.value = "";
+    }
+  }
+
   // ── Submit ───────────────────────────────────────────────────
   const handleSubmit = async () => {
     setSubmitting(true);
@@ -206,6 +263,41 @@ export function NewShipmentModal({
         {/* ── STEP 1 ── */}
         {step === 1 && (
           <div className="space-y-4 py-2">
+
+            {/* AI Auto-fill strip */}
+            <div className="flex items-center gap-3 rounded-lg border border-dashed border-blue-200 bg-blue-50/60 px-4 py-2.5">
+              <Sparkles className="w-4 h-4 text-blue-500 shrink-0" />
+              <p className="text-xs text-blue-700 flex-1">
+                Have a Bill of Lading or Shipping Instruction? Auto-fill the form with AI.
+              </p>
+              <label>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 text-blue-700 border-blue-300 bg-white hover:bg-blue-50"
+                  asChild
+                  disabled={aiParsing}
+                >
+                  <span>
+                    {aiParsing
+                      ? <><Loader2 className="w-3.5 h-3.5 animate-spin" />Parsing…</>
+                      : <><Sparkles className="w-3.5 h-3.5" />Auto-fill with AI</>}
+                  </span>
+                </Button>
+                <input
+                  ref={aiFileRef}
+                  type="file"
+                  className="hidden"
+                  accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx"
+                  disabled={aiParsing}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleAiAutofill(f);
+                  }}
+                />
+              </label>
+            </div>
+
             <div className="grid grid-cols-2 gap-4">
 
               {/* Supplier/Importer picker */}

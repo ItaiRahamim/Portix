@@ -10,8 +10,9 @@ import {
 import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
-  Package, Anchor, Ship, Globe, CheckCheck, Truck,
+  Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X,
 } from "lucide-react";
+import { useRef } from "react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { DocStatusBadge, ContainerStatusBadge } from "@/components/status-badge";
 import { DocumentUploadModal } from "@/components/document-upload-modal";
@@ -353,6 +354,152 @@ function CargoPhotosSection({
   );
 }
 
+// ─── Smart Upload Zone ────────────────────────────────────────────────────────
+
+function SmartUploadZone({
+  containerId,
+  onDocumentsUpdated,
+}: {
+  containerId: string;
+  onDocumentsUpdated: () => void;
+}) {
+  const [processing, setProcessing] = useState(false);
+  const [result, setResult] = useState<{ document_type: string; success: boolean }[] | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  async function runClassify(file: File) {
+    setProcessing(true);
+    setResult(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("containerId", containerId);
+
+      const res = await fetch("/api/classify-documents", { method: "POST", body: form });
+
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "Classification failed" }));
+        toast.error(error ?? "AI classification failed");
+        return;
+      }
+
+      const { updated, message } = await res.json();
+
+      if (message) {
+        toast.info(message);
+        return;
+      }
+
+      const succeeded = (updated as { document_type: string; success: boolean }[]).filter((u) => u.success);
+      if (succeeded.length > 0) {
+        toast.success(
+          `${succeeded.length} document type${succeeded.length > 1 ? "s" : ""} identified and uploaded.`
+        );
+        setResult(updated);
+        onDocumentsUpdated();
+      } else {
+        toast.warning("No documents could be uploaded. Check the file and retry.");
+      }
+    } catch {
+      toast.error("Smart upload failed. Fill manually.");
+    } finally {
+      setProcessing(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) runClassify(file);
+  }
+
+  return (
+    <Card className="mb-4 border-blue-200">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm flex items-center gap-2 text-blue-700">
+          <Sparkles className="w-4 h-4" />
+          Smart Upload — AI Document Classification
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div
+          className={`relative rounded-lg border-2 border-dashed transition-colors p-6 text-center cursor-pointer ${
+            isDragging
+              ? "border-blue-400 bg-blue-50"
+              : "border-blue-200 bg-blue-50/40 hover:bg-blue-50"
+          } ${processing ? "pointer-events-none opacity-60" : ""}`}
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={handleDrop}
+          onClick={() => !processing && fileRef.current?.click()}
+        >
+          <input
+            ref={fileRef}
+            type="file"
+            className="hidden"
+            accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx"
+            disabled={processing}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) runClassify(f);
+            }}
+          />
+          {processing ? (
+            <div className="flex flex-col items-center gap-2">
+              <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
+              <p className="text-sm text-blue-700">AI is classifying your documents…</p>
+              <p className="text-xs text-gray-500">This may take 10–30 seconds</p>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-2">
+              <Sparkles className="w-6 h-6 text-blue-400" />
+              <p className="text-sm text-blue-700">
+                Drop a document bundle here or{" "}
+                <span className="underline">click to select</span>
+              </p>
+              <p className="text-xs text-gray-500">
+                PDF, Word, or image · AI identifies document types automatically
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Results summary */}
+        {result && result.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {result.map((r) => (
+              <span
+                key={r.document_type}
+                className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${
+                  r.success
+                    ? "bg-green-100 text-green-700"
+                    : "bg-red-100 text-red-700"
+                }`}
+              >
+                {r.success ? (
+                  <CheckCircle className="w-3 h-3" />
+                ) : (
+                  <X className="w-3 h-3" />
+                )}
+                {r.document_type.replace(/_/g, " ")}
+              </span>
+            ))}
+            <button
+              className="text-xs text-gray-400 underline ml-1"
+              onClick={() => setResult(null)}
+            >
+              dismiss
+            </button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
@@ -625,6 +772,11 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           </div>
         </CardContent>
       </Card>
+
+      {/* Smart Upload Zone — supplier only */}
+      {role === "supplier" && (
+        <SmartUploadZone containerId={containerId} onDocumentsUpdated={loadData} />
+      )}
 
       {/* Document Checklist Table */}
       <Card>
