@@ -1,4 +1,4 @@
-# CLAUDE.md — KILO Project Guide
+# CLAUDE.md — Portix Project Guide
 
 > This file is the single source of truth for working on KILO.
 > Update it whenever a new pattern, bug, or preference is discovered — don't wait to be asked.
