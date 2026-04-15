@@ -33,6 +33,7 @@ export default function RootPage() {
         importer: "/importer",
         supplier: "/supplier",
         customs_agent: "/customs-agent",
+        customs: "/customs-agent",
       };
 
       router.replace(profile?.role ? (roleRoutes[profile.role] ?? "/login") : "/login");

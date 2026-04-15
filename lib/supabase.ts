@@ -42,7 +42,7 @@ if (!supabaseUrl || !supabaseAnonKey) {
 // Replace with: npx supabase gen types typescript --project-id YOUR_PROJECT_ID > lib/database.types.ts
 // Until then, using a minimal type for type safety without full type generation.
 
-export type UserRole = 'importer' | 'supplier' | 'customs_agent'
+export type UserRole = 'importer' | 'supplier' | 'customs_agent' | 'customs'
 
 export type ContainerStatus =
   | 'documents_missing'

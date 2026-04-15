@@ -144,8 +144,8 @@ export async function updateDocumentStatus(
   // a review status is a client-side bug or a tampered request — reject early.
   if (status === "approved" || status === "rejected") {
     const profile = await getCurrentProfile();
-    if (profile?.role !== "customs_agent") {
-      console.error("[db] updateDocumentStatus: permission denied — only customs_agent may approve/reject");
+    if (profile?.role !== "customs_agent" && profile?.role !== "customs") {
+      console.error("[db] updateDocumentStatus: permission denied — only customs agent may approve/reject");
       return false;
     }
     // Always stamp the real reviewer from the session — never trust the client
@@ -703,7 +703,7 @@ export async function getCustomsAgents(): Promise<Profile[]> {
   const { data, error } = await supabase
     .from("profiles")
     .select("id, email, full_name, company_name, role, phone, avatar_url, created_at, updated_at")
-    .eq("role", "customs_agent")
+    .in("role", ["customs", "customs_agent"])   // support both during transition
     .order("full_name", { ascending: true });
 
   if (error) {

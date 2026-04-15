@@ -101,8 +101,9 @@ export function AccountsPage({ role }: AccountsPageProps) {
       getAccountProfiles(counterpartRole),
     ]);
 
+    // Map URL role slug → DB role value (support both old and new customs role names)
     const currentRole: UserRole =
-      role === "customs-agent" ? "customs_agent" : role as UserRole;
+      role === "customs-agent" ? "customs" : role as UserRole;
     setSummaries(buildAccountSummaries(invoices, profiles, currentRole));
     setLoading(false);
   }, [role, counterpartRole]);

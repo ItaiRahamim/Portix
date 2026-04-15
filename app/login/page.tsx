@@ -56,6 +56,7 @@ export default function LoginPage() {
       importer: "/importer",
       supplier: "/supplier",
       customs_agent: "/customs-agent",
+      customs: "/customs-agent",
     };
 
     router.push(roleRoutes[profile.role] ?? "/");

@@ -40,6 +40,7 @@ export async function GET(request: NextRequest) {
             importer: "/importer",
             supplier: "/supplier",
             customs_agent: "/customs-agent",
+            customs: "/customs-agent",
           };
           // Role-based route takes priority; fall back to sanitised `next`
           const destination = roleRoutes[profile.role] ?? next;
