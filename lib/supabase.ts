@@ -109,6 +109,11 @@ export interface Container {
   docs_approved: number
   docs_rejected: number
   notes: string | null
+  // Carrier tracking fields (populated by track-containers Edge Function)
+  current_location: string | null
+  api_eta: string | null
+  tracking_status_raw: Record<string, unknown> | null
+  last_tracking_update: string | null
   created_at: string
   updated_at: string
 }

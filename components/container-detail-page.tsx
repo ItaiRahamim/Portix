@@ -10,7 +10,7 @@ import {
 import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
-  Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X,
+  Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
 } from "lucide-react";
 import { useRef } from "react";
 import { DashboardLayout } from "@/components/dashboard-layout";
@@ -672,7 +672,48 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               <p className="text-gray-500 text-xs">Port of Destination</p>
               <p className="mt-0.5">{container.port_of_destination}</p>
             </div>
+
+            {/* Carrier tracking fields — only shown when the Edge Function has polled */}
+            {container.current_location && (
+              <div>
+                <p className="text-gray-500 text-xs flex items-center gap-1">
+                  <MapPin className="w-3 h-3 text-blue-400" />
+                  Live Location
+                </p>
+                <p className="mt-0.5 text-blue-700 font-medium">{container.current_location}</p>
+              </div>
+            )}
+            {container.api_eta && (
+              <div>
+                <p className="text-gray-500 text-xs flex items-center gap-1">
+                  <Signal className="w-3 h-3 text-blue-400" />
+                  Carrier ETA
+                </p>
+                <p className="mt-0.5 text-blue-700">
+                  {new Date(container.api_eta).toLocaleDateString("en-GB", {
+                    day: "2-digit",
+                    month: "short",
+                    year: "numeric",
+                  })}
+                </p>
+              </div>
+            )}
           </div>
+
+          {/* Last tracking update timestamp */}
+          {container.last_tracking_update && (
+            <p className="text-[11px] text-gray-400 mt-3 flex items-center gap-1">
+              <Signal className="w-3 h-3" />
+              Live tracking last updated{" "}
+              {new Date(container.last_tracking_update).toLocaleString("en-GB", {
+                day: "2-digit",
+                month: "short",
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </p>
+          )}
+
           <div className="mt-4 pt-4 border-t flex items-center gap-3 flex-wrap">
             <span className="text-xs text-gray-500">Status:</span>
             <ContainerStatusBadge status={container.status} />
