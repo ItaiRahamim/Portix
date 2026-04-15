@@ -620,6 +620,7 @@ export interface Shipment {
   origin_port: string | null;      // nullable — falls back to first container port
   destination_port: string | null; // nullable — falls back to first container port
   origin_country: string | null;
+  customs_agent_id: string | null; // UUID of assigned customs agent (role=customs)
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -690,6 +691,52 @@ export async function createContainer(opts: {
 
   if (error) {
     console.error("[db] createContainer:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+// ─── Customs Agent Assignment ──────────────────────────────────────────────
+
+export async function getCustomsAgents(): Promise<Profile[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, email, full_name, company_name, role, phone, avatar_url, created_at, updated_at")
+    .eq("role", "customs_agent")
+    .order("full_name", { ascending: true });
+
+  if (error) {
+    console.error("[db] getCustomsAgents:", error.message);
+    return [];
+  }
+  return (data ?? []) as Profile[];
+}
+
+export async function assignCustomsAgent(shipmentId: string, customsAgentId: string | null): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("shipments")
+    .update({ customs_agent_id: customsAgentId })
+    .eq("id", shipmentId);
+
+  if (error) {
+    console.error("[db] assignCustomsAgent:", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function getShipmentById(shipmentId: string): Promise<Shipment | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("shipments")
+    .select("*")
+    .eq("id", shipmentId)
+    .single();
+
+  if (error) {
+    console.error("[db] getShipmentById:", error.message);
     return null;
   }
   return data ?? null;
