@@ -416,12 +416,20 @@ function SmartUploadZone({
         return;
       }
 
-      // ── Step 2: Read file bytes once — reused for every storage upload ─────────
+      // ── Step 2: Upload file ONCE to a shipment-level path ───────────────────
+      // Single source of truth — all matched document rows point to this path.
       const supabase = createBrowserSupabaseClient();
       const fileBytes = await file.arrayBuffer();
       const ext = file.name.split(".").pop() ?? "bin";
-      const timestamp = Date.now();
-      const rand = Math.random().toString(36).slice(2);
+      const storagePath = `smart_uploads/${container.shipment_id}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(STORAGE_BUCKETS.documents)
+        .upload(storagePath, fileBytes, { contentType: file.type, upsert: true });
+
+      if (uploadError) {
+        console.warn("[SmartUpload] storage upload failed:", uploadError.message);
+      }
 
       // ── Step 3: Resolve sibling containers in this shipment ──────────────────
       const { data: shipmentContainers } = await supabase
@@ -431,7 +439,7 @@ function SmartUploadZone({
 
       const siblings: { id: string; container_number: string }[] = shipmentContainers ?? [];
 
-      // ── Step 4: Upload file to Storage + PATCH each document row ─────────────
+      // ── Step 4: PATCH each matched document row (no more uploads) ────────────
       const updates: ClassifyResult[] = (
         await Promise.all(
           documents_found.map(async (doc) => {
@@ -451,42 +459,24 @@ function SmartUploadZone({
               targetIds = matched ? [matched.id] : [container.id];
             }
 
-            // Apply storage upload + DB patch to every targeted container
+            // Shared patch — same storage_path for every targeted row
+            const patch = {
+              status: "uploaded" as const,
+              storage_path: uploadError ? null : storagePath,
+              file_name: file.name,
+              file_size_bytes: file.size,
+              mime_type: file.type,
+              document_number: doc.document_number ?? null,
+              ai_data: { ...doc.extracted_data, ...doc },
+              uploaded_at: new Date().toISOString(),
+              rejection_reason: null,
+              reviewed_by: null,
+              reviewed_at: null,
+            };
+
+            // Never overwrite approved or rejected docs
             const rowResults = await Promise.all(
               targetIds.map(async (cid) => {
-                // Each container gets its own storage path under its own prefix
-                const storagePath = `${cid}/${doc.document_type}/${timestamp}-${rand}.${ext}`;
-
-                const { error: uploadError } = await supabase.storage
-                  .from(STORAGE_BUCKETS.documents)
-                  .upload(storagePath, fileBytes, {
-                    contentType: file.type,
-                    upsert: true,
-                  });
-
-                if (uploadError) {
-                  console.warn(
-                    `[SmartUpload] storage upload failed for ${doc.document_type} / ${cid}:`,
-                    uploadError.message
-                  );
-                }
-
-                const patch = {
-                  status: "uploaded" as const,
-                  // chk_storage_path_when_uploaded: storage_path + file_name required
-                  storage_path: uploadError ? null : storagePath,
-                  file_name: file.name,
-                  file_size_bytes: file.size,
-                  mime_type: file.type,
-                  document_number: doc.document_number ?? null,
-                  ai_data: { ...doc.extracted_data, ...doc },
-                  uploaded_at: new Date().toISOString(),
-                  rejection_reason: null,
-                  reviewed_by: null,
-                  reviewed_at: null,
-                };
-
-                // Never overwrite approved or rejected docs
                 const { error: dbError } = await supabase
                   .from("documents")
                   .update(patch)
@@ -500,7 +490,6 @@ function SmartUploadZone({
                     dbError.message
                   );
                 }
-
                 return !dbError;
               })
             );
