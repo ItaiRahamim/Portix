@@ -135,13 +135,31 @@ export function NewShipmentModal({
 
   // ── AI Auto-fill ─────────────────────────────────────────────
 
-  /** Case-insensitive partial match: returns the profile whose company_name or
-   *  full_name contains the AI string, or whose AI string contains the name. */
+  // Deduplicated list — one entry per unique company_name (first profile wins).
+  // Prevents duplicate options when multiple users share the same company.
+  const dedupedParties = partyProfiles.reduce<Profile[]>((acc, p) => {
+    const name = p.company_name || p.full_name;
+    if (!acc.some((x) => (x.company_name || x.full_name) === name)) acc.push(p);
+    return acc;
+  }, []);
+
+  /** Strip diacritics + lowercase — handles "Celestée" === "Celestee". */
+  function normalize(str: string): string {
+    return str
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .trim();
+  }
+
+  /** Fuzzy-match an AI name string → UUID from dedupedParties.
+   *  Searches the deduped list so the returned ID is always one
+   *  that actually appears in the rendered dropdown. */
   function matchPartyByName(aiName: string): string | null {
     if (!aiName?.trim()) return null;
-    const needle = aiName.trim().toLowerCase();
-    const match = partyProfiles.find((p) => {
-      const haystack = (p.company_name || p.full_name).toLowerCase();
+    const needle = normalize(aiName);
+    const match = dedupedParties.find((p) => {
+      const haystack = normalize(p.company_name || p.full_name);
       return haystack.includes(needle) || needle.includes(haystack);
     });
     if (!match) {
@@ -337,7 +355,7 @@ export function NewShipmentModal({
                     <SelectValue placeholder={loadingParties ? "Loading…" : partyPlaceholder} />
                   </SelectTrigger>
                   <SelectContent>
-                    {partyProfiles.map((p) => (
+                    {dedupedParties.map((p) => (
                       <SelectItem key={p.id} value={p.id}>
                         {p.company_name || p.full_name}
                       </SelectItem>
