@@ -1,13 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createAdminSupabaseClient } from "@/lib/supabase-admin";
 
 /**
  * POST /api/classify-documents
  *
  * Forwards the file binary to the Make.com webhook as multipart/form-data.
  * Make receives: file (binary) + action ("classify_documents") + container_id.
- * Make responds with: { documents_found: [{ document_type, document_number?, issue_date?, notes? }] }
- * Route then copies file to documents bucket per type and updates portix.documents rows.
+ *
+ * Make responds with:
+ * {
+ *   documents_found: [
+ *     {
+ *       document_type:    string,   // matches portix.document_type enum
+ *       document_number?: string,
+ *       container_number: string,   // specific container number OR "ALL"
+ *       extracted_data?:  object,   // any additional AI-extracted fields
+ *     }
+ *   ]
+ * }
+ *
+ * This route returns that payload directly to the frontend.
+ * All Supabase updates are performed client-side in SmartUploadZone
+ * so the browser Supabase client (with the user's session) handles auth.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -16,23 +29,23 @@ export async function POST(request: NextRequest) {
     const containerId = incoming.get("containerId") as string | null;
 
     if (!file || !containerId) {
-      return NextResponse.json({ error: "file and containerId are required" }, { status: 400 });
+      return NextResponse.json(
+        { error: "file and containerId are required" },
+        { status: 400 }
+      );
     }
 
     const webhookUrl = process.env.MAKE_WEBHOOK_URL;
     if (!webhookUrl) {
-      return NextResponse.json({ error: "MAKE_WEBHOOK_URL not configured" }, { status: 503 });
+      return NextResponse.json(
+        { error: "MAKE_WEBHOOK_URL not configured" },
+        { status: 503 }
+      );
     }
 
-    // Read bytes once — reused for Make call + per-type Supabase uploads
-    const bytes = await file.arrayBuffer();
-    const ext = file.name.split(".").pop() ?? "bin";
-    const timestamp = Date.now();
-    const rand = Math.random().toString(36).slice(2);
-
-    // Build multipart payload for Make — no manual Content-Type
+    // Forward file binary + metadata to Make — let fetch set multipart boundary
     const makeForm = new FormData();
-    makeForm.append("file", new Blob([bytes], { type: file.type }), file.name);
+    makeForm.append("file", new Blob([await file.arrayBuffer()], { type: file.type }), file.name);
     makeForm.append("action", "classify_documents");
     makeForm.append("container_id", containerId);
 
@@ -50,63 +63,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { documents_found } = await makeRes.json() as {
-      documents_found?: {
-        document_type: string;
-        document_number?: string;
-        issue_date?: string;
-        notes?: string;
-      }[];
-    };
+    // Return Make's response directly — the frontend handles all DB updates
+    const makeJson = await makeRes.json();
+
+    const documents_found = makeJson?.documents_found;
 
     if (!Array.isArray(documents_found) || documents_found.length === 0) {
-      return NextResponse.json({ updated: [], message: "No documents identified" });
+      return NextResponse.json({ documents_found: [], message: "No documents identified" });
     }
 
-    const supabase = createAdminSupabaseClient();
-
-    // For each identified doc type: upload file to documents bucket + update DB row
-    const results = await Promise.all(
-      documents_found.map(async (doc) => {
-        const docPath = `${containerId}/${doc.document_type}/${timestamp}-${rand}.${ext}`;
-
-        const { error: uploadError } = await supabase.storage
-          .from("documents")
-          .upload(docPath, bytes, { contentType: file.type, upsert: true });
-
-        if (uploadError) {
-          console.warn(`[classify-documents] upload failed for ${doc.document_type}:`, uploadError.message);
-        }
-
-        const { error: dbError } = await supabase
-          .from("documents")
-          .update({
-            status: "uploaded",
-            storage_path: uploadError ? null : docPath,
-            file_name: file.name,
-            file_size_bytes: file.size,
-            mime_type: file.type,
-            uploaded_at: new Date().toISOString(),
-            document_number: doc.document_number ?? null,
-            issue_date: doc.issue_date ?? null,
-            notes: doc.notes ?? null,
-            rejection_reason: null,
-            reviewed_by: null,
-            reviewed_at: null,
-          })
-          .eq("container_id", containerId)
-          .eq("document_type", doc.document_type)
-          .in("status", ["missing", "uploaded"]); // never overwrite approved/rejected
-
-        return {
-          document_type: doc.document_type,
-          success: !dbError,
-          storage_path: uploadError ? null : docPath,
-        };
-      })
-    );
-
-    return NextResponse.json({ updated: results }, { status: 200 });
+    return NextResponse.json({ documents_found });
   } catch (err) {
     console.error("[classify-documents]", err);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });

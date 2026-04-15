@@ -355,16 +355,30 @@ function CargoPhotosSection({
 }
 
 // ─── Smart Upload Zone ────────────────────────────────────────────────────────
+// Make.com classify_documents response shape
+
+interface DocumentFound {
+  document_type: string;
+  document_number?: string;
+  container_number: string; // specific container number OR "ALL"
+  extracted_data?: Record<string, unknown>;
+}
+
+interface ClassifyResult {
+  document_type: string;
+  container_number: string;
+  success: boolean;
+}
 
 function SmartUploadZone({
-  containerId,
+  container,
   onDocumentsUpdated,
 }: {
-  containerId: string;
+  container: ContainerView;
   onDocumentsUpdated: () => void;
 }) {
   const [processing, setProcessing] = useState(false);
-  const [result, setResult] = useState<{ document_type: string; success: boolean }[] | null>(null);
+  const [result, setResult] = useState<ClassifyResult[] | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -372,9 +386,10 @@ function SmartUploadZone({
     setProcessing(true);
     setResult(null);
     try {
+      // ── Step 1: Send file to Make via our API route ─────────────────────────
       const form = new FormData();
       form.append("file", file);
-      form.append("containerId", containerId);
+      form.append("containerId", container.id);
 
       const res = await fetch("/api/classify-documents", { method: "POST", body: form });
 
@@ -384,22 +399,104 @@ function SmartUploadZone({
         return;
       }
 
-      const { updated, message } = await res.json();
+      const body = await res.json();
 
-      if (message) {
-        toast.info(message);
+      if (body.message) {
+        toast.info(body.message);
         return;
       }
 
-      const succeeded = (updated as { document_type: string; success: boolean }[]).filter((u) => u.success);
+      const documents_found: DocumentFound[] = body.documents_found ?? [];
+      if (documents_found.length === 0) {
+        toast.warning("No documents identified. Check the file and retry.");
+        return;
+      }
+
+      // ── Step 2: Resolve sibling containers in this shipment ─────────────────
+      // Needed for the container_number === "ALL" case.
+      const supabase = createBrowserSupabaseClient();
+
+      const { data: shipmentContainers } = await supabase
+        .from("containers")
+        .select("id, container_number")
+        .eq("shipment_id", container.shipment_id);
+
+      const siblings: { id: string; container_number: string }[] = shipmentContainers ?? [];
+
+      // ── Step 3: PATCH each identified document row ──────────────────────────
+      const updates: ClassifyResult[] = (
+        await Promise.all(
+          documents_found.map(async (doc) => {
+            const isAll = doc.container_number?.toUpperCase() === "ALL";
+
+            // Which container IDs to update?
+            let targetIds: string[];
+            if (isAll) {
+              targetIds = siblings.map((c) => c.id);
+            } else {
+              const matched = siblings.find(
+                (c) =>
+                  c.container_number.toUpperCase() ===
+                  doc.container_number?.toUpperCase()
+              );
+              // Fall back to the current container if no match found
+              targetIds = matched ? [matched.id] : [container.id];
+            }
+
+            const patch = {
+              status: "uploaded" as const,
+              document_number: doc.document_number ?? null,
+              // Store the full AI-extracted object for audit / re-processing
+              ai_data: { ...doc.extracted_data, ...doc },
+              uploaded_at: new Date().toISOString(),
+              // Clear any previous review state so customs can re-review
+              rejection_reason: null,
+              reviewed_by: null,
+              reviewed_at: null,
+            };
+
+            // Apply patch to every targeted container's matching document row.
+            // We never overwrite a document that was already approved or rejected.
+            const rowResults = await Promise.all(
+              targetIds.map(async (cid) => {
+                const { error } = await supabase
+                  .from("documents")
+                  .update(patch)
+                  .eq("container_id", cid)
+                  .eq("document_type", doc.document_type)
+                  .in("status", ["missing", "uploaded"]);
+
+                if (error) {
+                  console.warn(
+                    `[SmartUpload] patch failed for ${doc.document_type} / ${cid}:`,
+                    error.message
+                  );
+                }
+                return !error;
+              })
+            );
+
+            return {
+              document_type: doc.document_type,
+              container_number: doc.container_number,
+              success: rowResults.every(Boolean),
+            };
+          })
+        )
+      );
+
+      const succeeded = updates.filter((u) => u.success);
       if (succeeded.length > 0) {
+        const allLabel = succeeded.some((u) => u.container_number?.toUpperCase() === "ALL")
+          ? " (applied to all containers in shipment)"
+          : "";
         toast.success(
-          `${succeeded.length} document type${succeeded.length > 1 ? "s" : ""} identified and uploaded.`
+          `${succeeded.length} document type${succeeded.length > 1 ? "s" : ""} updated from AI classification${allLabel}.`
         );
-        setResult(updated);
+        setResult(updates);
         onDocumentsUpdated();
       } else {
-        toast.warning("No documents could be uploaded. Check the file and retry.");
+        toast.warning("No documents could be updated. Check the file and retry.");
       }
     } catch {
       toast.error("Smart upload failed. Fill manually.");
@@ -461,7 +558,7 @@ function SmartUploadZone({
                 <span className="underline">click to select</span>
               </p>
               <p className="text-xs text-gray-500">
-                PDF, Word, or image · AI identifies document types automatically
+                PDF, Word, or image · AI identifies document types and updates all matching containers
               </p>
             </div>
           )}
@@ -470,9 +567,9 @@ function SmartUploadZone({
         {/* Results summary */}
         {result && result.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-1.5">
-            {result.map((r) => (
+            {result.map((r, i) => (
               <span
-                key={r.document_type}
+                key={`${r.document_type}-${i}`}
                 className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${
                   r.success
                     ? "bg-green-100 text-green-700"
@@ -485,6 +582,9 @@ function SmartUploadZone({
                   <X className="w-3 h-3" />
                 )}
                 {r.document_type.replace(/_/g, " ")}
+                {r.container_number?.toUpperCase() === "ALL" && (
+                  <span className="opacity-60 ml-0.5">(all)</span>
+                )}
               </span>
             ))}
             <button
@@ -816,7 +916,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
 
       {/* Smart Upload Zone — supplier only */}
       {role === "supplier" && (
-        <SmartUploadZone containerId={containerId} onDocumentsUpdated={loadData} />
+        <SmartUploadZone container={container} onDocumentsUpdated={loadData} />
       )}
 
       {/* Document Checklist Table */}

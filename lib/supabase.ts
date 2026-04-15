@@ -146,6 +146,7 @@ export interface Document {
   reviewed_at: string | null
   created_at: string
   updated_at: string
+  ai_data: Record<string, unknown> | null // raw AI extraction from Make classify_documents
 }
 
 export interface DocumentWithInternalNote extends Document {
