@@ -143,12 +143,20 @@ export function NewShipmentModal({
     return acc;
   }, []);
 
-  /** Strip diacritics + lowercase — handles "Celestée" === "Celestee". */
+  /**
+   * Aggressive normalisation for fuzzy name matching:
+   *   • strip diacritics   ("Celestée" → "celestee")
+   *   • lowercase
+   *   • remove punctuation ("EMELKA S.A." → "emelka sa")
+   *   • collapse whitespace
+   */
   function normalize(str: string): string {
     return str
       .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[\u0300-\u036f]/g, "")   // diacritics
       .toLowerCase()
+      .replace(/[.,\-_'()&/\\]/g, " ")   // punctuation → space
+      .replace(/\s+/g, " ")              // collapse multiple spaces
       .trim();
   }
 
@@ -181,8 +189,12 @@ export function NewShipmentModal({
       }
       const { shipment, containers: parsedContainers } = await res.json();
 
-      // ── Party (supplier / importer) — fuzzy match name → UUID ──────────────
-      const partyRawName = shipment.supplierName ?? shipment.importerName ?? null;
+      // ── Party — role-aware extraction then fuzzy match → UUID ────────────────
+      // Supplier creates shipment → counterpart is an importer → read importerName
+      // Importer creates shipment → counterpart is a supplier → read supplierName
+      const partyRawName = role === "supplier"
+        ? (shipment.importerName ?? shipment.buyerName ?? shipment.importerCompany ?? null)
+        : (shipment.supplierName ?? shipment.sellerName ?? shipment.supplierCompany ?? null);
       if (partyRawName) {
         const matched = matchPartyByName(partyRawName);
         if (matched) {
