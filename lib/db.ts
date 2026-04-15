@@ -563,7 +563,7 @@ export interface CreateShipmentResult {
  */
 export async function createShipmentWithContainers(opts: {
   shipmentNumber: string;
-  vesselName: string;
+  vesselName?: string;          // optional — AI may not extract it
   voyageNumber?: string;
   originCountry?: string;
   importerId: string;
@@ -574,28 +574,32 @@ export async function createShipmentWithContainers(opts: {
   containers: {
     containerNumber: string;
     containerType: string;
-    portOfLoading: string;
-    portOfDestination: string;
+    portOfLoading?: string;     // optional — fallback handled in RPC
+    portOfDestination?: string; // optional — fallback handled in RPC
     temperatureSetting?: string;
   }[];
 }): Promise<CreateShipmentResult | null> {
   const supabase = createBrowserSupabaseClient();
 
+  // Client-side fallbacks (second safety net — the RPC also applies these)
+  const firstContainer = opts.containers[0];
+
   const { data, error } = await supabase.rpc("create_shipment_with_containers", {
     p_shipment_number: opts.shipmentNumber,
-    p_vessel_name:     opts.vesselName,
-    p_voyage_number:   opts.voyageNumber ?? "",
-    p_origin_country:  opts.originCountry ?? "",
+    p_vessel_name:     opts.vesselName     ?? "",
+    p_voyage_number:   opts.voyageNumber   ?? "",
+    p_origin_country:  opts.originCountry  ?? "",
     p_importer_id:     opts.importerId,
     p_supplier_id:     opts.supplierId,
     p_product_name:    opts.productName,
     p_etd:             opts.etd,
     p_eta:             opts.eta,
-    p_containers:      opts.containers.map((c) => ({
+    p_containers: opts.containers.map((c) => ({
       container_number:    c.containerNumber,
       container_type:      c.containerType,
-      port_of_loading:     c.portOfLoading,
-      port_of_destination: c.portOfDestination,
+      // Fallback: if individual container port is blank, use first container's value
+      port_of_loading:     c.portOfLoading     ?? firstContainer?.portOfLoading     ?? "",
+      port_of_destination: c.portOfDestination ?? firstContainer?.portOfDestination ?? "",
       temperature_setting: c.temperatureSetting ?? "",
     })),
   });
@@ -611,8 +615,10 @@ export async function createShipmentWithContainers(opts: {
 export interface Shipment {
   id: string;
   shipment_number: string;
-  vessel_name: string;
+  vessel_name: string | null       // nullable — AI may not extract it
   voyage_number: string | null;
+  origin_port: string | null;      // nullable — falls back to first container port
+  destination_port: string | null; // nullable — falls back to first container port
   origin_country: string | null;
   created_by: string;
   created_at: string;
