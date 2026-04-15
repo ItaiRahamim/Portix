@@ -23,7 +23,9 @@ export function CustomsAgentSelector({
   const [agents, setAgents] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
-  const [selectedId, setSelectedId] = useState(currentAgentId ?? "");
+  // Radix Select forbids empty-string values — use a sentinel for "unassigned"
+  const NONE = "__none__";
+  const [selectedId, setSelectedId] = useState(currentAgentId ?? NONE);
 
   useEffect(() => {
     async function loadAgents() {
@@ -36,12 +38,13 @@ export function CustomsAgentSelector({
 
   async function handleAssign(agentId: string) {
     setUpdating(true);
-    const success = await assignCustomsAgent(shipmentId, agentId || null);
+    const realId = agentId === NONE ? null : agentId;
+    const success = await assignCustomsAgent(shipmentId, realId);
     setUpdating(false);
 
     if (success) {
       setSelectedId(agentId);
-      toast.success(`Customs agent ${agentId ? "assigned" : "unassigned"}`);
+      toast.success(realId ? "Customs agent assigned" : "Customs agent unassigned");
       onAssigned?.();
     } else {
       toast.error("Failed to assign customs agent");
@@ -78,7 +81,7 @@ export function CustomsAgentSelector({
             <SelectValue placeholder={loading ? "Loading agents…" : "Select or change agent"} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="">
+            <SelectItem value={NONE}>
               <span className="text-gray-500">— Unassigned —</span>
             </SelectItem>
             {agents.map((agent) => (
