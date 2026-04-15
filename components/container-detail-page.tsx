@@ -416,10 +416,14 @@ function SmartUploadZone({
         return;
       }
 
-      // ── Step 2: Resolve sibling containers in this shipment ─────────────────
-      // Needed for the container_number === "ALL" case.
+      // ── Step 2: Read file bytes once — reused for every storage upload ─────────
       const supabase = createBrowserSupabaseClient();
+      const fileBytes = await file.arrayBuffer();
+      const ext = file.name.split(".").pop() ?? "bin";
+      const timestamp = Date.now();
+      const rand = Math.random().toString(36).slice(2);
 
+      // ── Step 3: Resolve sibling containers in this shipment ──────────────────
       const { data: shipmentContainers } = await supabase
         .from("containers")
         .select("id, container_number")
@@ -427,7 +431,7 @@ function SmartUploadZone({
 
       const siblings: { id: string; container_number: string }[] = shipmentContainers ?? [];
 
-      // ── Step 3: PATCH each identified document row ──────────────────────────
+      // ── Step 4: Upload file to Storage + PATCH each document row ─────────────
       const updates: ClassifyResult[] = (
         await Promise.all(
           documents_found.map(async (doc) => {
@@ -447,36 +451,57 @@ function SmartUploadZone({
               targetIds = matched ? [matched.id] : [container.id];
             }
 
-            const patch = {
-              status: "uploaded" as const,
-              document_number: doc.document_number ?? null,
-              // Store the full AI-extracted object for audit / re-processing
-              ai_data: { ...doc.extracted_data, ...doc },
-              uploaded_at: new Date().toISOString(),
-              // Clear any previous review state so customs can re-review
-              rejection_reason: null,
-              reviewed_by: null,
-              reviewed_at: null,
-            };
-
-            // Apply patch to every targeted container's matching document row.
-            // We never overwrite a document that was already approved or rejected.
+            // Apply storage upload + DB patch to every targeted container
             const rowResults = await Promise.all(
               targetIds.map(async (cid) => {
-                const { error } = await supabase
+                // Each container gets its own storage path under its own prefix
+                const storagePath = `${cid}/${doc.document_type}/${timestamp}-${rand}.${ext}`;
+
+                const { error: uploadError } = await supabase.storage
+                  .from(STORAGE_BUCKETS.documents)
+                  .upload(storagePath, fileBytes, {
+                    contentType: file.type,
+                    upsert: true,
+                  });
+
+                if (uploadError) {
+                  console.warn(
+                    `[SmartUpload] storage upload failed for ${doc.document_type} / ${cid}:`,
+                    uploadError.message
+                  );
+                }
+
+                const patch = {
+                  status: "uploaded" as const,
+                  // chk_storage_path_when_uploaded: storage_path + file_name required
+                  storage_path: uploadError ? null : storagePath,
+                  file_name: file.name,
+                  file_size_bytes: file.size,
+                  mime_type: file.type,
+                  document_number: doc.document_number ?? null,
+                  ai_data: { ...doc.extracted_data, ...doc },
+                  uploaded_at: new Date().toISOString(),
+                  rejection_reason: null,
+                  reviewed_by: null,
+                  reviewed_at: null,
+                };
+
+                // Never overwrite approved or rejected docs
+                const { error: dbError } = await supabase
                   .from("documents")
                   .update(patch)
                   .eq("container_id", cid)
                   .eq("document_type", doc.document_type)
                   .in("status", ["missing", "uploaded"]);
 
-                if (error) {
+                if (dbError) {
                   console.warn(
-                    `[SmartUpload] patch failed for ${doc.document_type} / ${cid}:`,
-                    error.message
+                    `[SmartUpload] db patch failed for ${doc.document_type} / ${cid}:`,
+                    dbError.message
                   );
                 }
-                return !error;
+
+                return !dbError;
               })
             );
 
