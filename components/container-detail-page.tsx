@@ -407,6 +407,10 @@ function SmartUploadZone({
       }
 
       const documents_found: DocumentFound[] = body.documents_found ?? [];
+
+      // Debug: inspect exactly what Make returned
+      console.log("[SmartUpload] Parsed AI data:", documents_found);
+
       if (documents_found.length === 0) {
         toast.warning("No documents identified. Check the file and retry.");
         return;
@@ -427,7 +431,9 @@ function SmartUploadZone({
       const updates: ClassifyResult[] = (
         await Promise.all(
           documents_found.map(async (doc) => {
-            const isAll = doc.container_number?.toUpperCase() === "ALL";
+            // Forgiving match: trim + lowercase on both sides
+            const normalize = (s?: string) => (s ?? "").trim().toLowerCase();
+            const isAll = normalize(doc.container_number) === "all";
 
             // Which container IDs to update?
             let targetIds: string[];
@@ -435,9 +441,7 @@ function SmartUploadZone({
               targetIds = siblings.map((c) => c.id);
             } else {
               const matched = siblings.find(
-                (c) =>
-                  c.container_number.toUpperCase() ===
-                  doc.container_number?.toUpperCase()
+                (c) => normalize(c.container_number) === normalize(doc.container_number)
               );
               // Fall back to the current container if no match found
               targetIds = matched ? [matched.id] : [container.id];

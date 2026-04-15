@@ -63,10 +63,32 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Return Make's response directly — the frontend handles all DB updates
-    const makeJson = await makeRes.json();
+    // Read as text first — Gemini sometimes wraps JSON in ```json markdown fences
+    const rawText = await makeRes.text();
 
-    const documents_found = makeJson?.documents_found;
+    // Strip markdown code block wrappers before parsing
+    const cleaned = rawText
+      .replace(/```json\s*/gi, "")
+      .replace(/```JSON\s*/gi, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
+    let makeJson: Record<string, unknown>;
+    try {
+      makeJson = JSON.parse(cleaned);
+    } catch {
+      console.error("[classify-documents] JSON parse failed. Raw response:", rawText);
+      return NextResponse.json(
+        { error: "Make returned unparseable response", raw: rawText.slice(0, 500) },
+        { status: 502 }
+      );
+    }
+
+    // Support both top-level documents_found and nested inside a wrapper key
+    const documents_found =
+      (makeJson?.documents_found as unknown[]) ??
+      (makeJson?.result as Record<string, unknown>)?.documents_found ??
+      null;
 
     if (!Array.isArray(documents_found) || documents_found.length === 0) {
       return NextResponse.json({ documents_found: [], message: "No documents identified" });
