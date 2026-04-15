@@ -3,7 +3,7 @@ import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "KILO - Import/Export Logistics Platform",
+  title: "Portix - Import/Export Logistics Platform",
   description: "B2B Container-Centric Logistics Management",
 };
 
