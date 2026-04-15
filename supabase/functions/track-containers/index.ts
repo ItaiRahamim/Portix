@@ -105,7 +105,16 @@ serve(async (_req) => {
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-      { db: { schema: "portix" } },
+      {
+        db: { schema: "portix" },
+        auth: {
+          // Required for service-role usage in background jobs:
+          // prevents the client from attempting session refresh which
+          // would downgrade privileges and trigger RLS rejections.
+          autoRefreshToken: false,
+          persistSession: false,
+        },
+      },
     );
 
     const maerskKey = Deno.env.get("MAERSK_API_KEY") ?? null;
