@@ -98,31 +98,24 @@ function extractMaerskData(raw: unknown): {
   return { location, apiEta };
 }
 
+// ─── Isolated Admin Client ────────────────────────────────────────────────────
+// Created once at module level — completely isolated from any incoming request
+// context. No request headers are ever passed to this client, so it always
+// authenticates as the service role and bypasses RLS unconditionally.
+
+const supabaseAdmin = createClient(
+  Deno.env.get("SUPABASE_URL") ?? "",
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+  {
+    db: { schema: "portix" },
+    auth: { persistSession: false },
+  },
+);
+
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
 serve(async (req) => {
   try {
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      serviceRoleKey,
-      {
-        db: { schema: "portix" },
-        global: {
-          // Explicitly pin the service-role key as the Authorization header.
-          // Without this, Supabase Edge Functions can inherit the incoming
-          // request's Authorization header (e.g. anon key from the test panel),
-          // which downgrades privileges and triggers RLS rejections.
-          headers: { Authorization: `Bearer ${serviceRoleKey}` },
-        },
-        auth: {
-          autoRefreshToken: false,
-          persistSession: false,
-        },
-      },
-    );
-
     const maerskKey = Deno.env.get("MAERSK_API_KEY") ?? null;
 
     // ── Optional body: target a single container for dashboard testing ─────────
@@ -138,8 +131,8 @@ serve(async (req) => {
       // No body or invalid JSON — run in bulk mode (normal scheduled invocation)
     }
 
-    // ── Fetch containers ────────────────────────────────────────────────────────
-    let query = supabase
+    // ── Fetch containers (admin client — RLS bypassed) ──────────────────────────
+    let query = supabaseAdmin
       .from("containers")
       .select("id, container_number, status")
       .not("status", "in", '("released")');
@@ -205,7 +198,7 @@ serve(async (req) => {
               continue;
           }
 
-          const { error: updateError } = await supabase
+          const { error: updateError } = await supabaseAdmin
             .from("containers")
             .update({
               current_location: location,
