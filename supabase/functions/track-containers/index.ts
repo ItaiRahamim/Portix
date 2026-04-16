@@ -100,17 +100,23 @@ function extractMaerskData(raw: unknown): {
 
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
-serve(async (_req) => {
+serve(async (req) => {
   try {
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+      serviceRoleKey,
       {
         db: { schema: "portix" },
+        global: {
+          // Explicitly pin the service-role key as the Authorization header.
+          // Without this, Supabase Edge Functions can inherit the incoming
+          // request's Authorization header (e.g. anon key from the test panel),
+          // which downgrades privileges and triggers RLS rejections.
+          headers: { Authorization: `Bearer ${serviceRoleKey}` },
+        },
         auth: {
-          // Required for service-role usage in background jobs:
-          // prevents the client from attempting session refresh which
-          // would downgrade privileges and trigger RLS rejections.
           autoRefreshToken: false,
           persistSession: false,
         },
@@ -119,11 +125,29 @@ serve(async (_req) => {
 
     const maerskKey = Deno.env.get("MAERSK_API_KEY") ?? null;
 
-    // Fetch all non-terminal containers
-    const { data: containers, error: fetchError } = await supabase
+    // ── Optional body: target a single container for dashboard testing ─────────
+    // Accepted payload: { "container_id": "uuid" } OR { "container_number": "MSKU1234567" }
+    let filterContainerId: string | null = null;
+    let filterContainerNumber: string | null = null;
+
+    try {
+      const body = await req.json().catch(() => null);
+      if (body?.container_id)     filterContainerId     = body.container_id;
+      if (body?.container_number) filterContainerNumber = body.container_number;
+    } catch {
+      // No body or invalid JSON — run in bulk mode (normal scheduled invocation)
+    }
+
+    // ── Fetch containers ────────────────────────────────────────────────────────
+    let query = supabase
       .from("containers")
       .select("id, container_number, status")
       .not("status", "in", '("released")');
+
+    if (filterContainerId)     query = query.eq("id", filterContainerId);
+    if (filterContainerNumber) query = query.ilike("container_number", filterContainerNumber);
+
+    const { data: containers, error: fetchError } = await query;
 
     if (fetchError) throw fetchError;
 
@@ -150,7 +174,15 @@ serve(async (_req) => {
                 results.push({ id: container.id, skipped: "MAERSK_API_KEY not set" });
                 continue;
               }
-              raw = await fetchMaerskTracking(container.container_number, maerskKey);
+              try {
+                raw = await fetchMaerskTracking(container.container_number, maerskKey);
+              } catch (maerskErr) {
+                // Carrier API error — log and skip DB update for this container
+                const msg = (maerskErr as Error).message;
+                console.error(`[track-containers] Maersk API error for ${container.container_number}:`, msg);
+                results.push({ id: container.id, carrier, container_number: container.container_number, error: `Maersk: ${msg}` });
+                continue;
+              }
               ({ location, apiEta } = extractMaerskData(raw));
               break;
             }
@@ -183,7 +215,11 @@ serve(async (_req) => {
             })
             .eq("id", container.id);
 
-          if (updateError) throw updateError;
+          if (updateError) {
+            console.error(`[track-containers] DB update failed for ${container.container_number}:`, updateError.message);
+            results.push({ id: container.id, carrier, container_number: container.container_number, error: `DB: ${updateError.message}` });
+            continue;
+          }
 
           results.push({
             id: container.id,
