@@ -27,7 +27,8 @@ export default function CustomsAgentDashboardPage() {
   const router = useRouter();
   const [containers, setContainers] = useState<ContainerView[]>([]);
   const [loading, setLoading] = useState(true);
-  const [statusFilter, setStatusFilter] = useState<ContainerStatus | "all">("waiting_customs_review");
+  // Default to "all" — customs agents see every container in their assigned shipments
+  const [statusFilter, setStatusFilter] = useState<ContainerStatus | "all">("all");
   const [showFilters, setShowFilters] = useState(false);
 
   const loadContainers = useCallback(async () => {
@@ -129,11 +130,15 @@ export default function CustomsAgentDashboardPage() {
                   {filtered.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={11} className="text-center py-10 text-gray-400">
-                        {containers.length === 0 ? "No containers found" : "No containers match the current filter"}
+                        {containers.length === 0
+                          ? "No containers assigned to you yet"
+                          : "No containers match the current filter"}
                       </TableCell>
                     </TableRow>
                   ) : filtered.map((c) => {
                     const docsPending = Math.max(0, c.docs_uploaded - c.docs_approved - c.docs_rejected);
+                    // Containers with no uploaded docs can be viewed but not reviewed yet
+                    const canReview = c.docs_uploaded > 0;
                     return (
                       <TableRow
                         key={c.id}
@@ -162,20 +167,26 @@ export default function CustomsAgentDashboardPage() {
                             <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-yellow-100 text-yellow-700 text-xs">
                               {docsPending}
                             </span>
-                          ) : <span className="text-gray-400 text-sm">0</span>}
+                          ) : <span className="text-gray-400 text-sm">—</span>}
                         </TableCell>
                         <TableCell className="text-center">
                           {c.docs_rejected > 0 ? (
                             <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 text-xs">
                               {c.docs_rejected}
                             </span>
-                          ) : <span className="text-gray-400 text-sm">0</span>}
+                          ) : <span className="text-gray-400 text-sm">—</span>}
                         </TableCell>
                         <TableCell><ContainerStatusBadge status={c.status} /></TableCell>
                         <TableCell>
                           <div onClick={(e) => e.stopPropagation()}>
-                            <Button variant="outline" size="sm" onClick={() => router.push(`/customs-agent/containers/${c.id}`)}>
-                              <Eye className="w-3.5 h-3.5 mr-1" />Review
+                            <Button
+                              variant={canReview ? "outline" : "ghost"}
+                              size="sm"
+                              onClick={() => router.push(`/customs-agent/containers/${c.id}`)}
+                              className={canReview ? "" : "text-gray-400"}
+                            >
+                              <Eye className="w-3.5 h-3.5 mr-1" />
+                              {canReview ? "Review" : "View"}
                             </Button>
                           </div>
                         </TableCell>
