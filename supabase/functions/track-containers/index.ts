@@ -71,18 +71,22 @@ const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
 const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace-private/v2/events";
 
 async function getMaerskBearerToken(): Promise<string> {
-  const url = "https://api.maersk.com/oauth2/access_token";
-  const params = new URLSearchParams();
-  params.append("grant_type", "client_credentials");
-  params.append("client_id", Deno.env.get("MAERSK_CLIENT_ID") || "");
-  params.append("client_secret", Deno.env.get("MAERSK_CLIENT_SECRET") || "");
+  const clientId     = Deno.env.get("MAERSK_CLIENT_ID")     || "";
+  const clientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
 
-  const res = await fetch(url, {
+  // Build the body as a plain encoded string — mirrors the exact curl invocation
+  // that was confirmed working: -d "grant_type=client_credentials&client_id=...&client_secret=..."
+  const body =
+    `grant_type=client_credentials` +
+    `&client_id=${encodeURIComponent(clientId)}` +
+    `&client_secret=${encodeURIComponent(clientSecret)}`;
+
+  const res = await fetch("https://api.maersk.com/oauth2/access_token", {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: params,
+    body,
   });
 
   if (!res.ok) {
