@@ -73,8 +73,6 @@ const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace-private/v2/eve
 async function getMaerskBearerToken(): Promise<string> {
   const cid  = Deno.env.get("MAERSK_CLIENT_ID")     || "";
   const csec = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
-  console.log(`DEBUG: ID Length: ${cid.length}, Prefix: ${cid.substring(0, 4)}`);
-  console.log(`DEBUG: Secret Length: ${csec.length}, Prefix: ${csec.substring(0, 4)}`);
 
   const body = `grant_type=client_credentials&client_id=${cid}&client_secret=${csec}`;
 
@@ -100,7 +98,7 @@ async function fetchMaerskTracking(
   containerNumber: string,
   bearerToken: string,
 ): Promise<unknown> {
-  const url = `https://api.maersk.com/track-and-trace/v2/events?equipmentReference=${containerNumber}`;
+  const url = `https://api.maersk.com/track-and-trace/v2/containers/${containerNumber}`;
 
   console.log(`[track-containers] GET ${url}`);
   const res = await fetch(url, {
