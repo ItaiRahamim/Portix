@@ -2,13 +2,13 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Ship } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
+import { Logo } from "@/components/ui/logo";
 
 /**
  * Root page — redirects authenticated users to their role dashboard.
  * Unauthenticated users go to /login.
- * This prevents the old "role selector" from appearing in production.
  */
 export default function RootPage() {
   const router = useRouter();
@@ -40,17 +40,12 @@ export default function RootPage() {
     });
   }, [router]);
 
-  // Loading state while redirect resolves
+  // Splash screen shown for the brief moment before the redirect fires
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-      <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-lg bg-gray-900 flex items-center justify-center animate-pulse">
-          <Ship className="w-5 h-5 text-white" />
-        </div>
-        <div>
-          <p className="text-gray-900 font-medium">Portix</p>
-          <p className="text-gray-400 text-xs">Redirecting…</p>
-        </div>
+      <div className="flex flex-col items-center gap-5">
+        <Logo className="h-20 w-auto" />
+        <Loader2 className="w-4 h-4 text-gray-300 animate-spin" />
       </div>
     </div>
   );

@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
 import { toast } from "sonner";
+import { Logo } from "@/components/ui/logo";
 
 interface DashboardLayoutProps {
   role: "importer" | "supplier" | "customs-agent";
@@ -110,14 +111,21 @@ export function DashboardLayout({ role, title, subtitle, children }: DashboardLa
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b sticky top-0 z-30">
         <div className="container mx-auto px-4">
-          <div className="flex items-center gap-4 py-3">
-            {/* Role badge */}
-            <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${config.color} text-white shrink-0`}>
-              <RoleIcon className="w-4 h-4" />
-              <span className="text-sm">{config.label}</span>
+          <div className="flex items-center gap-3 py-2">
+            {/* Brand — links back to role home */}
+            <Link href={`/${role}`} className="shrink-0 flex items-center">
+              <Logo className="h-8 md:h-10 w-auto min-w-[120px]" />
+            </Link>
+
+            <div className="h-5 w-px bg-gray-200 shrink-0" />
+
+            {/* Role pill */}
+            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full ${config.color} text-white shrink-0`}>
+              <RoleIcon className="w-3.5 h-3.5" />
+              <span className="text-xs font-medium">{config.label}</span>
             </div>
 
-            <div className="h-6 w-px bg-gray-200" />
+            <div className="h-5 w-px bg-gray-200 shrink-0" />
 
             {/* Nav */}
             <nav className="flex gap-1 overflow-x-auto flex-1">

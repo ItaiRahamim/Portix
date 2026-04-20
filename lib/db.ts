@@ -20,6 +20,7 @@ import type {
   DocumentStatus,
   Invoice,
   Claim,
+  ClaimDocument,
   ImportLicenseView,
   Profile,
   UserRole,
@@ -279,21 +280,30 @@ export interface ClaimAttachment {
   file_size_bytes: number;
 }
 
+/** ClaimAttachment enriched with the parent message's timestamp. */
+export interface ChatAttachment extends ClaimAttachment {
+  created_at: string;
+}
+
 export interface ClaimMessage {
   id: string;
   claim_id: string;
   sender_id: string;
+  sender_role: "importer" | "supplier" | "customs" | "customs_agent" | null;
   message: string;
-  // Requires: ALTER TABLE portix.claim_messages ADD COLUMN attachments JSONB DEFAULT NULL;
   attachments: ClaimAttachment[] | null;
   created_at: string;
+  // Joined from portix.profiles via sender_id FK
+  sender?: { full_name: string } | null;
 }
 
 export async function getClaimMessages(claimId: string): Promise<ClaimMessage[]> {
   const supabase = createBrowserSupabaseClient();
   const { data, error } = await supabase
     .from("claim_messages")
-    .select("*")
+    // Join portix.profiles through the sender_id FK to get the sender's name.
+    // PostgREST resolves the FK automatically; "sender" is the alias.
+    .select("*, sender:profiles!sender_id(full_name)")
     .eq("claim_id", claimId)
     .order("created_at", { ascending: true });
 
@@ -301,27 +311,52 @@ export async function getClaimMessages(claimId: string): Promise<ClaimMessage[]>
     console.error("[db] getClaimMessages:", error.message);
     return [];
   }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (data ?? []).map((row: any) => ({
     ...row,
     attachments: row.attachments ?? null,
+    sender: row.sender ?? null,
   }));
 }
 
 export async function sendClaimMessage(
   claimId: string,
   message: string,
-  attachments?: ClaimAttachment[]
+  attachments?: ClaimAttachment[],
+  /** Pass the caller's role so it is stored on the message row.
+   *  The chat UI uses sender_role to colour-code bubbles without a join. */
+  senderRole?: string
 ): Promise<boolean> {
   const supabase = createBrowserSupabaseClient();
+
+  // Always derive sender_id from the live session — never trust a parameter.
   const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return false;
+  if (!user) {
+    console.error("[db] sendClaimMessage: no authenticated user");
+    return false;
+  }
+
+  // If senderRole wasn't supplied by the caller, resolve it from the profile
+  // so the chat bubble can colour-code correctly even on first load.
+  let resolvedRole = senderRole ?? null;
+  if (!resolvedRole) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", user.id)
+      .single();
+    resolvedRole = profile?.role ?? null;
+  }
+
+  const body = message.trim() || (attachments && attachments.length > 0 ? "📎 Attachment" : "");
 
   const { error } = await supabase
     .from("claim_messages")
     .insert({
-      claim_id: claimId,
-      sender_id: user.id,
-      message,
+      claim_id:    claimId,
+      sender_id:   user.id,
+      sender_role: resolvedRole,
+      message:     body,
       attachments: attachments && attachments.length > 0 ? attachments : null,
     });
 
@@ -416,6 +451,80 @@ export async function createClaim(opts: {
   }
   return data ?? null;
 }
+
+// ─── Claim Damage Report ───────────────────────────────────────────────────────
+
+export interface DamageReportPayload {
+  damage_type?: string;
+  affected_units?: number;
+  total_units?: number;
+  estimated_loss_usd?: number;
+  damage_description?: string;
+  damage_location?: string;
+  temperature_log_present?: boolean;
+  inspector_name?: string;
+  inspection_date?: string;
+  invoice_number?: string;
+  stuffing_date?: string;
+  release_date?: string;
+  waste_percentage?: number;
+}
+
+export async function updateDamageReport(
+  claimId: string,
+  payload: DamageReportPayload
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("claims")
+    .update(payload)
+    .eq("id", claimId);
+  if (error) {
+    console.error("[db] updateDamageReport:", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function updateClaimStatus(
+  claimId: string,
+  status: string
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("claims")
+    .update({ status })
+    .eq("id", claimId);
+  if (error) {
+    console.error("[db] updateClaimStatus:", error.message);
+    return false;
+  }
+  return true;
+}
+
+// ─── Claim Attachments (portix.claim_attachments) ────────────────────────────
+// Returns all files attached to any message in this claim thread.
+// claim_attachments rows are linked via: claim_messages.claim_id ← claim_attachments.message_id
+// so we traverse through claim_messages with an embedded PostgREST select.
+
+export async function getClaimDocuments(claimId: string): Promise<ClaimDocument[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claim_messages")
+    .select("claim_attachments(*)")
+    .eq("claim_id", claimId);
+
+  if (error) {
+    console.error("[db] getClaimDocuments:", error.message);
+    return [];
+  }
+
+  // Flatten: one entry per attachment row across all messages in this claim
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data ?? []).flatMap((m: any) => m.claim_attachments ?? []) as ClaimDocument[];
+}
+
+export type { ClaimDocument };
 
 // ─── Import Licenses ──────────────────────────────────────────────────────────
 

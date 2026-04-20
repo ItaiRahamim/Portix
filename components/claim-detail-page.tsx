@@ -1,39 +1,37 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  ArrowLeft, Paperclip, Send, ImageIcon, FileVideo, FileText,
-  X, ExternalLink, AlertCircle,
+  ArrowLeft, AlertCircle, Paperclip, Send, ImageIcon,
+  FileVideo, FileText, X, ExternalLink,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
+import { ClaimStatusBadge } from "@/components/claims/claim-status-badge";
+import { ClaimOverviewBlock } from "@/components/claims/claim-overview-block";
+import { DamageReportForm } from "@/components/claims/damage-report-form";
+import { ClaimDocumentsPanel } from "@/components/claims/claim-documents-panel";
+import { useClaim } from "@/hooks/use-claims";
+import { useClaimMessages } from "@/hooks/use-claim-messages";
+import { useCurrentUser } from "@/hooks/use-current-user";
 import {
-  getClaimById, getClaimMessages, sendClaimMessage, uploadClaimAttachment,
-  getContainerById, getCurrentUserId, getProfileById,
+  getContainerById, sendClaimMessage, uploadClaimAttachment,
+  updateClaimStatus,
   type ClaimMessage, type ClaimAttachment,
 } from "@/lib/db";
-import type { Claim, ContainerView, Profile } from "@/lib/supabase";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
+import type { ContainerView, UserRole, ClaimStatus } from "@/lib/supabase";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
-// ── Claim status maps ────────────────────────────────────────────────────────
-
-type ClaimStatus = "open" | "under_review" | "negotiation" | "resolved" | "closed";
-
-const STATUS_STYLES: Record<ClaimStatus, string> = {
-  open: "bg-blue-100 text-blue-700",
-  under_review: "bg-yellow-100 text-yellow-700",
-  negotiation: "bg-orange-100 text-orange-700",
-  resolved: "bg-green-100 text-green-700",
-  closed: "bg-gray-200 text-gray-600",
-};
+// ── Status maps ────────────────────────────────────────────────────────────────
 
 const STATUS_LABELS: Record<ClaimStatus, string> = {
   open: "Open",
@@ -64,10 +62,10 @@ function inferType(filename: string): "image" | "video" | "document" {
   return "document";
 }
 
-function AttachmentIcon({ type, className }: { type: "image" | "video" | "document"; className?: string }) {
-  if (type === "image") return <ImageIcon className={cn("text-blue-500", className)} />;
-  if (type === "video") return <FileVideo className={cn("text-purple-500", className)} />;
-  return <FileText className={cn("text-gray-500", className)} />;
+function AttachmentTypeIcon({ type, className }: { type: "image" | "video" | "document"; className?: string }) {
+  if (type === "image") return <ImageIcon className={cn("text-blue-400", className)} />;
+  if (type === "video") return <FileVideo className={cn("text-purple-400", className)} />;
+  return <FileText className={cn("text-gray-400", className)} />;
 }
 
 function AttachmentChip({ attachment, isMe }: { attachment: ClaimAttachment; isMe: boolean }) {
@@ -78,10 +76,11 @@ function AttachmentChip({ attachment, isMe }: { attachment: ClaimAttachment; isM
     supabase.storage
       .from("documents")
       .createSignedUrl(attachment.storage_path, 3600)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .then((res: any) => { if (res?.data?.signedUrl) setUrl(res.data.signedUrl); });
   }, [attachment.storage_path]);
 
-  const sizeMB = attachment.file_size_bytes
+  const sizeLabel = attachment.file_size_bytes
     ? `${(attachment.file_size_bytes / 1024).toFixed(0)} KB`
     : "";
 
@@ -99,33 +98,58 @@ function AttachmentChip({ attachment, isMe }: { attachment: ClaimAttachment; isM
         !url && "opacity-60 cursor-wait"
       )}
     >
-      <AttachmentIcon type={attachment.media_type} className="w-3.5 h-3.5 shrink-0" />
+      <AttachmentTypeIcon type={attachment.media_type} className="w-3.5 h-3.5 shrink-0" />
       <span className="truncate">{attachment.file_name}</span>
-      {sizeMB && <span className="shrink-0 opacity-60">{sizeMB}</span>}
+      {sizeLabel && <span className="shrink-0 opacity-60">{sizeLabel}</span>}
     </a>
   );
 }
 
-// ── Props ────────────────────────────────────────────────────────────────────
+// ── Loading skeleton ──────────────────────────────────────────────────────────
+
+function LoadingSkeleton({ role }: { role: UserRole }) {
+  return (
+    <DashboardLayout role={role === "supplier" ? "supplier" : "importer"} title="Loading…" subtitle="">
+      <div className="space-y-4">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-40 w-full rounded-xl" />
+        <Skeleton className="h-24 w-full rounded-xl" />
+        <Skeleton className="h-64 w-full rounded-xl" />
+        <Skeleton className="h-48 w-full rounded-xl" />
+        <Skeleton className="h-80 w-full rounded-xl" />
+      </div>
+    </DashboardLayout>
+  );
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 
 interface ClaimDetailPageProps {
   role: "importer" | "supplier";
 }
-
-// ── Component ────────────────────────────────────────────────────────────────
 
 export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
   const params = useParams();
   const router = useRouter();
   const claimId = params.claimId as string;
 
-  const [claim, setClaim] = useState<Claim | null>(null);
-  const [container, setContainer] = useState<ContainerView | null>(null);
-  const [messages, setMessages] = useState<ClaimMessage[]>([]);
-  const [senderProfiles, setSenderProfiles] = useState<Map<string, Profile>>(new Map());
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Single source of truth for auth — userId comes from useCurrentUser(),
+  // never from a separate getCurrentUserId() call (avoids a race condition).
+  const { userId, isLoading: userLoading } = useCurrentUser();
 
+  const { data: claim, isLoading: claimLoading } = useClaim(claimId);
+  const { data: messages = [] } = useClaimMessages(claimId);
+
+  // Derive the attachments panel list directly from chat messages so it stays
+  // in sync with the realtime subscription without a separate query.
+  const chatAttachments = useMemo(
+    () => messages.flatMap((m) => (m.attachments ?? []).map((a) => ({ ...a, created_at: m.created_at }))),
+    [messages]
+  );
+
+  const [container, setContainer] = useState<ContainerView | null>(null);
+
+  // Chat compose state
   const [messageText, setMessageText] = useState("");
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [statusDraft, setStatusDraft] = useState<ClaimStatus | "">("");
@@ -135,35 +159,16 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const initialScrollDone = useRef(false);
 
-  const loadData = useCallback(async () => {
-    const [c, msgs, uid] = await Promise.all([
-      getClaimById(claimId),
-      getClaimMessages(claimId),
-      getCurrentUserId(),
-    ]);
+  const loadContainer = useCallback(async (containerId: string) => {
+    const c = await getContainerById(containerId);
+    setContainer(c);
+  }, []);
 
-    setClaim(c);
-    setMessages(msgs);
-    setCurrentUserId(uid);
+  useEffect(() => {
+    if (claim?.container_id) loadContainer(claim.container_id);
+  }, [claim?.container_id, loadContainer]);
 
-    if (c) {
-      const cont = await getContainerById(c.container_id);
-      setContainer(cont);
-    }
-
-    // Load profiles for message senders
-    const uniqueSenderIds = [...new Set(msgs.map((m) => m.sender_id))];
-    const profiles = await Promise.all(uniqueSenderIds.map((id) => getProfileById(id)));
-    const profileMap = new Map<string, Profile>();
-    profiles.forEach((p) => { if (p) profileMap.set(p.id, p); });
-    setSenderProfiles(profileMap);
-
-    setLoading(false);
-  }, [claimId]);
-
-  useEffect(() => { loadData(); }, [loadData]);
-
-  // Scroll to latest message
+  // Scroll to bottom whenever the messages list grows
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
       behavior: initialScrollDone.current ? "smooth" : "instant",
@@ -191,7 +196,6 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
     if (!canSend) return;
     setSending(true);
 
-    // 1. Upload any pending files first
     let attachments: ClaimAttachment[] = [];
     if (pendingFiles.length > 0) {
       const results = await Promise.all(
@@ -199,22 +203,19 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
       );
       attachments = results.filter((r): r is ClaimAttachment => r !== null);
       const failed = results.filter((r) => r === null).length;
-      if (failed > 0) {
-        toast.error(`${failed} attachment${failed > 1 ? "s" : ""} failed to upload.`);
-      }
+      if (failed > 0) toast.error(`${failed} attachment${failed > 1 ? "s" : ""} failed to upload.`);
     }
 
-    // 2. Send the message (text may be empty if only attachments)
     const ok = await sendClaimMessage(
       claimId,
       messageText.trim(),
-      attachments.length > 0 ? attachments : undefined
+      attachments.length > 0 ? attachments : undefined,
+      role
     );
 
     if (ok) {
       setMessageText("");
       setPendingFiles([]);
-      loadData();
     } else {
       toast.error("Failed to send message.");
     }
@@ -230,36 +231,25 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
 
   async function handleStatusUpdate() {
     if (!statusDraft || !claim || statusDraft === claim.status) return;
-    const supabase = createBrowserSupabaseClient();
-    const { error } = await supabase
-      .from("claims")
-      .update({ status: statusDraft })
-      .eq("id", claimId);
-    if (error) {
-      toast.error("Failed to update status.");
-    } else {
+    const ok = await updateClaimStatus(claimId, statusDraft);
+    if (ok) {
       toast.success(`Status updated to "${STATUS_LABELS[statusDraft]}".`);
       setStatusDraft("");
-      loadData();
+    } else {
+      toast.error("Failed to update status.");
     }
   }
 
-  // ── Loading / Not found ───────────────────────────────────────────────────
+  // ── Loading / Error states ────────────────────────────────────────────────
 
-  if (loading) {
-    return (
-      <DashboardLayout role={role} title="Loading…" subtitle="">
-        <div className="py-12 text-center text-gray-400 text-sm">Loading claim…</div>
-      </DashboardLayout>
-    );
-  }
+  if (claimLoading || userLoading) return <LoadingSkeleton role={role} />;
 
   if (!claim) {
     return (
-      <DashboardLayout role={role} title="Claim Not Found" subtitle="">
+      <DashboardLayout role={role === "supplier" ? "supplier" : "importer"} title="Claim Not Found" subtitle="">
         <div className="flex flex-col items-center py-20 gap-4">
           <AlertCircle className="w-10 h-10 text-gray-300" />
-          <p className="text-gray-500">This claim does not exist or has been removed.</p>
+          <p className="text-gray-500">This claim does not exist or you don&apos;t have access.</p>
           <Button variant="outline" size="sm" onClick={() => router.push(backPath)}>
             <ArrowLeft className="w-4 h-4 mr-1" /> Back to Claims
           </Button>
@@ -272,7 +262,7 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
 
   return (
     <DashboardLayout
-      role={role}
+      role={role === "supplier" ? "supplier" : "importer"}
       title={`Claim — ${container?.container_number ?? claim.container_id.slice(0, 8)}`}
       subtitle={`${container?.supplier_company ?? ""} · ${container?.product_name ?? ""}`}
     >
@@ -284,7 +274,7 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
         <ArrowLeft className="w-4 h-4" /> Back to Claims
       </Button>
 
-      {/* Claim Info Card */}
+      {/* ── 1. Claim metadata card ─────────────────────────────────────── */}
       <Card className="mb-4">
         <CardContent className="pt-5 pb-5">
           <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
@@ -292,16 +282,8 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
               <p className="text-[11px] text-gray-400 mb-0.5 uppercase tracking-wide">Claim ID</p>
               <p className="font-mono text-sm font-semibold text-gray-800">{claim.id.slice(0, 8)}…</p>
             </div>
-
             <div className="flex items-center gap-2 flex-wrap">
-              <span className={cn(
-                "text-xs px-2.5 py-1 rounded-full font-medium",
-                STATUS_STYLES[claim.status as ClaimStatus] ?? "bg-gray-100 text-gray-700"
-              )}>
-                {STATUS_LABELS[claim.status as ClaimStatus] ?? claim.status}
-              </span>
-
-              {/* Status change — importer only */}
+              <ClaimStatusBadge status={claim.status} />
               {role === "importer" && (
                 <div className="flex items-center gap-1.5">
                   <Select value={statusDraft} onValueChange={(v) => setStatusDraft(v as ClaimStatus)}>
@@ -337,12 +319,7 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
                   {container.container_number}
                   <ExternalLink className="w-3 h-3" />
                 </button>
-              ) : <span className="text-gray-500 text-sm">—</span>}
-              {container && (
-                <p className="text-xs text-gray-400 mt-0.5">
-                  {container.port_of_loading} → {container.port_of_destination}
-                </p>
-              )}
+              ) : <span className="text-gray-500">—</span>}
             </div>
             <div>
               <p className="text-[11px] text-gray-400 mb-0.5 uppercase tracking-wide">Supplier</p>
@@ -378,17 +355,38 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
         </CardContent>
       </Card>
 
-      {/* Conversation */}
+      {/* ── 2. AI Overview ────────────────────────────────────────────────── */}
+      <div className="mb-4">
+        <ClaimOverviewBlock
+          claimId={claimId}
+          summary={claim.claim_summary}
+          updatedAt={claim.last_summary_at}
+        />
+      </div>
+
+      {/* ── 3. Damage Report ─────────────────────────────────────────────── */}
+      <div className="mb-4">
+        <DamageReportForm claim={claim} role={role} />
+      </div>
+
+      {/* ── 4. Document Zones ────────────────────────────────────────────── */}
+      <div className="mb-4">
+        <ClaimDocumentsPanel
+          claimId={claimId}
+          documents={chatAttachments}
+        />
+      </div>
+
+      {/* ── 5. Chat / Communication ──────────────────────────────────────── */}
       <Card>
         <CardHeader className="py-3 px-5 border-b">
           <CardTitle className="text-sm font-medium text-gray-700 flex items-center gap-2">
-            Conversation
+            Communication
             <span className="text-xs font-normal text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">
               {messages.length} message{messages.length !== 1 ? "s" : ""}
             </span>
           </CardTitle>
         </CardHeader>
-
         <CardContent className="px-5 pb-0">
           <div className="space-y-5 min-h-[120px] max-h-[500px] overflow-y-auto py-4 pr-1">
             {messages.length === 0 && (
@@ -397,35 +395,35 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
               </p>
             )}
             {messages.map((msg) => {
-              const isMe = msg.sender_id === currentUserId;
-              const senderProfile = senderProfiles.get(msg.sender_id);
-              const senderName = senderProfile?.full_name ?? senderProfile?.email ?? "Unknown";
-              const senderRole = senderProfile?.role ?? "importer";
-              const initial = senderName.charAt(0).toUpperCase();
+              const isMe = msg.sender_id === userId;
+              const isSupplier = msg.sender_role === "supplier";
+
+              // Derive first name from the joined profile; fall back to role label
+              const fullName = msg.sender?.full_name ?? "";
+              const firstName = fullName.split(" ")[0] || (isSupplier ? "Supplier" : "Importer");
+              // Avatar initials: up to 2 chars from first name
+              const initials = firstName.slice(0, 2).toUpperCase();
 
               return (
                 <div key={msg.id} className={cn("flex gap-2.5", isMe ? "flex-row-reverse" : "flex-row")}>
                   <div className={cn(
                     "w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold mt-0.5",
-                    senderRole === "supplier" ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-600"
+                    isSupplier ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-600"
                   )}>
-                    {initial}
+                    {initials}
                   </div>
-
                   <div className={cn("flex flex-col gap-1 max-w-[72%]", isMe ? "items-end" : "items-start")}>
                     <div className={cn("flex items-center gap-1.5 text-[11px] text-gray-400", isMe && "flex-row-reverse")}>
-                      <span className="font-medium text-gray-600 truncate max-w-[140px]">{senderName}</span>
                       <span className={cn(
                         "px-1.5 py-px rounded text-[10px] font-medium shrink-0",
-                        senderRole === "supplier" ? "bg-green-50 text-green-700" : "bg-blue-50 text-blue-600"
+                        isSupplier ? "bg-green-50 text-green-700" : "bg-blue-50 text-blue-600"
                       )}>
-                        {senderRole === "supplier" ? "Supplier" : "Importer"}
+                        {firstName}
                       </span>
                       <span className="shrink-0">
                         {new Date(msg.created_at).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
                       </span>
                     </div>
-
                     {msg.message && (
                       <div className={cn(
                         "rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
@@ -436,16 +434,10 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
                         {msg.message}
                       </div>
                     )}
-
-                    {/* Attachments */}
                     {msg.attachments && msg.attachments.length > 0 && (
                       <div className="flex flex-col gap-1 mt-0.5">
                         {msg.attachments.map((att, i) => (
-                          <AttachmentChip
-                            key={i}
-                            attachment={att}
-                            isMe={isMe}
-                          />
+                          <AttachmentChip key={i} attachment={att} isMe={isMe} />
                         ))}
                       </div>
                     )}
@@ -456,13 +448,12 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Input */}
           <div className="border-t py-3">
             {pendingFiles.length > 0 && (
               <div className="flex flex-wrap gap-1.5 mb-2">
                 {pendingFiles.map((f, i) => (
                   <div key={i} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-100">
-                    <AttachmentIcon type={f.type} className="w-3 h-3" />
+                    <AttachmentTypeIcon type={f.type} className="w-3 h-3" />
                     <span className="max-w-[100px] truncate">{f.name}</span>
                     <button className="ml-0.5 hover:text-red-500" onClick={() => setPendingFiles((p) => p.filter((_, j) => j !== i))}>
                       <X className="w-3 h-3" />
@@ -471,7 +462,6 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
                 ))}
               </div>
             )}
-
             <div className="flex gap-2 items-end">
               <Textarea
                 placeholder="Type your message… (⌘+Enter to send)"
@@ -485,16 +475,24 @@ export function ClaimDetailPage({ role }: ClaimDetailPageProps) {
                 <Button size="sm" disabled={!canSend || sending} onClick={handleSend} className="gap-1.5">
                   <Send className="w-3.5 h-3.5" />{sending ? "…" : "Send"}
                 </Button>
-                <label className="cursor-pointer">
-                  <Button variant="outline" size="sm" className="gap-1.5 w-full pointer-events-none">
-                    <Paperclip className="w-3.5 h-3.5" /> Attach
-                  </Button>
-                  <input
-                    ref={fileInputRef} type="file" className="hidden"
-                    accept=".pdf,.jpg,.jpeg,.png,.mp4,.mov,.doc,.docx,.xlsx"
-                    multiple onChange={handleFileSelect}
-                  />
-                </label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 w-full"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={sending}
+                >
+                  <Paperclip className="w-3.5 h-3.5" /> Attach
+                </Button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  accept=".pdf,.jpg,.jpeg,.png,.mp4,.mov,.doc,.docx,.xlsx"
+                  multiple
+                  onChange={handleFileSelect}
+                />
               </div>
             </div>
             <p className="text-[11px] text-gray-400 mt-1.5">Supports PDF, JPG, PNG, MP4, DOC · ⌘+Enter to send</p>

@@ -177,6 +177,8 @@ export interface Claim {
   container_id: string
   importer_id: string
   supplier_id: string
+  // Optional link to the supplier's Portix user account
+  supplier_user_id: string | null
   claim_type: ClaimType
   description: string
   amount: number | null
@@ -185,6 +187,40 @@ export interface Claim {
   resolved_at: string | null
   created_at: string
   updated_at: string
+  // ── Claimix damage-report fields ────────────────────────────────────────
+  invoice_number: string | null
+  stuffing_date: string | null
+  release_date: string | null
+  waste_percentage: number | null
+  claim_summary: string | null            // AI-generated nightly
+  damage_type: string | null             // Moisture | Physical | Temperature | Contamination | Other
+  affected_units: number | null
+  total_units: number | null
+  estimated_loss_usd: number | null
+  damage_description: string | null
+  damage_location: string | null
+  temperature_log_present: boolean
+  inspector_name: string | null
+  inspection_date: string | null
+  // Set by generate-claim-summary Edge Function after each Gemini run
+  last_summary_at: string | null
+}
+
+/**
+ * Maps to portix.claim_attachments — files attached to a claim message.
+ * Linked via message_id → portix.claim_messages(id).
+ * Previously called ClaimDocument (Claimix 3-zone system); reconciled to
+ * match the actual database table.
+ */
+export interface ClaimDocument {
+  id: string
+  message_id: string
+  media_type: MediaType
+  storage_path: string
+  file_name: string
+  file_size_bytes: number | null
+  mime_type: string | null
+  created_at: string
 }
 
 export interface ImportLicenseView {

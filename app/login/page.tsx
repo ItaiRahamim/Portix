@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Ship, Eye, EyeOff } from "lucide-react";
+import { Eye, EyeOff } from "lucide-react";
+import { Logo } from "@/components/ui/logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -67,14 +68,9 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
       <div className="w-full max-w-md">
         {/* Logo */}
-        <div className="flex items-center justify-center gap-3 mb-8">
-          <div className="w-10 h-10 rounded-lg bg-gray-900 flex items-center justify-center">
-            <Ship className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold text-gray-900">Portix</h1>
-            <p className="text-gray-400 text-xs">Import/Export Logistics</p>
-          </div>
+        <div className="flex flex-col items-center gap-3 mb-8">
+          <Logo className="h-20 w-auto" />
+          <p className="text-xs text-gray-400 tracking-wide">Import/Export Logistics</p>
         </div>
 
         <Card>
@@ -136,7 +132,7 @@ export default function LoginPage() {
         </Card>
 
         <p className="text-center text-xs text-gray-400 mt-6">
-          Portix — Secure Import/Export Platform
+          © {new Date().getFullYear()} Portix. All rights reserved.
         </p>
       </div>
     </div>

@@ -5,72 +5,196 @@
 //   current_location, api_eta, tracking_status_raw, last_tracking_update
 //
 // Schedule: invoke via pg_cron or Supabase Dashboard → Edge Functions → Schedules
+//
 // Env vars required:
-//   SUPABASE_URL             (auto-injected)
-//   SUPABASE_SERVICE_ROLE_KEY (auto-injected)
-//   MAERSK_API_KEY           (set in Supabase Dashboard → Edge Functions → Secrets)
+//   SUPABASE_URL                (auto-injected)
+//   SUPABASE_SERVICE_ROLE_KEY   (auto-injected)
+//   MAERSK_CLIENT_ID            Set in Dashboard → Edge Functions → Secrets
+//   MAERSK_CLIENT_SECRET        Set in Dashboard → Edge Functions → Secrets
+//   MAERSK_API_KEY              (legacy Consumer-Key fallback — optional)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ─── Carrier Detection ────────────────────────────────────────────────────────
-// Container owner codes (first 3 characters of the 4-char BIC prefix)
-// Add more codes here as needed — the switch statement routes them to handlers.
+// BIC owner codes are the FIRST 4 CHARACTERS of a container number (not 3).
+// The 4th character is always the equipment category identifier (U = container).
+// We match on the full 4-char prefix for unambiguous carrier resolution.
 
 const CARRIER_BY_PREFIX: Record<string, string> = {
-  // Maersk / Sealand / Hamburg Süd (all use Maersk Track API)
-  MAE: "maersk", MRK: "maersk", MSK: "maersk",
-  TRL: "maersk", SUD: "maersk", TCK: "maersk", MCS: "maersk",
+  // Maersk / Sealand / Hamburg Süd (all route through Maersk Track API)
+  MSKU: "maersk",  // Maersk Line (main)
+  MRKU: "maersk",  // Maersk Line
+  MNBU: "maersk",  // Maersk Line
+  TCKU: "maersk",  // Maersk Tankers
+  SUDU: "maersk",  // Hamburg Süd
+  GLDU: "maersk",  // Maersk (Sealand)
+  HJMU: "maersk",  // Maersk
+  MCSU: "maersk",  // Maersk
   // MSC — Phase 2
-  MSC: "msc", MSD: "msc",
+  MSCU: "msc",
+  MEDU: "msc",
   // CMA CGM — Phase 3
-  CMA: "cma", CMB: "cma",
+  CMAU: "cma",
+  CGMU: "cma",
+  APHU: "cma",     // APL (owned by CMA CGM)
+  // Hapag-Lloyd — Phase 4
+  HLXU: "hapag",
+  HLCU: "hapag",
+  // Evergreen — Phase 4
+  EISU: "evergreen",
+  EGHU: "evergreen",
 };
 
 function detectCarrier(containerNumber: string): string {
-  const prefix = containerNumber.replace(/\s/g, "").slice(0, 3).toUpperCase();
-  return CARRIER_BY_PREFIX[prefix] ?? "unknown";
+  // Use the first 4 characters — the full BIC owner code including category
+  const prefix = containerNumber.replace(/\s/g, "").slice(0, 4).toUpperCase();
+  const carrier = CARRIER_BY_PREFIX[prefix];
+  if (!carrier) {
+    console.warn(
+      `[track-containers] Unknown carrier for prefix '${prefix}' (container: ${containerNumber}). ` +
+      `Add this prefix to CARRIER_BY_PREFIX to enable tracking.`
+    );
+  }
+  return carrier ?? "unknown";
+}
+
+// ─── Maersk OAuth2 Token ──────────────────────────────────────────────────────
+// Maersk APIs (post-2022) require an OAuth2 access token obtained via the
+// Client Credentials grant before calling any tracking endpoint.
+// Token endpoint: POST https://api.maersk.com/oauth2/access_token
+// Docs: https://developer.maersk.com/documentation/authentication
+
+const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
+// Correct product path: "track-and-trace-private" is the registered API
+// Gateway route on developer.maersk.com — /track/ does not exist.
+const MAERSK_TRACK_BASE_URL =
+  "https://api.maersk.com/track-and-trace-private/v2/containers";
+
+async function getMaerskBearerToken(
+  clientId: string,
+  clientSecret: string,
+): Promise<string> {
+  console.log("[track-containers] Fetching Maersk OAuth2 Bearer token…");
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  const res = await fetch(MAERSK_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json",
+    },
+    body: body.toString(),
+  });
+
+  const responseText = await res.text();
+  console.log(
+    `[track-containers] Maersk token endpoint responded ${res.status}:`,
+    responseText.slice(0, 300)
+  );
+
+  if (!res.ok) {
+    throw new Error(
+      `Maersk token endpoint returned HTTP ${res.status}. Body: ${responseText.slice(0, 500)}`
+    );
+  }
+
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(responseText);
+  } catch {
+    throw new Error(`Maersk token endpoint returned non-JSON: ${responseText.slice(0, 300)}`);
+  }
+
+  const token = json?.access_token as string | undefined;
+  if (!token) {
+    throw new Error(
+      `Maersk token response missing 'access_token'. Full response: ${responseText.slice(0, 500)}`
+    );
+  }
+
+  console.log("[track-containers] Maersk Bearer token obtained successfully.");
+  return token;
 }
 
 // ─── Maersk Track & Trace ─────────────────────────────────────────────────────
-// Docs: https://developer.maersk.com/product-catalogue/track-and-trace
-// Endpoint: GET /track/v1/containers/{containerNumber}
-// Auth:     Consumer-Key header
-
-const MAERSK_TRACK_BASE_URL =
-  "https://api.maersk.com/track/v1/containers";
 
 async function fetchMaerskTracking(
   containerNumber: string,
-  apiKey: string,
+  opts: { bearerToken?: string; clientId?: string; apiKey?: string },
 ): Promise<unknown> {
   const url = `${MAERSK_TRACK_BASE_URL}/${encodeURIComponent(containerNumber)}`;
 
-  const res = await fetch(url, {
-    headers: {
-      "Consumer-Key": apiKey,
-      "Accept": "application/json",
-    },
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Maersk API ${res.status}: ${body}`);
+  // Maersk always requires Consumer-Key (= client_id) on every request.
+  // When OAuth2 is used, Bearer token AND Consumer-Key are both mandatory.
+  // Without Consumer-Key the gateway returns the "maersk-host" proxy error.
+  if (!opts.bearerToken && !opts.apiKey) {
+    throw new Error(
+      "No Maersk credentials available. Set MAERSK_CLIENT_ID + MAERSK_CLIENT_SECRET in Edge Function secrets."
+    );
   }
 
-  return res.json();
+  const headers: Record<string, string> = {
+    "Accept": "application/json",
+  };
+
+  if (opts.bearerToken) {
+    // OAuth2 flow: Bearer token + Consumer-Key (client_id) both required
+    headers["Authorization"] = `Bearer ${opts.bearerToken}`;
+    if (opts.clientId) headers["Consumer-Key"] = opts.clientId;
+    console.log(
+      `[track-containers] Maersk T&T → OAuth2 Bearer + Consumer-Key for ${containerNumber}`
+    );
+  } else if (opts.apiKey) {
+    // Legacy: standalone Consumer-Key only
+    headers["Consumer-Key"] = opts.apiKey;
+    console.log(
+      `[track-containers] Maersk T&T → Consumer-Key (legacy) for ${containerNumber}`
+    );
+  }
+
+  console.log(`[track-containers] GET ${url}`);
+  const res = await fetch(url, { headers });
+
+  const responseText = await res.text();
+  console.log(
+    `[track-containers] Maersk T&T responded HTTP ${res.status} for ${containerNumber}:`,
+    responseText.slice(0, 500)
+  );
+
+  if (!res.ok) {
+    throw new Error(
+      `Maersk T&T API HTTP ${res.status} for ${containerNumber}. Body: ${responseText.slice(0, 500)}`
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Maersk T&T returned non-JSON for ${containerNumber}: ${responseText.slice(0, 300)}`
+    );
+  }
+
+  return parsed;
 }
 
-// Normalise Maersk response shape → { location, apiEta }
+// ─── Normalise Maersk Response ────────────────────────────────────────────────
 // The Maersk T&T API returns different shapes depending on the product version.
 // This function tries the most common paths and falls back gracefully.
+
 function extractMaerskData(raw: unknown): {
   location: string | null;
   apiEta: string | null;
 } {
   const r = raw as Record<string, unknown>;
 
-  // V2 shape: containers[].transportPlan[]
   const containers =
     (r?.containers as unknown[]) ??
     (r?.containerTrackingInfoList as unknown[]) ??
@@ -78,7 +202,6 @@ function extractMaerskData(raw: unknown): {
 
   const first = (containers[0] ?? r) as Record<string, unknown>;
 
-  // Current location: last completed transport leg
   const transportPlan = (first?.transportPlan as Record<string, unknown>[]) ?? [];
   const lastLeg = transportPlan.at(-1) as Record<string, unknown> | undefined;
 
@@ -88,7 +211,6 @@ function extractMaerskData(raw: unknown): {
     (first?.vesselCurrentPort as string) ??
     null;
 
-  // API ETA: estimated arrival of final leg
   const apiEta: string | null =
     (lastLeg?.estimatedArrival as Record<string, unknown>)?.dateTime as string ??
     (first?.estimatedTimeOfArrival as string) ??
@@ -99,9 +221,8 @@ function extractMaerskData(raw: unknown): {
 }
 
 // ─── Isolated Admin Client ────────────────────────────────────────────────────
-// Created once at module level — completely isolated from any incoming request
-// context. No request headers are ever passed to this client, so it always
-// authenticates as the service role and bypasses RLS unconditionally.
+// Module-level — completely decoupled from any incoming request context.
+// Authenticates as service role and bypasses RLS unconditionally.
 
 const supabaseAdmin = createClient(
   Deno.env.get("SUPABASE_URL") ?? "",
@@ -116,22 +237,39 @@ const supabaseAdmin = createClient(
 
 serve(async (req) => {
   try {
-    const maerskKey = Deno.env.get("MAERSK_API_KEY") ?? null;
+    // ── Credentials ──────────────────────────────────────────────────────────
+    const maerskClientId     = Deno.env.get("MAERSK_CLIENT_ID")     ?? null;
+    const maerskClientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") ?? null;
+    const maerskLegacyKey    = Deno.env.get("MAERSK_API_KEY")       ?? null;
 
-    // ── Optional body: target a single container for dashboard testing ─────────
-    // Accepted payload: { "container_id": "uuid" } OR { "container_number": "MSKU1234567" }
-    let filterContainerId: string | null = null;
+    // Log which credential mode is active (without leaking values)
+    if (maerskClientId && maerskClientSecret) {
+      console.log("[track-containers] Maersk auth mode: OAuth2 Client Credentials");
+    } else if (maerskLegacyKey) {
+      console.log("[track-containers] Maersk auth mode: Consumer-Key (legacy)");
+    } else {
+      console.warn("[track-containers] WARNING: No Maersk credentials found in env vars.");
+    }
+
+    // ── Optional body: target a single container for debugging ───────────────
+    let filterContainerId:     string | null = null;
     let filterContainerNumber: string | null = null;
 
     try {
       const body = await req.json().catch(() => null);
       if (body?.container_id)     filterContainerId     = body.container_id;
       if (body?.container_number) filterContainerNumber = body.container_number;
-    } catch {
-      // No body or invalid JSON — run in bulk mode (normal scheduled invocation)
+    } catch { /* bulk mode */ }
+
+    if (filterContainerNumber) {
+      console.log(`[track-containers] Targeted mode: container_number = ${filterContainerNumber}`);
+    } else if (filterContainerId) {
+      console.log(`[track-containers] Targeted mode: container_id = ${filterContainerId}`);
+    } else {
+      console.log("[track-containers] Bulk mode: processing all active containers");
     }
 
-    // ── Fetch containers (admin client — RLS bypassed) ──────────────────────────
+    // ── Fetch containers from DB ──────────────────────────────────────────────
     let query = supabaseAdmin
       .from("containers")
       .select("id, container_number, status")
@@ -142,11 +280,47 @@ serve(async (req) => {
 
     const { data: containers, error: fetchError } = await query;
 
-    if (fetchError) throw fetchError;
+    if (fetchError) {
+      console.error("[track-containers] DB fetch error:", fetchError.message);
+      throw fetchError;
+    }
 
-    // Group by carrier
+    console.log(`[track-containers] Found ${containers?.length ?? 0} container(s) in DB.`);
+
+    // ── Diagnostic: container not found ──────────────────────────────────────
+    if (!containers || containers.length === 0) {
+      const msg = filterContainerNumber
+        ? `Container '${filterContainerNumber}' not found in portix.containers (or status is 'released'). ` +
+          `Add this container to the database first.`
+        : "No active containers found in the database.";
+      console.warn(`[track-containers] ${msg}`);
+      return new Response(
+        JSON.stringify({ ok: true, processed: 0, results: [], diagnostic: msg }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // ── Obtain Maersk OAuth2 token once for all Maersk containers ────────────
+    let maerskBearerToken: string | null = null;
+    let maerskTokenError: string | null = null;
+
+    const hasMaerskContainers = containers.some(
+      (c) => detectCarrier(c.container_number) === "maersk"
+    );
+
+    if (hasMaerskContainers && maerskClientId && maerskClientSecret) {
+      try {
+        maerskBearerToken = await getMaerskBearerToken(maerskClientId, maerskClientSecret);
+      } catch (tokenErr) {
+        maerskTokenError = (tokenErr as Error).message;
+        console.error("[track-containers] Failed to obtain Maersk Bearer token:", maerskTokenError);
+        // Don't throw — fall back to legacy key or surface per-container
+      }
+    }
+
+    // ── Group by carrier ──────────────────────────────────────────────────────
     const byCarrier = new Map<string, { id: string; container_number: string; status: string }[]>();
-    for (const c of containers ?? []) {
+    for (const c of containers) {
       const carrier = detectCarrier(c.container_number);
       if (!byCarrier.has(carrier)) byCarrier.set(carrier, []);
       byCarrier.get(carrier)!.push(c);
@@ -163,29 +337,44 @@ serve(async (req) => {
 
           switch (carrier) {
             case "maersk": {
-              if (!maerskKey) {
-                results.push({ id: container.id, skipped: "MAERSK_API_KEY not set" });
+              // Surface token error early if no fallback key either
+              if (maerskTokenError && !maerskLegacyKey) {
+                results.push({
+                  id: container.id,
+                  carrier,
+                  container_number: container.container_number,
+                  error: `Maersk auth failed: ${maerskTokenError}`,
+                });
                 continue;
               }
+
               try {
-                raw = await fetchMaerskTracking(container.container_number, maerskKey);
+                raw = await fetchMaerskTracking(container.container_number, {
+                  bearerToken: maerskBearerToken ?? undefined,
+                  clientId:    maerskClientId   ?? undefined,
+                  apiKey:      maerskLegacyKey  ?? undefined,
+                });
               } catch (maerskErr) {
-                // Carrier API error — log and skip DB update for this container
                 const msg = (maerskErr as Error).message;
-                console.error(`[track-containers] Maersk API error for ${container.container_number}:`, msg);
-                results.push({ id: container.id, carrier, container_number: container.container_number, error: `Maersk: ${msg}` });
+                console.error(
+                  `[track-containers] Maersk API error for ${container.container_number}: ${msg}`
+                );
+                results.push({
+                  id: container.id,
+                  carrier,
+                  container_number: container.container_number,
+                  error: `Maersk API: ${msg}`,
+                  hint: "Check MAERSK_CLIENT_ID / MAERSK_CLIENT_SECRET secrets in Supabase Dashboard.",
+                });
                 continue;
               }
+
               ({ location, apiEta } = extractMaerskData(raw));
               break;
             }
 
             // ── Phase 2: MSC ─────────────────────────────────────────────────
-            // case "msc": {
-            //   raw = await fetchMscTracking(container.container_number, Deno.env.get("MSC_API_KEY")!);
-            //   ({ location, apiEta } = extractMscData(raw));
-            //   break;
-            // }
+            // case "msc": { ... break; }
 
             // ── Phase 3: CMA CGM ─────────────────────────────────────────────
             // case "cma": { ... break; }
@@ -193,11 +382,13 @@ serve(async (req) => {
             default:
               results.push({
                 id: container.id,
-                skipped: `carrier '${carrier}' not yet implemented`,
+                container_number: container.container_number,
+                skipped: `Carrier '${carrier}' not yet implemented. Add prefix to CARRIER_BY_PREFIX and implement handler.`,
               });
               continue;
           }
 
+          // ── Write to DB ───────────────────────────────────────────────────
           const { error: updateError } = await supabaseAdmin
             .from("containers")
             .update({
@@ -209,11 +400,22 @@ serve(async (req) => {
             .eq("id", container.id);
 
           if (updateError) {
-            console.error(`[track-containers] DB update failed for ${container.container_number}:`, updateError.message);
-            results.push({ id: container.id, carrier, container_number: container.container_number, error: `DB: ${updateError.message}` });
+            console.error(
+              `[track-containers] DB update failed for ${container.container_number}:`,
+              updateError.message
+            );
+            results.push({
+              id: container.id,
+              carrier,
+              container_number: container.container_number,
+              error: `DB update: ${updateError.message}`,
+            });
             continue;
           }
 
+          console.log(
+            `[track-containers] ✓ ${container.container_number}: location='${location}', eta='${apiEta}'`
+          );
           results.push({
             id: container.id,
             carrier,
@@ -223,7 +425,7 @@ serve(async (req) => {
           });
         } catch (err) {
           console.error(
-            `[track-containers] ${container.container_number}:`,
+            `[track-containers] Unhandled error for ${container.container_number}:`,
             (err as Error).message,
           );
           results.push({
