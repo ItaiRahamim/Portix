@@ -1,23 +1,27 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 
 serve(async (req) => {
-  // Handle CORS
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: { 'Access-Control-Allow-Origin': '*' } })
   }
 
   try {
     const { container_number } = await req.json();
-    const clientId = Deno.env.get("MAERSK_CLIENT_ID") || "";
-    const clientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
 
-    // 1. DUMB RAW STRING - EXACTLY LIKE CURL (No URLSearchParams)
-    const bodyString = `grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}`;
+    // CRITICAL: .trim() removes any hidden newlines from Supabase secrets
+    const clientId = (Deno.env.get("MAERSK_CLIENT_ID") || "").trim();
+    const clientSecret = (Deno.env.get("MAERSK_CLIENT_SECRET") || "").trim();
+
+    // 1. AUTHENTICATION (Using URLSearchParams which worked perfectly before)
+    const authParams = new URLSearchParams();
+    authParams.append("grant_type", "client_credentials");
+    authParams.append("client_id", clientId);
+    authParams.append("client_secret", clientSecret);
 
     const authRes = await fetch("https://api.maersk.com/oauth2/access_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: bodyString
+      body: authParams
     });
 
     if (!authRes.ok) {
@@ -27,8 +31,8 @@ serve(async (req) => {
 
     const { access_token } = await authRes.json();
 
-    // 2. FETCH TRACKING DATA (Using Proprietary Ocean T&T Endpoint)
-    const trackUrl = `https://api.maersk.com/track-and-trace/equipments?equipmentNumber=${container_number}`;
+    // 2. FETCH TRACKING DATA (Correct DCSA Endpoint based on token scopes)
+    const trackUrl = `https://api.maersk.com/track-and-trace/events?equipmentReference=${container_number}`;
 
     const trackRes = await fetch(trackUrl, {
       headers: {
@@ -39,6 +43,8 @@ serve(async (req) => {
     });
 
     const data = await trackRes.json();
+
+    // Return response directly to Supabase dashboard
     return new Response(JSON.stringify({ ok: true, data }), {
       headers: { "Content-Type": "application/json" }
     });
