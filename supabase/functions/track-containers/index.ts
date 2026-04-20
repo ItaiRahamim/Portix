@@ -99,7 +99,7 @@ async function fetchMaerskTracking(
   containerNumber: string,
   bearerToken: string,
 ): Promise<unknown> {
-  const url = `https://api.maersk.com/track-and-trace-private/v2/events?equipmentReference=${containerNumber}`;
+  const url = `https://api.maersk.com/track-and-trace/v2/events?equipmentReference=${containerNumber}`;
 
   console.log(`[track-containers] GET ${url}`);
   const res = await fetch(url, {
