@@ -122,29 +122,22 @@ async function getMaerskBearerToken(): Promise<string> {
 
 async function fetchMaerskTracking(
   containerNumber: string,
-  opts: { bearerToken?: string; clientId?: string },
+  bearerToken: string,
 ): Promise<unknown> {
   // DCSA T&T v2: equipmentReference is a query param, not a path segment.
   const url = `${MAERSK_EVENTS_URL}?equipmentReference=${encodeURIComponent(containerNumber)}`;
 
-  // Maersk requires an OAuth2 Bearer token AND Consumer-Key (= client_id) on every request.
-  // Without Bearer token the gateway returns 401; without Consumer-Key it returns a proxy error.
-  if (!opts.bearerToken) {
-    throw new Error(
-      "No Maersk Bearer token available. Ensure MAERSK_CLIENT_ID + MAERSK_CLIENT_SECRET are set in Edge Function secrets."
-    );
-  }
-
+  // Both Authorization and Consumer-Key are mandatory on every Maersk gateway request.
+  // Consumer-Key is read directly from env to guarantee it is never silently omitted.
   const headers: Record<string, string> = {
-    "Accept": "application/json",
-    "Authorization": `Bearer ${opts.bearerToken}`,
+    "Authorization": `Bearer ${bearerToken}`,
+    "Consumer-Key":  Deno.env.get("MAERSK_CLIENT_ID") || "",
+    "Accept":        "application/json",
   };
 
-  // Consumer-Key must accompany every OAuth2 request to the Maersk API Gateway
-  if (opts.clientId) headers["Consumer-Key"] = opts.clientId;
-
   console.log(
-    `[track-containers] Maersk T&T → DCSA events query for ${containerNumber}`
+    `[track-containers] Maersk T&T → DCSA events query for ${containerNumber} ` +
+    `(Consumer-Key present: ${!!Deno.env.get("MAERSK_CLIENT_ID")})`
   );
 
   console.log(`[track-containers] GET ${url}`);
@@ -403,10 +396,7 @@ serve(async (req) => {
               }
 
               try {
-                raw = await fetchMaerskTracking(container.container_number, {
-                  bearerToken: maerskBearerToken ?? undefined,
-                  clientId:    maerskClientId   ?? undefined,
-                });
+                raw = await fetchMaerskTracking(container.container_number, maerskBearerToken!);
               } catch (maerskErr) {
                 const msg = (maerskErr as Error).message;
                 console.error(
