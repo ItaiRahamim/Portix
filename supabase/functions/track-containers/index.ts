@@ -68,7 +68,7 @@ const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
 // DCSA Track & Trace v2 — official Maersk public gateway path.
 // Uses equipmentReference query param, not a path segment.
 // Docs: https://developer.maersk.com/product-catalog/track-and-trace
-const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace/v2/events";
+const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace-private/v2/events";
 
 async function getMaerskBearerToken(): Promise<string> {
   console.log("[track-containers] Fetching Maersk OAuth2 Bearer token…");
