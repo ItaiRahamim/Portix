@@ -1,22 +1,23 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 serve(async (req) => {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: { 'Access-Control-Allow-Origin': '*' } })
+  }
+
   try {
     const { container_number } = await req.json();
     const clientId = Deno.env.get("MAERSK_CLIENT_ID") || "";
     const clientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
 
-    // 1. Get OAuth2 Token
-    const authParams = new URLSearchParams();
-    authParams.append("grant_type", "client_credentials");
-    authParams.append("client_id", clientId);
-    authParams.append("client_secret", clientSecret);
+    // 1. DUMB RAW STRING - EXACTLY LIKE CURL (No URLSearchParams)
+    const bodyString = `grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}`;
 
     const authRes = await fetch("https://api.maersk.com/oauth2/access_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: authParams
+      body: bodyString
     });
 
     if (!authRes.ok) {
@@ -26,8 +27,9 @@ serve(async (req) => {
 
     const { access_token } = await authRes.json();
 
-    // 2. Fetch Tracking Data from the CORRECT proprietary endpoint
-    const trackUrl = `https://api.maersk.com/track-and-trace/v2/containers/${container_number}`;
+    // 2. FETCH TRACKING DATA (Using Proprietary Ocean T&T Endpoint)
+    const trackUrl = `https://api.maersk.com/track-and-trace/equipments?equipmentNumber=${container_number}`;
+
     const trackRes = await fetch(trackUrl, {
       headers: {
         "Authorization": `Bearer ${access_token}`,
