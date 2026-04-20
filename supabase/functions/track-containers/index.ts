@@ -65,10 +65,10 @@ function detectCarrier(containerNumber: string): string {
 // Docs: https://developer.maersk.com/documentation/authentication
 
 const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
-// Correct product path: "track-and-trace-private" is the registered API
-// Gateway route on developer.maersk.com — /track/ does not exist.
-const MAERSK_TRACK_BASE_URL =
-  "https://api.maersk.com/track-and-trace-private/v2/containers";
+// DCSA Track & Trace v2 — official Maersk public gateway path.
+// Uses equipmentReference query param, not a path segment.
+// Docs: https://developer.maersk.com/product-catalog/track-and-trace
+const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace/v2/events";
 
 async function getMaerskBearerToken(
   clientId: string,
@@ -127,7 +127,8 @@ async function fetchMaerskTracking(
   containerNumber: string,
   opts: { bearerToken?: string; clientId?: string },
 ): Promise<unknown> {
-  const url = `${MAERSK_TRACK_BASE_URL}/${encodeURIComponent(containerNumber)}`;
+  // DCSA T&T v2: equipmentReference is a query param, not a path segment.
+  const url = `${MAERSK_EVENTS_URL}?equipmentReference=${encodeURIComponent(containerNumber)}`;
 
   // Maersk requires an OAuth2 Bearer token AND Consumer-Key (= client_id) on every request.
   // Without Bearer token the gateway returns 401; without Consumer-Key it returns a proxy error.
@@ -146,7 +147,7 @@ async function fetchMaerskTracking(
   if (opts.clientId) headers["Consumer-Key"] = opts.clientId;
 
   console.log(
-    `[track-containers] Maersk T&T → OAuth2 Bearer + Consumer-Key for ${containerNumber}`
+    `[track-containers] Maersk T&T → DCSA events query for ${containerNumber}`
   );
 
   console.log(`[track-containers] GET ${url}`);
@@ -176,37 +177,102 @@ async function fetchMaerskTracking(
   return parsed;
 }
 
-// ─── Normalise Maersk Response ────────────────────────────────────────────────
-// The Maersk T&T API returns different shapes depending on the product version.
-// This function tries the most common paths and falls back gracefully.
+// ─── Normalise Maersk DCSA Events Response ────────────────────────────────────
+// DCSA Track & Trace v2 returns either:
+//   { events: [...] }   — wrapped object
+//   [...]               — bare array (some gateway versions)
+//
+// Each event has:
+//   eventType              : "TRANSPORT" | "EQUIPMENT" | "SHIPMENT"
+//   eventClassifierCode    : "ACT" (actual) | "EST" (estimated) | "PLN" (planned)
+//   transportEventTypeCode : "ARRI" (arrival) | "DEPA" (departure)
+//   eventDateTime          : ISO-8601 string
+//   eventLocation          : { locationName?: string; UNLocationCode?: string }
+//
+// Strategy:
+//   location → name of the MOST RECENT actual or estimated arrival event
+//   apiEta   → dateTime of the NEXT estimated arrival (latest EST ARRI event)
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type DCSAEvent = Record<string, any>;
 
 function extractMaerskData(raw: unknown): {
   location: string | null;
   apiEta: string | null;
 } {
-  const r = raw as Record<string, unknown>;
+  // Normalise to array
+  let events: DCSAEvent[] = [];
+  if (Array.isArray(raw)) {
+    events = raw as DCSAEvent[];
+  } else if (raw && typeof raw === "object") {
+    const r = raw as Record<string, unknown>;
+    if (Array.isArray(r.events)) events = r.events as DCSAEvent[];
+    // Fallback: legacy container-envelope shape (old API versions)
+    else {
+      const containers =
+        (r.containers as DCSAEvent[]) ??
+        (r.containerTrackingInfoList as DCSAEvent[]) ??
+        [];
+      const first = (containers[0] ?? r) as DCSAEvent;
+      const transportPlan = (first?.transportPlan as DCSAEvent[]) ?? [];
+      const lastLeg = transportPlan.at(-1) as DCSAEvent | undefined;
+      return {
+        location:
+          lastLeg?.actualArrival?.location ??
+          first?.currentLocation ??
+          first?.vesselCurrentPort ??
+          null,
+        apiEta:
+          lastLeg?.estimatedArrival?.dateTime ??
+          first?.estimatedTimeOfArrival ??
+          first?.eta ??
+          null,
+      };
+    }
+  }
 
-  const containers =
-    (r?.containers as unknown[]) ??
-    (r?.containerTrackingInfoList as unknown[]) ??
-    [];
+  if (events.length === 0) {
+    console.warn("[track-containers] extractMaerskData: received empty events array.");
+    return { location: null, apiEta: null };
+  }
 
-  const first = (containers[0] ?? r) as Record<string, unknown>;
+  // ── Most recent actual or estimated TRANSPORT arrival → current location ──
+  const arrivals = events
+    .filter(
+      (e) =>
+        e.eventType === "TRANSPORT" &&
+        e.transportEventTypeCode === "ARRI" &&
+        (e.eventClassifierCode === "ACT" || e.eventClassifierCode === "EST")
+    )
+    .sort((a, b) =>
+      (a.eventDateTime as string).localeCompare(b.eventDateTime as string)
+    );
 
-  const transportPlan = (first?.transportPlan as Record<string, unknown>[]) ?? [];
-  const lastLeg = transportPlan.at(-1) as Record<string, unknown> | undefined;
-
+  const lastArrival = arrivals.at(-1);
   const location: string | null =
-    (lastLeg?.actualArrival as Record<string, unknown>)?.location as string ??
-    (first?.currentLocation as string) ??
-    (first?.vesselCurrentPort as string) ??
+    lastArrival?.eventLocation?.locationName ??
+    lastArrival?.eventLocation?.UNLocationCode ??
     null;
 
-  const apiEta: string | null =
-    (lastLeg?.estimatedArrival as Record<string, unknown>)?.dateTime as string ??
-    (first?.estimatedTimeOfArrival as string) ??
-    (first?.eta as string) ??
-    null;
+  // ── Next estimated TRANSPORT arrival → ETA ───────────────────────────────
+  const estimatedArrivals = events
+    .filter(
+      (e) =>
+        e.eventType === "TRANSPORT" &&
+        e.transportEventTypeCode === "ARRI" &&
+        e.eventClassifierCode === "EST"
+    )
+    .sort((a, b) =>
+      (a.eventDateTime as string).localeCompare(b.eventDateTime as string)
+    );
+
+  // Use the latest EST arrival date as the best ETA signal
+  const apiEta: string | null = estimatedArrivals.at(-1)?.eventDateTime ?? null;
+
+  console.log(
+    `[track-containers] extractMaerskData: ${events.length} events → ` +
+    `location='${location}', eta='${apiEta}'`
+  );
 
   return { location, apiEta };
 }
