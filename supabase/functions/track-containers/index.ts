@@ -70,36 +70,33 @@ const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
 // Docs: https://developer.maersk.com/product-catalog/track-and-trace
 const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace/v2/events";
 
-async function getMaerskBearerToken(
-  clientId: string,
-  clientSecret: string,
-): Promise<string> {
+async function getMaerskBearerToken(): Promise<string> {
   console.log("[track-containers] Fetching Maersk OAuth2 Bearer token…");
 
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: clientId,
-    client_secret: clientSecret,
-  });
+  // Read credentials directly from env — avoids any parameter-passing ambiguity.
+  const params = new URLSearchParams();
+  params.append("grant_type",    "client_credentials");
+  params.append("client_id",     Deno.env.get("MAERSK_CLIENT_ID")     || "");
+  params.append("client_secret", Deno.env.get("MAERSK_CLIENT_SECRET") || "");
 
   const res = await fetch(MAERSK_TOKEN_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      "Accept": "application/json",
+      "Accept":        "application/json",
     },
-    body: body.toString(),
+    body: params,   // pass URLSearchParams object directly — Deno serialises it correctly
   });
 
   const responseText = await res.text();
   console.log(
     `[track-containers] Maersk token endpoint responded ${res.status}:`,
-    responseText.slice(0, 300)
+    responseText.slice(0, 300),
   );
 
   if (!res.ok) {
     throw new Error(
-      `Maersk token endpoint returned HTTP ${res.status}. Body: ${responseText.slice(0, 500)}`
+      `Maersk token endpoint returned HTTP ${res.status}. Body: ${responseText.slice(0, 500)}`,
     );
   }
 
@@ -113,7 +110,7 @@ async function getMaerskBearerToken(
   const token = json?.access_token as string | undefined;
   if (!token) {
     throw new Error(
-      `Maersk token response missing 'access_token'. Full response: ${responseText.slice(0, 500)}`
+      `Maersk token response missing 'access_token'. Full response: ${responseText.slice(0, 500)}`,
     );
   }
 
@@ -367,7 +364,7 @@ serve(async (req) => {
 
     if (hasMaerskContainers && maerskClientId && maerskClientSecret) {
       try {
-        maerskBearerToken = await getMaerskBearerToken(maerskClientId, maerskClientSecret);
+        maerskBearerToken = await getMaerskBearerToken();
       } catch (tokenErr) {
         maerskTokenError = (tokenErr as Error).message;
         console.error("[track-containers] Failed to obtain Maersk Bearer token:", maerskTokenError);
