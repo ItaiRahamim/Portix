@@ -11,7 +11,6 @@
 //   SUPABASE_SERVICE_ROLE_KEY   (auto-injected)
 //   MAERSK_CLIENT_ID            Set in Dashboard → Edge Functions → Secrets
 //   MAERSK_CLIENT_SECRET        Set in Dashboard → Edge Functions → Secrets
-//   MAERSK_API_KEY              (legacy Consumer-Key fallback — optional)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -126,37 +125,29 @@ async function getMaerskBearerToken(
 
 async function fetchMaerskTracking(
   containerNumber: string,
-  opts: { bearerToken?: string; clientId?: string; apiKey?: string },
+  opts: { bearerToken?: string; clientId?: string },
 ): Promise<unknown> {
   const url = `${MAERSK_TRACK_BASE_URL}/${encodeURIComponent(containerNumber)}`;
 
-  // Maersk always requires Consumer-Key (= client_id) on every request.
-  // When OAuth2 is used, Bearer token AND Consumer-Key are both mandatory.
-  // Without Consumer-Key the gateway returns the "maersk-host" proxy error.
-  if (!opts.bearerToken && !opts.apiKey) {
+  // Maersk requires an OAuth2 Bearer token AND Consumer-Key (= client_id) on every request.
+  // Without Bearer token the gateway returns 401; without Consumer-Key it returns a proxy error.
+  if (!opts.bearerToken) {
     throw new Error(
-      "No Maersk credentials available. Set MAERSK_CLIENT_ID + MAERSK_CLIENT_SECRET in Edge Function secrets."
+      "No Maersk Bearer token available. Ensure MAERSK_CLIENT_ID + MAERSK_CLIENT_SECRET are set in Edge Function secrets."
     );
   }
 
   const headers: Record<string, string> = {
     "Accept": "application/json",
+    "Authorization": `Bearer ${opts.bearerToken}`,
   };
 
-  if (opts.bearerToken) {
-    // OAuth2 flow: Bearer token + Consumer-Key (client_id) both required
-    headers["Authorization"] = `Bearer ${opts.bearerToken}`;
-    if (opts.clientId) headers["Consumer-Key"] = opts.clientId;
-    console.log(
-      `[track-containers] Maersk T&T → OAuth2 Bearer + Consumer-Key for ${containerNumber}`
-    );
-  } else if (opts.apiKey) {
-    // Legacy: standalone Consumer-Key only
-    headers["Consumer-Key"] = opts.apiKey;
-    console.log(
-      `[track-containers] Maersk T&T → Consumer-Key (legacy) for ${containerNumber}`
-    );
-  }
+  // Consumer-Key must accompany every OAuth2 request to the Maersk API Gateway
+  if (opts.clientId) headers["Consumer-Key"] = opts.clientId;
+
+  console.log(
+    `[track-containers] Maersk T&T → OAuth2 Bearer + Consumer-Key for ${containerNumber}`
+  );
 
   console.log(`[track-containers] GET ${url}`);
   const res = await fetch(url, { headers });
@@ -240,15 +231,15 @@ serve(async (req) => {
     // ── Credentials ──────────────────────────────────────────────────────────
     const maerskClientId     = Deno.env.get("MAERSK_CLIENT_ID")     ?? null;
     const maerskClientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") ?? null;
-    const maerskLegacyKey    = Deno.env.get("MAERSK_API_KEY")       ?? null;
 
     // Log which credential mode is active (without leaking values)
     if (maerskClientId && maerskClientSecret) {
-      console.log("[track-containers] Maersk auth mode: OAuth2 Client Credentials");
-    } else if (maerskLegacyKey) {
-      console.log("[track-containers] Maersk auth mode: Consumer-Key (legacy)");
+      console.log("[track-containers] Maersk auth mode: OAuth2 Client Credentials ✓");
     } else {
-      console.warn("[track-containers] WARNING: No Maersk credentials found in env vars.");
+      console.warn(
+        "[track-containers] WARNING: MAERSK_CLIENT_ID or MAERSK_CLIENT_SECRET not found in env vars. " +
+        "Set both secrets in Supabase Dashboard → Edge Functions → Secrets."
+      );
     }
 
     // ── Optional body: target a single container for debugging ───────────────
@@ -314,7 +305,7 @@ serve(async (req) => {
       } catch (tokenErr) {
         maerskTokenError = (tokenErr as Error).message;
         console.error("[track-containers] Failed to obtain Maersk Bearer token:", maerskTokenError);
-        // Don't throw — fall back to legacy key or surface per-container
+        // Don't throw — surface error per-container below
       }
     }
 
@@ -337,8 +328,8 @@ serve(async (req) => {
 
           switch (carrier) {
             case "maersk": {
-              // Surface token error early if no fallback key either
-              if (maerskTokenError && !maerskLegacyKey) {
+              // Surface token error early
+              if (maerskTokenError) {
                 results.push({
                   id: container.id,
                   carrier,
@@ -352,7 +343,6 @@ serve(async (req) => {
                 raw = await fetchMaerskTracking(container.container_number, {
                   bearerToken: maerskBearerToken ?? undefined,
                   clientId:    maerskClientId   ?? undefined,
-                  apiKey:      maerskLegacyKey  ?? undefined,
                 });
               } catch (maerskErr) {
                 const msg = (maerskErr as Error).message;
