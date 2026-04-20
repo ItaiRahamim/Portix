@@ -71,63 +71,26 @@ const MAERSK_TOKEN_URL = "https://api.maersk.com/oauth2/access_token";
 const MAERSK_EVENTS_URL = "https://api.maersk.com/track-and-trace-private/v2/events";
 
 async function getMaerskBearerToken(): Promise<string> {
-  console.log("[track-containers] Fetching Maersk OAuth2 Bearer token…");
-
-  // Read credentials directly from env — avoids any parameter-passing ambiguity.
-  const clientId     = Deno.env.get("MAERSK_CLIENT_ID")     || "";
-  const clientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
-
-  // Diagnostic: log first 6 chars of each credential so we can verify
-  // the correct values are loaded without exposing the full secret.
-  console.log(
-    `[track-containers] MAERSK_CLIENT_ID     → "${clientId.slice(0, 6)}…" (len=${clientId.length})`,
-  );
-  console.log(
-    `[track-containers] MAERSK_CLIENT_SECRET → "${clientSecret.slice(0, 6)}…" (len=${clientSecret.length})`,
-  );
-
+  const url = "https://api.maersk.com/oauth2/access_token";
   const params = new URLSearchParams();
-  params.append("grant_type",    "client_credentials");
-  params.append("client_id",     clientId);
-  params.append("client_secret", clientSecret);
+  params.append("grant_type", "client_credentials");
+  params.append("client_id", Deno.env.get("MAERSK_CLIENT_ID") || "");
+  params.append("client_secret", Deno.env.get("MAERSK_CLIENT_SECRET") || "");
 
-  const res = await fetch(MAERSK_TOKEN_URL, {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      "Accept":        "application/json",
     },
-    body: params,   // pass URLSearchParams object directly — Deno serialises it correctly
+    body: params,
   });
 
-  const responseText = await res.text();
-  console.log(
-    `[track-containers] Maersk token endpoint responded ${res.status}:`,
-    responseText.slice(0, 300),
-  );
-
   if (!res.ok) {
-    throw new Error(
-      `Maersk token endpoint returned HTTP ${res.status}. Body: ${responseText.slice(0, 500)}`,
-    );
+    const err = await res.text();
+    throw new Error(`Maersk token endpoint returned HTTP ${res.status}. Body: ${err}`);
   }
-
-  let json: Record<string, unknown>;
-  try {
-    json = JSON.parse(responseText);
-  } catch {
-    throw new Error(`Maersk token endpoint returned non-JSON: ${responseText.slice(0, 300)}`);
-  }
-
-  const token = json?.access_token as string | undefined;
-  if (!token) {
-    throw new Error(
-      `Maersk token response missing 'access_token'. Full response: ${responseText.slice(0, 500)}`,
-    );
-  }
-
-  console.log("[track-containers] Maersk Bearer token obtained successfully.");
-  return token;
+  const data = await res.json();
+  return data.access_token;
 }
 
 // ─── Maersk Track & Trace ─────────────────────────────────────────────────────
@@ -136,24 +99,16 @@ async function fetchMaerskTracking(
   containerNumber: string,
   bearerToken: string,
 ): Promise<unknown> {
-  // DCSA T&T v2: equipmentReference is a query param, not a path segment.
-  const url = `${MAERSK_EVENTS_URL}?equipmentReference=${encodeURIComponent(containerNumber)}`;
-
-  // Both Authorization and Consumer-Key are mandatory on every Maersk gateway request.
-  // Consumer-Key is read directly from env to guarantee it is never silently omitted.
-  const headers: Record<string, string> = {
-    "Authorization": `Bearer ${bearerToken}`,
-    "Consumer-Key":  Deno.env.get("MAERSK_CLIENT_ID") || "",
-    "Accept":        "application/json",
-  };
-
-  console.log(
-    `[track-containers] Maersk T&T → DCSA events query for ${containerNumber} ` +
-    `(Consumer-Key present: ${!!Deno.env.get("MAERSK_CLIENT_ID")})`
-  );
+  const url = `https://api.maersk.com/track-and-trace-private/v2/events?equipmentReference=${containerNumber}`;
 
   console.log(`[track-containers] GET ${url}`);
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${bearerToken}`,
+      "Consumer-Key": Deno.env.get("MAERSK_CLIENT_ID") || "",
+      "Accept": "application/json",
+    },
+  });
 
   const responseText = await res.text();
   console.log(
