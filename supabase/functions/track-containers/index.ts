@@ -74,10 +74,22 @@ async function getMaerskBearerToken(): Promise<string> {
   console.log("[track-containers] Fetching Maersk OAuth2 Bearer token…");
 
   // Read credentials directly from env — avoids any parameter-passing ambiguity.
+  const clientId     = Deno.env.get("MAERSK_CLIENT_ID")     || "";
+  const clientSecret = Deno.env.get("MAERSK_CLIENT_SECRET") || "";
+
+  // Diagnostic: log first 6 chars of each credential so we can verify
+  // the correct values are loaded without exposing the full secret.
+  console.log(
+    `[track-containers] MAERSK_CLIENT_ID     → "${clientId.slice(0, 6)}…" (len=${clientId.length})`,
+  );
+  console.log(
+    `[track-containers] MAERSK_CLIENT_SECRET → "${clientSecret.slice(0, 6)}…" (len=${clientSecret.length})`,
+  );
+
   const params = new URLSearchParams();
   params.append("grant_type",    "client_credentials");
-  params.append("client_id",     Deno.env.get("MAERSK_CLIENT_ID")     || "");
-  params.append("client_secret", Deno.env.get("MAERSK_CLIENT_SECRET") || "");
+  params.append("client_id",     clientId);
+  params.append("client_secret", clientSecret);
 
   const res = await fetch(MAERSK_TOKEN_URL, {
     method: "POST",
