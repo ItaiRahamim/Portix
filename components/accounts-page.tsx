@@ -4,130 +4,142 @@ import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import { Eye } from "lucide-react";
+import { Eye, TrendingUp, TrendingDown, Minus } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { getInvoices, getAccountProfiles } from "@/lib/db";
-import type { Invoice, Profile, UserRole } from "@/lib/supabase";
+import { getMyCompany, getCompanyAccounts } from "@/lib/db";
+import type { CompanyWithBalance } from "@/lib/db";
 
 interface AccountsPageProps {
   role: "importer" | "supplier" | "customs-agent";
 }
 
-interface AccountSummary {
-  profile: Profile;
-  totalInvoices: number;
-  totalAmount: number;
-  paidAmount: number;
-  remainingBalance: number;
-  lastInvoiceDate: string | null;
+function formatCurrency(amount: number, currency = "USD") {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(amount);
 }
 
-function buildAccountSummaries(
-  invoices: Invoice[],
-  profiles: Profile[],
-  currentRole: UserRole
-): AccountSummary[] {
-  const profileMap = new Map(profiles.map((p) => [p.id, p]));
-
-  // Group invoices by counterpart ID
-  const grouped = new Map<string, Invoice[]>();
-  for (const inv of invoices) {
-    // counterpart is the "other side" from the current user's role
-    const counterpartId =
-      currentRole === "importer" ? inv.supplier_id : inv.importer_id;
-    const group = grouped.get(counterpartId) ?? [];
-    group.push(inv);
-    grouped.set(counterpartId, group);
-  }
-
-  const summaries: AccountSummary[] = [];
-  for (const [id, invs] of grouped.entries()) {
-    const profile = profileMap.get(id);
-    if (!profile) continue;
-
-    const totalAmount = invs.reduce((s, i) => s + (i.amount ?? 0), 0);
-    const paidAmount = invs.reduce((s, i) => s + (i.paid_amount ?? 0), 0);
-    const sortedByDate = [...invs].sort(
-      (a, b) => new Date(b.invoice_date).getTime() - new Date(a.invoice_date).getTime()
+function BalanceCell({ balance }: { balance: number }) {
+  if (balance > 0) {
+    return (
+      <span className="flex items-center justify-end gap-1 text-red-600 font-medium">
+        <TrendingUp className="w-3.5 h-3.5" />
+        {formatCurrency(balance)}
+      </span>
     );
-
-    summaries.push({
-      profile,
-      totalInvoices: invs.length,
-      totalAmount,
-      paidAmount,
-      remainingBalance: totalAmount - paidAmount,
-      lastInvoiceDate: sortedByDate[0]?.invoice_date ?? null,
-    });
   }
-
-  // Ensure all profiles appear even with no invoices
-  for (const profile of profiles) {
-    if (!grouped.has(profile.id)) {
-      summaries.push({
-        profile,
-        totalInvoices: 0,
-        totalAmount: 0,
-        paidAmount: 0,
-        remainingBalance: 0,
-        lastInvoiceDate: null,
-      });
-    }
+  if (balance < 0) {
+    return (
+      <span className="flex items-center justify-end gap-1 text-green-600 font-medium">
+        <TrendingDown className="w-3.5 h-3.5" />
+        {formatCurrency(Math.abs(balance))} credit
+      </span>
+    );
   }
-
-  return summaries.sort((a, b) =>
-    a.profile.full_name.localeCompare(b.profile.full_name)
+  return (
+    <span className="flex items-center justify-end gap-1 text-gray-400">
+      <Minus className="w-3.5 h-3.5" />
+      {formatCurrency(0)}
+    </span>
   );
 }
 
+const COMPANY_TYPE_LABELS: Record<string, string> = {
+  importer: "Importer",
+  supplier: "Supplier",
+  broker: "Broker",
+};
+
+const COMPANY_TYPE_COLORS: Record<string, string> = {
+  importer: "bg-blue-100 text-blue-700",
+  supplier: "bg-green-100 text-green-700",
+  broker: "bg-purple-100 text-purple-700",
+};
+
 export function AccountsPage({ role }: AccountsPageProps) {
   const router = useRouter();
-  const [summaries, setSummaries] = useState<AccountSummary[]>([]);
+  const [accounts, setAccounts] = useState<CompanyWithBalance[]>([]);
+  const [myCompanyId, setMyCompanyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Determine which role to look up as counterparts
-  const counterpartRole: UserRole =
-    role === "importer" ? "supplier"
-    : role === "supplier" ? "importer"
-    : "importer"; // customs agent sees importers
+  const columnLabel =
+    role === "importer" ? "Supplier / Broker"
+    : role === "supplier" ? "Importer"
+    : "Company";
+
+  const basePath = `/${role}/accounts`;
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const [invoices, profiles] = await Promise.all([
-      getInvoices(),
-      getAccountProfiles(counterpartRole),
-    ]);
-
-    // Map URL role slug → DB role value (support both old and new customs role names)
-    const currentRole: UserRole =
-      role === "customs-agent" ? "customs" : role as UserRole;
-    setSummaries(buildAccountSummaries(invoices, profiles, currentRole));
+    const myCompany = await getMyCompany();
+    if (!myCompany) {
+      setLoading(false);
+      return;
+    }
+    setMyCompanyId(myCompany.id);
+    const companyAccounts = await getCompanyAccounts(myCompany.id);
+    // Sort: highest outstanding balance first
+    companyAccounts.sort(
+      (a, b) => (b.balance?.current_balance ?? 0) - (a.balance?.current_balance ?? 0)
+    );
+    setAccounts(companyAccounts);
     setLoading(false);
-  }, [role, counterpartRole]);
+  }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  const columnLabel =
-    role === "importer" ? "Supplier"
-    : role === "supplier" ? "Importer"
-    : "Client";
-
-  const basePath = `/${role}/accounts`;
+  // KPI aggregates
+  const totalOutstanding = accounts.reduce(
+    (sum, a) => sum + Math.max(0, a.balance?.current_balance ?? 0), 0
+  );
+  const totalInvoiced = accounts.reduce(
+    (sum, a) => sum + (a.balance?.total_invoiced ?? 0), 0
+  );
+  const totalPaid = accounts.reduce(
+    (sum, a) => sum + (a.balance?.total_paid ?? 0), 0
+  );
 
   return (
     <DashboardLayout
       role={role}
       title="Accounts"
-      subtitle={`Manage financial relationships with your ${columnLabel.toLowerCase()}s`}
+      subtitle={`Company-level financial relationships and transaction ledger`}
     >
+      {/* KPI row */}
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        <Card>
+          <CardContent className="pt-4 pb-4">
+            <p className="text-xs text-gray-500 mb-1">Total Invoiced</p>
+            <p className="text-xl font-semibold text-gray-900">{formatCurrency(totalInvoiced)}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-4 pb-4">
+            <p className="text-xs text-gray-500 mb-1">Total Paid</p>
+            <p className="text-xl font-semibold text-green-600">{formatCurrency(totalPaid)}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-4 pb-4">
+            <p className="text-xs text-gray-500 mb-1">Outstanding Balance</p>
+            <p className={`text-xl font-semibold ${totalOutstanding > 0 ? "text-red-600" : "text-gray-400"}`}>
+              {formatCurrency(totalOutstanding)}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Accounts table */}
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">
-            {role === "importer" ? "Suppliers" : role === "supplier" ? "Importers" : "Clients"}
-          </CardTitle>
+          <CardTitle className="text-base">{columnLabel}s</CardTitle>
         </CardHeader>
         <CardContent>
           {loading ? (
@@ -137,64 +149,72 @@ export function AccountsPage({ role }: AccountsPageProps) {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>{columnLabel}</TableHead>
                     <TableHead>Company</TableHead>
-                    <TableHead className="text-center">Total Invoices</TableHead>
-                    <TableHead className="text-right">Total Amount</TableHead>
-                    <TableHead className="text-right">Paid</TableHead>
-                    <TableHead className="text-right">Remaining</TableHead>
-                    <TableHead>Last Invoice</TableHead>
-                    <TableHead>Action</TableHead>
+                    <TableHead>Type</TableHead>
+                    <TableHead>Country</TableHead>
+                    <TableHead className="text-right">Total Invoiced</TableHead>
+                    <TableHead className="text-right">Total Paid</TableHead>
+                    <TableHead className="text-right">Credits</TableHead>
+                    <TableHead className="text-right">Balance</TableHead>
+                    <TableHead></TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {summaries.length === 0 ? (
+                  {accounts.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={8} className="text-center py-10 text-gray-400">
-                        No accounts found
+                        No company accounts found. Transactions will appear here once invoices are issued.
                       </TableCell>
                     </TableRow>
                   ) : (
-                    summaries.map(({ profile, totalInvoices, totalAmount, paidAmount, remainingBalance, lastInvoiceDate }) => (
-                      <TableRow
-                        key={profile.id}
-                        className="cursor-pointer hover:bg-gray-50"
-                        onClick={() => router.push(`${basePath}/${profile.id}`)}
-                      >
-                        <TableCell className="text-sm font-medium">{profile.full_name}</TableCell>
-                        <TableCell className="text-sm text-gray-600">{profile.company_name}</TableCell>
-                        <TableCell className="text-center text-sm">{totalInvoices}</TableCell>
-                        <TableCell className="text-right text-sm">
-                          {totalAmount > 0 ? `$${totalAmount.toLocaleString()}` : "—"}
-                        </TableCell>
-                        <TableCell className="text-right text-sm text-green-600">
-                          {paidAmount > 0 ? `$${paidAmount.toLocaleString()}` : "—"}
-                        </TableCell>
-                        <TableCell className="text-right text-sm">
-                          {remainingBalance > 0 ? (
-                            <span className="text-red-600">${remainingBalance.toLocaleString()}</span>
-                          ) : (
-                            <span className="text-gray-400">$0</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-sm text-gray-500">
-                          {lastInvoiceDate
-                            ? new Date(lastInvoiceDate).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
-                            : "—"}
-                        </TableCell>
-                        <TableCell>
-                          <div onClick={(e) => e.stopPropagation()}>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => router.push(`${basePath}/${profile.id}`)}
+                    accounts.map((company) => {
+                      const bal = company.balance;
+                      const detailPath = myCompanyId
+                        ? `${basePath}/${company.id}`
+                        : "#";
+                      return (
+                        <TableRow
+                          key={company.id}
+                          className="cursor-pointer hover:bg-gray-50"
+                          onClick={() => router.push(detailPath)}
+                        >
+                          <TableCell className="font-medium text-sm">{company.name}</TableCell>
+                          <TableCell>
+                            <Badge
+                              className={`text-xs font-normal ${COMPANY_TYPE_COLORS[company.type] ?? "bg-gray-100 text-gray-600"}`}
+                              variant="secondary"
                             >
-                              <Eye className="w-3.5 h-3.5 mr-1" />View
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))
+                              {COMPANY_TYPE_LABELS[company.type] ?? company.type}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-sm text-gray-500">{company.country ?? "—"}</TableCell>
+                          <TableCell className="text-right text-sm">
+                            {bal ? formatCurrency(bal.total_invoiced) : "—"}
+                          </TableCell>
+                          <TableCell className="text-right text-sm text-green-600">
+                            {bal ? formatCurrency(bal.total_paid) : "—"}
+                          </TableCell>
+                          <TableCell className="text-right text-sm text-blue-600">
+                            {bal && bal.total_credits > 0 ? formatCurrency(bal.total_credits) : "—"}
+                          </TableCell>
+                          <TableCell className="text-right text-sm">
+                            <BalanceCell balance={bal?.current_balance ?? 0} />
+                          </TableCell>
+                          <TableCell>
+                            <div onClick={(e) => e.stopPropagation()}>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => router.push(detailPath)}
+                              >
+                                <Eye className="w-3.5 h-3.5 mr-1" />
+                                Ledger
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
                   )}
                 </TableBody>
               </Table>

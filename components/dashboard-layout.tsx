@@ -8,7 +8,6 @@ import {
   Package,
   FileText,
   ShieldCheck,
-  Ship,
   Users,
   AlertTriangle,
   Award,
@@ -41,7 +40,6 @@ const roleConfig = {
     label: "Importer",
     icon: Package,
     nav: [
-      { label: "Containers", path: "/importer", icon: Ship },
       { label: "Accounts", path: "/importer/accounts", icon: Users },
       { label: "Claims", path: "/importer/claims", icon: AlertTriangle },
       { label: "Licenses", path: "/importer/licenses", icon: Award },
@@ -53,7 +51,6 @@ const roleConfig = {
     label: "Supplier",
     icon: FileText,
     nav: [
-      { label: "Containers", path: "/supplier", icon: Ship },
       { label: "Accounts", path: "/supplier/accounts", icon: Users },
       { label: "Claims", path: "/supplier/claims", icon: AlertTriangle },
     ],
@@ -63,7 +60,6 @@ const roleConfig = {
     label: "Customs Agent",
     icon: ShieldCheck,
     nav: [
-      { label: "Containers", path: "/customs-agent", icon: Ship },
       { label: "Accounts", path: "/customs-agent/accounts", icon: Users },
     ],
   },
@@ -113,7 +109,7 @@ export function DashboardLayout({ role, title, subtitle, children }: DashboardLa
         <div className="container mx-auto px-4">
           <div className="flex items-center gap-3 py-2">
             {/* Brand — links back to role home */}
-            <Link href={`/${role}`} className="shrink-0 flex items-center">
+            <Link href={`/${role}/accounts`} className="shrink-0 flex items-center">
               <Logo className="h-8 md:h-10 w-auto min-w-[120px]" />
             </Link>
 

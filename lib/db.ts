@@ -24,6 +24,12 @@ import type {
   ImportLicenseView,
   Profile,
   UserRole,
+  Company,
+  Transaction,
+  CompanyBalance,
+  CompanyWithBalance,
+  TransactionType,
+  TransactionStatus,
 } from "@/lib/supabase";
 
 // ─── Current user ─────────────────────────────────────────────────────────────
@@ -850,3 +856,284 @@ export async function getShipmentById(shipmentId: string): Promise<Shipment | nu
   }
   return data ?? null;
 }
+
+// ─── B2B Companies & Transactions ────────────────────────────────────────────
+
+/**
+ * Returns the current user's own company (via profile.company_id).
+ * Returns null if the user has no company linked.
+ */
+export async function getMyCompany(): Promise<Company | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  // Fetch company_id from profile first
+  const { data: profile, error: profileError } = await supabase
+    .from("profiles")
+    .select("company_id")
+    .eq("id", user.id)
+    .single();
+
+  if (profileError || !profile?.company_id) {
+    console.error("[db] getMyCompany (profile):", profileError?.message ?? "no company_id");
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from("companies")
+    .select("*")
+    .eq("id", profile.company_id)
+    .single();
+
+  if (error) {
+    console.error("[db] getMyCompany (company):", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+/**
+ * Returns all companies that have transactions with my company, enriched with
+ * the live balance for that company pair.
+ *
+ * The result is used by the Accounts list view.
+ */
+export async function getCompanyAccounts(myCompanyId: string): Promise<CompanyWithBalance[]> {
+  const supabase = createBrowserSupabaseClient();
+
+  // 1. Get all balances where my company is either party
+  const { data: balances, error: balErr } = await supabase
+    .from("company_balances")
+    .select("*")
+    .or(`creditor_company_id.eq.${myCompanyId},debtor_company_id.eq.${myCompanyId}`);
+
+  if (balErr) {
+    console.error("[db] getCompanyAccounts (balances):", balErr.message);
+    return [];
+  }
+
+  if (!balances || balances.length === 0) return [];
+
+  // 2. Collect all counterpart company IDs (de-duped)
+  const counterpartIds = [
+    ...new Set(
+      (balances as CompanyBalance[]).map((b) =>
+        b.creditor_company_id === myCompanyId
+          ? b.debtor_company_id
+          : b.creditor_company_id
+      )
+    ),
+  ];
+
+  // 3. Fetch company details for all counterparts
+  const { data: companies, error: compErr } = await supabase
+    .from("companies")
+    .select("*")
+    .in("id", counterpartIds);
+
+  if (compErr) {
+    console.error("[db] getCompanyAccounts (companies):", compErr.message);
+    return [];
+  }
+
+  // 4. Merge companies + their balance with my company
+  return (companies ?? []).map((company: Company) => {
+    const balance =
+      (balances as CompanyBalance[]).find(
+        (b) =>
+          (b.creditor_company_id === myCompanyId && b.debtor_company_id === company.id) ||
+          (b.debtor_company_id === myCompanyId && b.creditor_company_id === company.id)
+      ) ?? null;
+
+    return { ...company, balance };
+  }) as CompanyWithBalance[];
+}
+
+/**
+ * Returns the full transaction ledger between two companies,
+ * enriched with company names and creator profile.
+ *
+ * Call with my company as either creditor or debtor — it handles both directions.
+ */
+export async function getCompanyTransactions(
+  companyIdA: string,
+  companyIdB: string
+): Promise<Transaction[]> {
+  const supabase = createBrowserSupabaseClient();
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .select(`
+      *,
+      creditor_company:companies!creditor_company_id(id, name, type, country),
+      debtor_company:companies!debtor_company_id(id, name, type, country),
+      created_by_profile:profiles!created_by(full_name)
+    `)
+    .or(
+      `and(creditor_company_id.eq.${companyIdA},debtor_company_id.eq.${companyIdB}),` +
+      `and(creditor_company_id.eq.${companyIdB},debtor_company_id.eq.${companyIdA})`
+    )
+    .order("transaction_date", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getCompanyTransactions:", error.message);
+    return [];
+  }
+  return (data ?? []) as Transaction[];
+}
+
+/**
+ * Creates a new transaction (invoice, payment, or credit_note).
+ *
+ * - Invoices are created by the creditor (supplier/broker).
+ * - Payments are created by the debtor (importer).
+ * - Credit notes are created by the creditor.
+ */
+export async function createTransaction(opts: {
+  type: TransactionType;
+  creditorCompanyId: string;
+  debtorCompanyId: string;
+  amount: number;
+  currency?: string;
+  referenceNumber?: string;
+  notes?: string;
+  transactionDate?: string;
+  dueDate?: string;
+  containerId?: string;
+  parentTransactionId?: string;
+}): Promise<Transaction | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  // Payments start as 'pending_approval'; all others start as 'active'
+  const initialStatus: TransactionStatus =
+    opts.type === "payment" ? "pending_approval" : "active";
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .insert({
+      type: opts.type,
+      status: initialStatus,
+      creditor_company_id: opts.creditorCompanyId,
+      debtor_company_id: opts.debtorCompanyId,
+      created_by: user.id,
+      amount: opts.amount,
+      currency: opts.currency ?? "USD",
+      reference_number: opts.referenceNumber ?? null,
+      notes: opts.notes ?? null,
+      transaction_date: opts.transactionDate ?? new Date().toISOString().slice(0, 10),
+      due_date: opts.dueDate ?? null,
+      container_id: opts.containerId ?? null,
+      parent_transaction_id: opts.parentTransactionId ?? null,
+    })
+    .select("*")
+    .single();
+
+  if (error) {
+    console.error("[db] createTransaction:", error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+/**
+ * Approves a pending_approval payment.
+ * Only the creditor company can call this.
+ */
+export async function approveTransaction(transactionId: string): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return false;
+
+  const { error } = await supabase
+    .from("transactions")
+    .update({
+      status: "approved",
+      approved_by: user.id,
+      approved_at: new Date().toISOString(),
+    })
+    .eq("id", transactionId)
+    .eq("status", "pending_approval"); // safety guard
+
+  if (error) {
+    console.error("[db] approveTransaction:", error.message);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Rejects a pending_approval payment.
+ * Only the creditor company can call this.
+ */
+export async function rejectTransaction(transactionId: string): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+
+  const { error } = await supabase
+    .from("transactions")
+    .update({ status: "rejected" })
+    .eq("id", transactionId)
+    .eq("status", "pending_approval"); // safety guard
+
+  if (error) {
+    console.error("[db] rejectTransaction:", error.message);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Uploads a payment proof document to Supabase Storage and links it to the
+ * transaction row. Storage path: swift-documents/{transactionId}/{fileName}
+ */
+export async function uploadTransactionDocument(
+  transactionId: string,
+  file: File
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return false;
+
+  const ext = file.name.split(".").pop() ?? "pdf";
+  const storagePath = `${transactionId}/${Date.now()}-${transactionId.slice(0, 8)}.${ext}`;
+
+  // 1. Upload file
+  const { error: uploadError } = await supabase.storage
+    .from("swift-documents")
+    .upload(storagePath, file, { upsert: false });
+
+  if (uploadError) {
+    console.error("[db] uploadTransactionDocument (storage):", uploadError.message);
+    return false;
+  }
+
+  // 2. Link file metadata to transaction row
+  const { error: updateError } = await supabase
+    .from("transactions")
+    .update({
+      document_storage_path: storagePath,
+      document_file_name: file.name,
+      document_uploaded_by: user.id,
+    })
+    .eq("id", transactionId);
+
+  if (updateError) {
+    console.error("[db] uploadTransactionDocument (update):", updateError.message);
+    return false;
+  }
+
+  return true;
+}
+
+// Re-export types so consumers can import everything from lib/db
+export type {
+  Company,
+  Transaction,
+  CompanyBalance,
+  CompanyWithBalance,
+  TransactionType,
+  TransactionStatus,
+};
