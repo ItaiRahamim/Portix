@@ -824,15 +824,34 @@ export async function getCustomsAgents(): Promise<Profile[]> {
 
 export async function assignCustomsAgent(shipmentId: string, customsAgentId: string | null): Promise<boolean> {
   const supabase = createBrowserSupabaseClient();
-  const { error } = await supabase
+
+  // .select("id") is CRITICAL: without it, Supabase returns { data: null, error: null }
+  // for both "0 rows updated (RLS blocked)" and "1 row updated" — indistinguishable.
+  // With .select("id") we get the updated row back; an empty array means RLS silently
+  // filtered it out and we can surface a real error to the caller.
+  const { data, error } = await supabase
     .from("shipments")
     .update({ customs_agent_id: customsAgentId })
-    .eq("id", shipmentId);
+    .eq("id", shipmentId)
+    .select("id");
 
   if (error) {
-    console.error("[db] assignCustomsAgent:", error.message);
+    console.error("[db] assignCustomsAgent error:", error.message);
     return false;
   }
+
+  if (!data || data.length === 0) {
+    // RLS blocked the update (likely UPDATE policy not satisfied).
+    // This means the current user is neither the shipment creator nor an importer
+    // with containers in that shipment — check migration 00325_fix_shipment_update_rls.
+    console.error(
+      "[db] assignCustomsAgent: 0 rows updated — RLS likely blocking update on shipment",
+      shipmentId,
+      "(is the importer_id in containers set to the current user's UUID?)",
+    );
+    return false;
+  }
+
   return true;
 }
 

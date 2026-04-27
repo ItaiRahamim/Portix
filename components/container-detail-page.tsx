@@ -28,9 +28,7 @@ import {
   updateDocumentStatus,
   updateContainerStatus,
   getCurrentUserId,
-  getShipmentById,
   type CargoMedia,
-  type Shipment,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
 import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/lib/supabase";
@@ -535,7 +533,6 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const containerId = params.containerId as string;
 
   const [container, setContainer] = useState<ContainerView | null>(null);
-  const [shipment, setShipment] = useState<Shipment | null>(null);
   const [docs, setDocs] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -554,13 +551,6 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     ]);
     setContainer(c);
     setDocs(d);
-
-    // Load shipment data if available (for customs agent assignment)
-    if (c?.shipment_id) {
-      const s = await getShipmentById(c.shipment_id);
-      setShipment(s);
-    }
-
     setLoading(false);
   }, [containerId, role]);
 
@@ -784,11 +774,14 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         </CardContent>
       </Card>
 
-      {/* Customs Agent Assignment — Importer only */}
-      {role === "importer" && shipment && (
+      {/* Customs Agent Assignment — Importer only.
+          Uses container.shipment_id (always present) and container.customs_agent_id
+          (now included in v_containers view) so the selector is visible regardless
+          of who created the shipment (importer or supplier). */}
+      {role === "importer" && (
         <CustomsAgentSelector
-          shipmentId={shipment.id}
-          currentAgentId={shipment.customs_agent_id}
+          shipmentId={container.shipment_id}
+          currentAgentId={container.customs_agent_id}
           onAssigned={loadData}
         />
       )}

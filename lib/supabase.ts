@@ -125,6 +125,7 @@ export interface ContainerView extends Container {
   shipment_number: string
   vessel_name: string
   origin_country: string | null
+  customs_agent_id: string | null   // UUID of the assigned customs agent (from shipments join)
   importer_company: string
   supplier_company: string
 }
