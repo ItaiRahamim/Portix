@@ -358,14 +358,6 @@ function CargoPhotosSection({
 }
 
 // ─── Smart Upload Zone ────────────────────────────────────────────────────────
-// Make.com classify_documents response shape
-
-interface DocumentFound {
-  document_type: string;
-  document_number?: string;
-  container_number: string; // specific container number OR "ALL"
-  extracted_data?: Record<string, unknown>;
-}
 
 interface ClassifyResult {
   document_type: string;
@@ -389,132 +381,46 @@ function SmartUploadZone({
     setProcessing(true);
     setResult(null);
     try {
-      // ── Step 1: Send file to Make via our API route ─────────────────────────
+      // Edge Function handles Gemini classification, storage upload, and DB patching.
       const form = new FormData();
       form.append("file", file);
       form.append("containerId", container.id);
 
-      const res = await fetch("/api/classify-documents", { method: "POST", body: form });
+      const supabase = createBrowserSupabaseClient();
+      const { data: body, error: fnError } = await supabase.functions.invoke(
+        "classify-documents",
+        { body: form },
+      );
 
-      if (!res.ok) {
-        const { error } = await res.json().catch(() => ({ error: "Classification failed" }));
-        toast.error(error ?? "AI classification failed");
+      if (fnError) {
+        toast.error(fnError.message ?? "AI classification failed");
         return;
       }
 
-      const body = await res.json();
-
-      if (body.message) {
+      // No-documents case — Edge Function returns { ok: true, results: [], message: "..." }
+      if (body?.message && !body?.results?.length) {
         toast.info(body.message);
         return;
       }
 
-      const documents_found: DocumentFound[] = body.documents_found ?? [];
+      const results: ClassifyResult[] = body?.results ?? [];
 
-      // Debug: inspect exactly what Make returned
-      console.log("[SmartUpload] Parsed AI data:", documents_found);
+      console.log("[SmartUpload] AI classification results:", results);
 
-      if (documents_found.length === 0) {
+      if (results.length === 0) {
         toast.warning("No documents identified. Check the file and retry.");
         return;
       }
 
-      // ── Step 2: Upload file ONCE to a shipment-level path ───────────────────
-      // Single source of truth — all matched document rows point to this path.
-      const supabase = createBrowserSupabaseClient();
-      const fileBytes = await file.arrayBuffer();
-      const ext = file.name.split(".").pop() ?? "bin";
-      const storagePath = `smart_uploads/${container.shipment_id}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from(STORAGE_BUCKETS.documents)
-        .upload(storagePath, fileBytes, { contentType: file.type, upsert: true });
-
-      if (uploadError) {
-        console.warn("[SmartUpload] storage upload failed:", uploadError.message);
-      }
-
-      // ── Step 3: Resolve sibling containers in this shipment ──────────────────
-      const { data: shipmentContainers } = await supabase
-        .from("containers")
-        .select("id, container_number")
-        .eq("shipment_id", container.shipment_id);
-
-      const siblings: { id: string; container_number: string }[] = shipmentContainers ?? [];
-
-      // ── Step 4: PATCH each matched document row (no more uploads) ────────────
-      const updates: ClassifyResult[] = (
-        await Promise.all(
-          documents_found.map(async (doc) => {
-            // Forgiving match: trim + lowercase on both sides
-            const normalize = (s?: string) => (s ?? "").trim().toLowerCase();
-            const isAll = normalize(doc.container_number) === "all";
-
-            // Which container IDs to update?
-            let targetIds: string[];
-            if (isAll) {
-              targetIds = siblings.map((c) => c.id);
-            } else {
-              const matched = siblings.find(
-                (c) => normalize(c.container_number) === normalize(doc.container_number)
-              );
-              // Fall back to the current container if no match found
-              targetIds = matched ? [matched.id] : [container.id];
-            }
-
-            // Shared patch — same storage_path for every targeted row
-            const patch = {
-              status: "uploaded" as const,
-              storage_path: uploadError ? null : storagePath,
-              file_name: file.name,
-              file_size_bytes: file.size,
-              mime_type: file.type,
-              document_number: doc.document_number ?? null,
-              ai_data: { ...doc.extracted_data, ...doc },
-              uploaded_at: new Date().toISOString(),
-              rejection_reason: null,
-              reviewed_by: null,
-              reviewed_at: null,
-            };
-
-            // Never overwrite approved or rejected docs
-            const rowResults = await Promise.all(
-              targetIds.map(async (cid) => {
-                const { error: dbError } = await supabase
-                  .from("documents")
-                  .update(patch)
-                  .eq("container_id", cid)
-                  .eq("document_type", doc.document_type)
-                  .in("status", ["missing", "uploaded"]);
-
-                if (dbError) {
-                  console.warn(
-                    `[SmartUpload] db patch failed for ${doc.document_type} / ${cid}:`,
-                    dbError.message
-                  );
-                }
-                return !dbError;
-              })
-            );
-
-            return {
-              document_type: doc.document_type,
-              container_number: doc.container_number,
-              success: rowResults.every(Boolean),
-            };
-          })
-        )
-      );
-
-      const succeeded = updates.filter((u) => u.success);
+      const succeeded = results.filter((r) => r.success);
       if (succeeded.length > 0) {
-        const allLabel = succeeded.some((u) => u.container_number?.toUpperCase() === "ALL")
+        const allLabel = succeeded.some((r) => r.container_number?.toUpperCase() === "ALL")
           ? " (applied to all containers in shipment)"
           : "";
         toast.success(
           `${succeeded.length} document type${succeeded.length > 1 ? "s" : ""} updated from AI classification${allLabel}.`
         );
-        setResult(updates);
+        setResult(results);
         onDocumentsUpdated();
       } else {
         toast.warning("No documents could be updated. Check the file and retry.");
@@ -1097,6 +1003,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         preselectedDocType={uploadPreselect.docType}
         isReplacement={uploadPreselect.isReplacement}
         onUploaded={loadData}
+        containerImporterId={container.importer_id}
       />
       <RejectDocumentModal
         document={rejectDoc}

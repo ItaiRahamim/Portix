@@ -24,12 +24,6 @@ import type {
   ImportLicenseView,
   Profile,
   UserRole,
-  Company,
-  Transaction,
-  CompanyBalance,
-  CompanyWithBalance,
-  TransactionType,
-  TransactionStatus,
 } from "@/lib/supabase";
 
 // ─── Current user ─────────────────────────────────────────────────────────────
@@ -82,7 +76,7 @@ export async function getContainerById(id: string): Promise<ContainerView | null
     .from("v_containers")
     .select("*")
     .eq("id", id)
-    .single();
+    .maybeSingle();   // .single() throws when RLS returns 0 rows; maybeSingle() returns null safely
 
   if (error) {
     console.error("[db] getContainerById:", error.message);
@@ -848,7 +842,7 @@ export async function getShipmentById(shipmentId: string): Promise<Shipment | nu
     .from("shipments")
     .select("*")
     .eq("id", shipmentId)
-    .single();
+    .maybeSingle();   // .single() throws "Cannot coerce the result to a single JSON object" when RLS blocks; maybeSingle() returns null
 
   if (error) {
     console.error("[db] getShipmentById:", error.message);
@@ -857,283 +851,609 @@ export async function getShipmentById(shipmentId: string): Promise<Shipment | nu
   return data ?? null;
 }
 
-// ─── B2B Companies & Transactions ────────────────────────────────────────────
-
 /**
- * Returns the current user's own company (via profile.company_id).
- * Returns null if the user has no company linked.
+ * Fetch containers visible to a specific customs agent.
+ * Explicitly scopes to shipments where customs_agent_id = agentId, so
+ * unassigned containers can never appear in the review queue.
  */
-export async function getMyCompany(): Promise<Company | null> {
+export async function getContainersForCustomsAgent(agentId: string): Promise<ContainerView[]> {
+  const supabase = createBrowserSupabaseClient();
+
+  // Step 1 — which shipments are assigned to this agent?
+  const { data: assignedShipments, error: shipErr } = await supabase
+    .from("shipments")
+    .select("id")
+    .eq("customs_agent_id", agentId);
+
+  if (shipErr) {
+    console.error("[db] getContainersForCustomsAgent (shipments):", shipErr.message);
+    return [];
+  }
+
+  const shipmentIds = (assignedShipments ?? []).map((s: { id: string }) => s.id);
+
+  if (shipmentIds.length === 0) return [];   // no assigned shipments → empty queue
+
+  // Step 2 — containers in those shipments (RLS is an additional guard)
+  const { data, error } = await supabase
+    .from("v_containers")
+    .select("*")
+    .in("shipment_id", shipmentIds)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getContainersForCustomsAgent (containers):", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+
+// ─── Accounts Module (Simplified — company_name based) ───────────────────────
+//
+// Partners are discovered via containers (supplier_id / importer_id).
+// Balances come from portix.account_transactions (simple table, no FK to companies).
+// The unique key for a "company" is profiles.company_name (plain TEXT).
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export type TxnType   = 'invoice' | 'payment' | 'credit';
+export type TxnStatus = 'draft' | 'pending' | 'approved' | 'rejected';
+
+export interface AccountTransaction {
+  id: string;
+  created_at: string;
+  uploader_user_id: string;
+  uploader_company_name: string;
+  target_company_name: string;
+  /** UUID of the target's representative profile — set on all new rows, null on legacy rows */
+  target_profile_id: string | null;
+  type: TxnType;
+  amount: number;
+  currency: string;
+  reference_number: string | null;
+  notes: string | null;
+  status: TxnStatus;
+  document_storage_path: string | null;
+  document_file_name: string | null;
+  transaction_date: string;
+  due_date: string | null;
+  container_id: string | null;
+  /** Joined from portix.containers — present when container_id is set */
+  container?: { container_number: string } | null;
+}
+
+/** One row per counterpart company in the Accounts list. */
+export interface PartnerAccount {
+  /** UUID of a representative profile for this partner company — used for URL routing */
+  partner_id: string;
+  company_name: string;
+  /** role of the counterpart users (supplier, importer, customs_agent) */
+  partner_role: string;
+  total_invoiced: number;
+  total_paid: number;
+  total_credits: number;
+  /** outstanding balance across the relationship */
+  current_balance: number;
+}
+
+// ── Helper: get current user's company_name ───────────────────────────────────
+
+export async function getMyCompanyName(): Promise<string | null> {
   const supabase = createBrowserSupabaseClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
 
-  // Fetch company_id from profile first
-  const { data: profile, error: profileError } = await supabase
-    .from("profiles")
-    .select("company_id")
-    .eq("id", user.id)
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('company_name')
+    .eq('id', user.id)
     .single();
 
-  if (profileError || !profile?.company_id) {
-    console.error("[db] getMyCompany (profile):", profileError?.message ?? "no company_id");
+  if (error || !data?.company_name) {
+    console.error('[db] getMyCompanyName:', error?.message ?? 'no company_name');
     return null;
   }
+  return data.company_name as string;
+}
 
-  const { data, error } = await supabase
-    .from("companies")
-    .select("*")
-    .eq("id", profile.company_id)
+// ── Partner discovery via containers ─────────────────────────────────────────
+
+/**
+ * Returns all partner accounts (counterpart companies) discovered through
+ * shared containers, enriched with their current balance from account_transactions.
+ *
+ * Works even when the balance is $0 — partners appear as soon as a container
+ * linking the two companies exists.
+ */
+export async function getPartnerAccounts(): Promise<PartnerAccount[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return [];
+
+  // 1. Get my profile (company_name + role)
+  const { data: myProfile, error: profileErr } = await supabase
+    .from('profiles')
+    .select('company_name, role')
+    .eq('id', user.id)
     .single();
 
-  if (error) {
-    console.error("[db] getMyCompany (company):", error.message);
-    return null;
+  if (profileErr || !myProfile?.company_name) {
+    console.error('[db] getPartnerAccounts (myProfile):', profileErr?.message ?? 'no company_name');
+    return [];
   }
-  return data ?? null;
+  const myCompanyName = myProfile.company_name as string;
+  const myRole = myProfile.role as string;
+
+  // 2. Get all user IDs in my company (same company_name — handles multi-user companies)
+  const { data: myUsers, error: usersErr } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('company_name', myCompanyName);
+
+  if (usersErr || !myUsers?.length) {
+    console.error('[db] getPartnerAccounts (myUsers):', usersErr?.message);
+    return [];
+  }
+  const myUserIds = myUsers.map((u: { id: string }) => u.id);
+
+  // 3a. Find counterpart user IDs via containers (supplier ↔ importer FKs)
+  const [asSupplier, asImporter] = await Promise.all([
+    supabase.from('containers').select('importer_id').in('supplier_id', myUserIds),
+    supabase.from('containers').select('supplier_id').in('importer_id', myUserIds),
+  ]);
+
+  const counterpartIdSet = new Set<string>();
+  for (const c of asSupplier.data ?? []) {
+    if (c.importer_id) counterpartIdSet.add(c.importer_id);
+  }
+  for (const c of asImporter.data ?? []) {
+    if (c.supplier_id) counterpartIdSet.add(c.supplier_id);
+  }
+
+  // 3b. Customs-agent discovery via explicit FK: shipments.customs_agent_id
+  //     This is the ONLY correct way — never infer from status or UI states.
+  // NOTE: migration 00312 stores customs agents as role='customs' in the DB.
+  //       Guard both values for safety.
+  const isCustomsAgent = myRole === 'customs' || myRole === 'customs_agent';
+
+  if (myRole === 'importer') {
+    // Importer → customs agent:
+    //   containers.importer_id = me → shipments.customs_agent_id
+    const { data: myContainers } = await supabase
+      .from('containers')
+      .select('shipment_id')
+      .in('importer_id', myUserIds);
+
+    const shipmentIds = (myContainers ?? [])
+      .map((c: { shipment_id: string }) => c.shipment_id)
+      .filter(Boolean);
+
+    if (shipmentIds.length > 0) {
+      const { data: shipments } = await supabase
+        .from('shipments')
+        .select('customs_agent_id')
+        .in('id', shipmentIds)
+        .not('customs_agent_id', 'is', null);
+
+      for (const s of shipments ?? []) {
+        if (s.customs_agent_id) counterpartIdSet.add(s.customs_agent_id);
+      }
+    }
+  } else if (isCustomsAgent) {
+    // Customs agent → importer:
+    //   shipments.customs_agent_id = me → containers.importer_id
+    const { data: myShipments } = await supabase
+      .from('shipments')
+      .select('id')
+      .in('customs_agent_id', myUserIds);
+
+    const shipmentIds = (myShipments ?? [])
+      .map((s: { id: string }) => s.id)
+      .filter(Boolean);
+
+    if (shipmentIds.length > 0) {
+      const { data: linkedContainers } = await supabase
+        .from('containers')
+        .select('importer_id')
+        .in('shipment_id', shipmentIds);
+
+      for (const c of linkedContainers ?? []) {
+        if (c.importer_id) counterpartIdSet.add(c.importer_id);
+      }
+    }
+  }
+
+  // Remove self (edge case)
+  for (const id of myUserIds) counterpartIdSet.delete(id);
+
+  if (counterpartIdSet.size === 0) return [];
+
+  // 4. Resolve counterpart user IDs → company_name + role
+  const { data: counterpartProfiles, error: cpErr } = await supabase
+    .from('profiles')
+    .select('id, company_name, role')
+    .in('id', [...counterpartIdSet]);
+
+  if (cpErr || !counterpartProfiles?.length) {
+    console.error('[db] getPartnerAccounts (counterpartProfiles):', cpErr?.message);
+    return [];
+  }
+
+  // 5. Deduplicate by company_name — track a representative UUID + role per company
+  const partnerMap = new Map<string, { role: string; id: string }>();
+  for (const p of counterpartProfiles) {
+    if (p.company_name && !partnerMap.has(p.company_name)) {
+      partnerMap.set(p.company_name, { role: p.role as string, id: p.id });
+    }
+  }
+  // Remove own company from partners (extra guard)
+  partnerMap.delete(myCompanyName);
+
+  const partnerNames = [...partnerMap.keys()];
+  if (partnerNames.length === 0) return [];
+
+  // 6. Fetch all account_transactions involving my company (both as uploader and target)
+  //    Use two queries to avoid complex OR filter issues with text values
+  const [asUploaderRes, asTargetRes] = await Promise.all([
+    supabase
+      .from('account_transactions')
+      .select('*')
+      .eq('uploader_company_name', myCompanyName),
+    supabase
+      .from('account_transactions')
+      .select('*')
+      .eq('target_company_name', myCompanyName),
+  ]);
+
+  // Merge + deduplicate by id
+  const allTxnMap = new Map<string, AccountTransaction>();
+  for (const t of [...(asUploaderRes.data ?? []), ...(asTargetRes.data ?? [])]) {
+    allTxnMap.set(t.id, t as AccountTransaction);
+  }
+  const allTxns = [...allTxnMap.values()];
+
+  // 7. Compute balance per partner
+  return partnerNames.map((partnerName) => {
+    const info = partnerMap.get(partnerName) ?? { role: 'importer', id: '' };
+
+    // Transactions where I'm the uploader to this partner
+    const myTxns = allTxns.filter(
+      (t) => t.uploader_company_name === myCompanyName && t.target_company_name === partnerName
+    );
+    // Transactions where the partner uploaded to me
+    const theirTxns = allTxns.filter(
+      (t) => t.uploader_company_name === partnerName && t.target_company_name === myCompanyName
+    );
+
+    // Invoices I issued (money partner owes me)
+    const invoicesIssued = myTxns
+      .filter((t) => t.type === 'invoice')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Invoices partner issued to me (money I owe them)
+    const invoicesOwed = theirTxns
+      .filter((t) => t.type === 'invoice')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Approved payments partner made to me (reduces what they owe)
+    const paymentsReceived = theirTxns
+      .filter((t) => t.type === 'payment' && t.status === 'approved')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Approved payments I made to them (reduces what I owe)
+    const paymentsMade = myTxns
+      .filter((t) => t.type === 'payment' && t.status === 'approved')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Credits I issued (reduces what partner owes me)
+    const creditsIssued = myTxns
+      .filter((t) => t.type === 'credit')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Credits partner issued to me (reduces what I owe)
+    const creditsReceived = theirTxns
+      .filter((t) => t.type === 'credit')
+      .reduce((s, t) => s + t.amount, 0);
+
+    // Net balance from MY perspective:
+    // positive = they owe me; negative = I owe them
+    const current_balance =
+      invoicesIssued - paymentsReceived - creditsIssued
+      - invoicesOwed + paymentsMade + creditsReceived;
+
+    // For the UI display, total_invoiced = all invoices across the relationship
+    const total_invoiced = invoicesIssued + invoicesOwed;
+    const total_paid = paymentsReceived + paymentsMade;
+    const total_credits = creditsIssued + creditsReceived;
+
+    return {
+      partner_id: info.id,
+      company_name: partnerName,
+      partner_role: info.role,
+      total_invoiced,
+      total_paid,
+      total_credits,
+      current_balance,
+    } as PartnerAccount;
+  });
 }
 
+// ── Fetch transaction ledger for one partner ──────────────────────────────────
+
 /**
- * Returns all companies that have transactions with my company, enriched with
- * the live balance for that company pair.
- *
- * The result is used by the Accounts list view.
+ * Returns all transactions between my company and the partner company.
+ * Queries by uploader_user_id (UUID) and falls back to company name strings
+ * so both new (UUID-linked) and legacy rows are returned.
  */
-export async function getCompanyAccounts(myCompanyId: string): Promise<CompanyWithBalance[]> {
+export async function getPartnerTransactions(
+  myUserIds: string[],
+  myCompanyName: string,
+  partnerUserIds: string[],
+  partnerCompanyName: string,
+): Promise<AccountTransaction[]> {
   const supabase = createBrowserSupabaseClient();
 
-  // 1. Get all balances where my company is either party
-  const { data: balances, error: balErr } = await supabase
-    .from("company_balances")
-    .select("*")
-    .or(`creditor_company_id.eq.${myCompanyId},debtor_company_id.eq.${myCompanyId}`);
+  const SELECT = '*, container:container_id(container_number)';
 
-  if (balErr) {
-    console.error("[db] getCompanyAccounts (balances):", balErr.message);
-    return [];
+  if (!myUserIds.length || !partnerUserIds.length) return [];
+
+  const [asUploaderRes, asTargetRes] = await Promise.all([
+    // Rows I uploaded (my user IDs are uploaders)
+    supabase.from('account_transactions').select(SELECT).in('uploader_user_id', myUserIds),
+    // Rows partner uploaded (partner user IDs are uploaders)
+    supabase.from('account_transactions').select(SELECT).in('uploader_user_id', partnerUserIds),
+  ]);
+
+  const partnerUserIdSet = new Set(partnerUserIds);
+  const myUserIdSet = new Set(myUserIds);
+
+  // Keep only transactions that involve the other party (UUID match or legacy name match)
+  const myUploads = (asUploaderRes.data ?? []).filter(
+    (t: AccountTransaction) =>
+      (t.target_profile_id != null && partnerUserIdSet.has(t.target_profile_id)) ||
+      t.target_company_name === partnerCompanyName
+  );
+  const theirUploads = (asTargetRes.data ?? []).filter(
+    (t: AccountTransaction) =>
+      (t.target_profile_id != null && myUserIdSet.has(t.target_profile_id)) ||
+      t.target_company_name === myCompanyName
+  );
+
+  const txnMap = new Map<string, AccountTransaction>();
+  for (const t of [...myUploads, ...theirUploads]) {
+    txnMap.set(t.id, t as AccountTransaction);
   }
 
-  if (!balances || balances.length === 0) return [];
-
-  // 2. Collect all counterpart company IDs (de-duped)
-  const counterpartIds = [
-    ...new Set(
-      (balances as CompanyBalance[]).map((b) =>
-        b.creditor_company_id === myCompanyId
-          ? b.debtor_company_id
-          : b.creditor_company_id
-      )
-    ),
-  ];
-
-  // 3. Fetch company details for all counterparts
-  const { data: companies, error: compErr } = await supabase
-    .from("companies")
-    .select("*")
-    .in("id", counterpartIds);
-
-  if (compErr) {
-    console.error("[db] getCompanyAccounts (companies):", compErr.message);
-    return [];
-  }
-
-  // 4. Merge companies + their balance with my company
-  return (companies ?? []).map((company: Company) => {
-    const balance =
-      (balances as CompanyBalance[]).find(
-        (b) =>
-          (b.creditor_company_id === myCompanyId && b.debtor_company_id === company.id) ||
-          (b.debtor_company_id === myCompanyId && b.creditor_company_id === company.id)
-      ) ?? null;
-
-    return { ...company, balance };
-  }) as CompanyWithBalance[];
+  return [...txnMap.values()].sort(
+    (a, b) =>
+      new Date(b.transaction_date).getTime() - new Date(a.transaction_date).getTime() ||
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
 }
 
-/**
- * Returns the full transaction ledger between two companies,
- * enriched with company names and creator profile.
- *
- * Call with my company as either creditor or debtor — it handles both directions.
- */
-export async function getCompanyTransactions(
-  companyIdA: string,
-  companyIdB: string
-): Promise<Transaction[]> {
-  const supabase = createBrowserSupabaseClient();
-
-  const { data, error } = await supabase
-    .from("transactions")
-    .select(`
-      *,
-      creditor_company:companies!creditor_company_id(id, name, type, country),
-      debtor_company:companies!debtor_company_id(id, name, type, country),
-      created_by_profile:profiles!created_by(full_name)
-    `)
-    .or(
-      `and(creditor_company_id.eq.${companyIdA},debtor_company_id.eq.${companyIdB}),` +
-      `and(creditor_company_id.eq.${companyIdB},debtor_company_id.eq.${companyIdA})`
-    )
-    .order("transaction_date", { ascending: false })
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    console.error("[db] getCompanyTransactions:", error.message);
-    return [];
-  }
-  return (data ?? []) as Transaction[];
-}
+// ── Create a transaction ──────────────────────────────────────────────────────
 
 /**
- * Creates a new transaction (invoice, payment, or credit_note).
+ * Upload-first flow:
+ *   1. Upload file to swift-documents bucket (call uploadToSwiftBucket in the UI)
+ *   2. Call createAccountTransaction with the returned storagePath
  *
- * - Invoices are created by the creditor (supplier/broker).
- * - Payments are created by the debtor (importer).
- * - Credit notes are created by the creditor.
+ * This keeps the DB row and the file in sync — no orphaned transactions.
  */
-export async function createTransaction(opts: {
-  type: TransactionType;
-  creditorCompanyId: string;
-  debtorCompanyId: string;
+export async function createAccountTransaction(opts: {
+  myCompanyName: string;
+  partnerCompanyName: string;
+  /** UUID of the partner's representative profile — stored as target_profile_id */
+  targetProfileId?: string;
+  type: TxnType;
   amount: number;
   currency?: string;
   referenceNumber?: string;
   notes?: string;
   transactionDate?: string;
   dueDate?: string;
-  containerId?: string;
+  documentStoragePath: string;   // required — upload first, then call this
+  documentFileName: string;
+  /** For payments only: links to the invoice being offset */
   parentTransactionId?: string;
-}): Promise<Transaction | null> {
+}): Promise<AccountTransaction | null> {
   const supabase = createBrowserSupabaseClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
 
-  // Payments start as 'pending_approval'; all others start as 'active'
-  const initialStatus: TransactionStatus =
-    opts.type === "payment" ? "pending_approval" : "active";
+  // Payments are pending until the counterpart approves; everything else is active
+  const initialStatus: TxnStatus = opts.type === 'payment' ? 'pending' : 'approved';
+
+  // Direction:
+  //   invoice → uploader is the creditor (issuing to partner)
+  //   payment → uploader is the debtor (paying to partner)
+  //   credit  → uploader is the creditor (giving credit to partner)
+  const uploaderCompanyName = opts.myCompanyName;
+  const targetCompanyName   = opts.partnerCompanyName;
 
   const { data, error } = await supabase
-    .from("transactions")
+    .from('account_transactions')
     .insert({
-      type: opts.type,
-      status: initialStatus,
-      creditor_company_id: opts.creditorCompanyId,
-      debtor_company_id: opts.debtorCompanyId,
-      created_by: user.id,
-      amount: opts.amount,
-      currency: opts.currency ?? "USD",
-      reference_number: opts.referenceNumber ?? null,
-      notes: opts.notes ?? null,
-      transaction_date: opts.transactionDate ?? new Date().toISOString().slice(0, 10),
-      due_date: opts.dueDate ?? null,
-      container_id: opts.containerId ?? null,
-      parent_transaction_id: opts.parentTransactionId ?? null,
+      uploader_user_id:      user.id,
+      uploader_company_name: uploaderCompanyName,
+      target_company_name:   targetCompanyName,
+      target_profile_id:     opts.targetProfileId ?? null,
+      type:                  opts.type,
+      status:                initialStatus,
+      amount:                opts.amount,
+      currency:              opts.currency ?? 'USD',
+      reference_number:      opts.referenceNumber ?? null,
+      notes:                 opts.notes ?? null,
+      transaction_date:      opts.transactionDate ?? new Date().toISOString().slice(0, 10),
+      due_date:              opts.dueDate ?? null,
+      document_storage_path: opts.documentStoragePath,
+      document_file_name:    opts.documentFileName,
     })
-    .select("*")
+    .select('*')
     .single();
 
   if (error) {
-    console.error("[db] createTransaction:", error.message);
+    console.error('[db] createAccountTransaction:', error.message);
     return null;
   }
-  return data ?? null;
+  return data as AccountTransaction;
 }
 
-/**
- * Approves a pending_approval payment.
- * Only the creditor company can call this.
- */
-export async function approveTransaction(transactionId: string): Promise<boolean> {
-  const supabase = createBrowserSupabaseClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return false;
+// ── Approve a payment ─────────────────────────────────────────────────────────
 
+/**
+ * Only the target company (creditor receiving the payment) should call this.
+ * RLS enforces this at the DB level.
+ */
+export async function approveAccountTransaction(id: string): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
   const { error } = await supabase
-    .from("transactions")
-    .update({
-      status: "approved",
-      approved_by: user.id,
-      approved_at: new Date().toISOString(),
-    })
-    .eq("id", transactionId)
-    .eq("status", "pending_approval"); // safety guard
+    .from('account_transactions')
+    .update({ status: 'approved' })
+    .eq('id', id)
+    .in('status', ['draft', 'pending']); // safety guard — cannot approve already-approved/rejected rows
 
   if (error) {
-    console.error("[db] approveTransaction:", error.message);
+    console.error('[db] approveAccountTransaction:', error.message);
     return false;
   }
   return true;
 }
 
-/**
- * Rejects a pending_approval payment.
- * Only the creditor company can call this.
- */
-export async function rejectTransaction(transactionId: string): Promise<boolean> {
-  const supabase = createBrowserSupabaseClient();
+// ── Reject a payment ──────────────────────────────────────────────────────────
 
+export async function rejectAccountTransaction(id: string): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
   const { error } = await supabase
-    .from("transactions")
-    .update({ status: "rejected" })
-    .eq("id", transactionId)
-    .eq("status", "pending_approval"); // safety guard
+    .from('account_transactions')
+    .update({ status: 'rejected' as TxnStatus })
+    .eq('id', id)
+    .eq('status', 'pending');
 
   if (error) {
-    console.error("[db] rejectTransaction:", error.message);
+    console.error('[db] rejectAccountTransaction:', error.message);
     return false;
   }
   return true;
+}
+
+// ─── Draft transaction for new order (Make.com OCR amount) ───────────────────
+
+/**
+ * Inserts a draft invoice transaction after a new shipment is created.
+ * Called once per container when Make.com returns a totalAmount during AI auto-fill.
+ *
+ * The supplier is the uploader (creditor); the importer is the target (debtor).
+ */
+export async function createOrderDraftTransaction(opts: {
+  supplierProfileId: string;
+  importerProfileId: string;
+  amount: number;
+  containerId: string;
+  containerNumber: string;
+}): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+
+  const [{ data: supplierProfile }, { data: importerProfile }] = await Promise.all([
+    supabase.from('profiles').select('company_name').eq('id', opts.supplierProfileId).single(),
+    supabase.from('profiles').select('company_name').eq('id', opts.importerProfileId).single(),
+  ]);
+
+  if (!supplierProfile?.company_name || !importerProfile?.company_name) return false;
+
+  const { error } = await supabase
+    .from('account_transactions')
+    .insert({
+      uploader_user_id:      opts.supplierProfileId,
+      uploader_company_name: supplierProfile.company_name,
+      target_company_name:   importerProfile.company_name,
+      target_profile_id:     opts.importerProfileId,
+      type:                  'invoice',
+      status:                'draft',
+      amount:                opts.amount,
+      currency:              'USD',
+      notes:                 `Auto-drafted via Make.com OCR`,
+      container_id:          opts.containerId,
+      document_storage_path: null,
+      document_file_name:    null,
+    });
+
+  if (error) {
+    console.error('[db] createOrderDraftTransaction:', error.message);
+    return false;
+  }
+  return true;
+}
+
+// ─── Invoice OCR mock + draft creation ───────────────────────────────────────
+
+/**
+ * Mock OCR: returns a deterministic amount derived from the file name/size
+ * so each document produces a unique (but reproducible) number for demo purposes.
+ * Replace with a real OCR/AI call when ready.
+ */
+export function mockInvoiceOCR(_fileUrl: string, fileSizeBytes: number): number {
+  // Produce a plausible invoice amount between $1,000 and $50,000
+  return Math.round((1000 + (fileSizeBytes % 49000)) * 100) / 100;
 }
 
 /**
- * Uploads a payment proof document to Supabase Storage and links it to the
- * transaction row. Storage path: swift-documents/{transactionId}/{fileName}
+ * Creates a draft account_transaction linked to a document upload.
+ * Called automatically when a commercial_invoice is uploaded to a container.
+ * The supplier reviews and promotes it to 'pending' (then importer approves).
  */
-export async function uploadTransactionDocument(
-  transactionId: string,
-  file: File
-): Promise<boolean> {
+export async function createDraftInvoiceTransaction(opts: {
+  /** Storage path of the uploaded commercial invoice */
+  documentStoragePath: string;
+  documentFileName: string;
+  fileSizeBytes: number;
+  /** Container's importer_id — used to look up their company_name */
+  importerProfileId: string;
+}): Promise<AccountTransaction | null> {
   const supabase = createBrowserSupabaseClient();
   const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return false;
+  if (!user) return null;
 
-  const ext = file.name.split(".").pop() ?? "pdf";
-  const storagePath = `${transactionId}/${Date.now()}-${transactionId.slice(0, 8)}.${ext}`;
+  // Resolve my company name (the supplier uploading the invoice)
+  const { data: myProfile } = await supabase
+    .from('profiles')
+    .select('company_name')
+    .eq('id', user.id)
+    .single();
 
-  // 1. Upload file
-  const { error: uploadError } = await supabase.storage
-    .from("swift-documents")
-    .upload(storagePath, file, { upsert: false });
+  // Resolve the importer's company name
+  const { data: importerProfile } = await supabase
+    .from('profiles')
+    .select('company_name')
+    .eq('id', opts.importerProfileId)
+    .single();
 
-  if (uploadError) {
-    console.error("[db] uploadTransactionDocument (storage):", uploadError.message);
-    return false;
-  }
+  if (!myProfile?.company_name || !importerProfile?.company_name) return null;
 
-  // 2. Link file metadata to transaction row
-  const { error: updateError } = await supabase
-    .from("transactions")
-    .update({
-      document_storage_path: storagePath,
-      document_file_name: file.name,
-      document_uploaded_by: user.id,
+  const amount = mockInvoiceOCR(opts.documentStoragePath, opts.fileSizeBytes);
+
+  const { data, error } = await supabase
+    .from('account_transactions')
+    .insert({
+      uploader_user_id:      user.id,
+      uploader_company_name: myProfile.company_name,
+      target_company_name:   importerProfile.company_name,
+      target_profile_id:     opts.importerProfileId,
+      type:                  'invoice',
+      status:                'draft',
+      amount,
+      currency:              'USD',
+      notes:                 'Auto-created from commercial invoice upload — review before sending',
+      document_storage_path: opts.documentStoragePath,
+      document_file_name:    opts.documentFileName,
     })
-    .eq("id", transactionId);
+    .select('*')
+    .single();
 
-  if (updateError) {
-    console.error("[db] uploadTransactionDocument (update):", updateError.message);
-    return false;
+  if (error) {
+    console.error('[db] createDraftInvoiceTransaction:', error.message);
+    return null;
   }
-
-  return true;
+  return data as AccountTransaction;
 }
-
-// Re-export types so consumers can import everything from lib/db
-export type {
-  Company,
-  Transaction,
-  CompanyBalance,
-  CompanyWithBalance,
-  TransactionType,
-  TransactionStatus,
-};

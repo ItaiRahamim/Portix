@@ -18,280 +18,380 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  ArrowLeft, Upload, FileText, Loader2, CheckCircle, XCircle,
-  CreditCard, Receipt, ReceiptText,
+  ArrowLeft, FileText, Loader2, CheckCircle, XCircle,
+  CreditCard, Receipt, ReceiptText, Paperclip, Clock,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import {
-  getMyCompany, getCompanyTransactions,
-  createTransaction, approveTransaction, rejectTransaction,
-  uploadTransactionDocument,
+  getPartnerTransactions,
+  createAccountTransaction,
+  approveAccountTransaction,
+  rejectAccountTransaction,
 } from "@/lib/db";
-import type { Transaction, Company, TransactionType } from "@/lib/db";
+import type { AccountTransaction } from "@/lib/db";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
 import { toast } from "sonner";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Display helpers ──────────────────────────────────────────────────────────
 
-interface AccountDetailPageProps {
-  role: "importer" | "supplier" | "customs-agent";
-}
-
-// ─── Status & type display helpers ───────────────────────────────────────────
-
-const TXN_STATUS_STYLES: Record<string, string> = {
-  active:           "bg-blue-100 text-blue-700",
-  pending_approval: "bg-yellow-100 text-yellow-700",
-  approved:         "bg-green-100 text-green-700",
-  rejected:         "bg-red-100 text-red-700",
-  voided:           "bg-gray-100 text-gray-500",
+const STATUS_STYLES: Record<string, string> = {
+  draft:    "bg-amber-100 text-amber-700",
+  pending:  "bg-yellow-100 text-yellow-700",
+  approved: "bg-green-100 text-green-700",
+  rejected: "bg-red-100 text-red-700",
+};
+const STATUS_LABELS: Record<string, string> = {
+  draft:    "Draft",
+  pending:  "Pending Approval",
+  approved: "Approved",
+  rejected: "Rejected",
 };
 
-const TXN_STATUS_LABELS: Record<string, string> = {
-  active:           "Active",
-  pending_approval: "Pending Approval",
-  approved:         "Approved",
-  rejected:         "Rejected",
-  voided:           "Voided",
+const TYPE_STYLES: Record<string, string> = {
+  invoice: "bg-slate-100 text-slate-700",
+  payment: "bg-teal-100 text-teal-700",
+  credit:  "bg-purple-100 text-purple-700",
+};
+const TYPE_LABELS: Record<string, string> = {
+  invoice: "Invoice",
+  payment: "Payment",
+  credit:  "Credit Note",
 };
 
-const TXN_TYPE_LABELS: Record<string, string> = {
-  invoice:     "Invoice",
-  payment:     "Payment",
-  credit_note: "Credit Note",
-};
-
-const TXN_TYPE_STYLES: Record<string, string> = {
-  invoice:     "bg-slate-100 text-slate-700",
-  payment:     "bg-teal-100 text-teal-700",
-  credit_note: "bg-purple-100 text-purple-700",
-};
-
-function formatCurrency(amount: number, currency = "USD") {
+function fmt(amount: number, currency = "USD") {
   return new Intl.NumberFormat("en-US", {
     style: "currency", currency,
     minimumFractionDigits: 2, maximumFractionDigits: 2,
   }).format(amount);
 }
 
-function formatDate(dateStr: string) {
-  return new Date(dateStr).toLocaleDateString("en-GB", {
+function fmtDate(d: string) {
+  return new Date(d).toLocaleDateString("en-GB", {
     day: "2-digit", month: "short", year: "numeric",
   });
 }
 
+// ─── Upload helper (upload-first flow) ───────────────────────────────────────
+
+async function uploadToSwiftBucket(file: File): Promise<string | null> {
+  const supabase = createBrowserSupabaseClient();
+  const ext = file.name.split(".").pop() ?? "pdf";
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+  const { error } = await supabase.storage
+    .from("swift-documents")
+    .upload(path, file, { upsert: false });
+  if (error) {
+    console.error("[uploadToSwiftBucket]", error.message);
+    return null;
+  }
+  return path;
+}
+
+// ─── Required file input sub-component ───────────────────────────────────────
+
+function FileField({
+  file,
+  onChange,
+}: {
+  file: File | null;
+  onChange: (f: File | null) => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label className="flex items-center gap-1.5">
+        <Paperclip className="w-3.5 h-3.5 text-gray-400" />
+        Document <span className="text-red-500">*</span>
+      </Label>
+      <Input
+        type="file"
+        accept=".pdf,.jpg,.jpeg,.png,.heic"
+        onChange={(e) => onChange(e.target.files?.[0] ?? null)}
+      />
+      {file ? (
+        <p className="text-xs text-green-600">✓ {file.name} ({(file.size / 1024).toFixed(1)} KB)</p>
+      ) : (
+        <p className="text-xs text-gray-400">PDF or image required — upload before submitting</p>
+      )}
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
+
+interface AccountDetailPageProps {
+  role: "importer" | "supplier" | "customs-agent";
+}
 
 export function AccountDetailPage({ role }: AccountDetailPageProps) {
   const params = useParams();
   const router = useRouter();
-  const counterpartCompanyId = params.accountId as string;
 
-  const [myCompany, setMyCompany] = useState<Company | null>(null);
-  const [counterpartCompany, setCounterpartCompany] = useState<Company | null>(null);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  // URL param is now a UUID (partner's representative profile ID)
+  const partnerId = params.accountId as string;
+
+  const [myCompanyName, setMyCompanyName] = useState<string | null>(null);
+  const [myUserIds, setMyUserIds] = useState<string[]>([]);
+  const [partnerDisplayName, setPartnerDisplayName] = useState<string>("");
+  const [partnerUserIds, setPartnerUserIds] = useState<string[]>([]);
+  const [transactions, setTransactions] = useState<AccountTransaction[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // ── Modal state ────────────────────────────────────────────────
-  // Invoice modal
-  const [invoiceOpen, setInvoiceOpen] = useState(false);
+  // Role capabilities
+  // Supplier + Customs-Agent = creditors (issue invoices / credits, approve payments)
+  // Importer = debtor (submits payment proofs)
+  const amICreditor = role === "supplier" || role === "customs-agent";
+  const amIDebtor   = role === "importer";
+
+  // UUID sets used for balance splitting and uploader detection
+  const myUserIdSet = new Set(myUserIds);
+  const partnerUserIdSet = new Set(partnerUserIds);
+
+  // ── Modal state: Invoice ───────────────────────────────────────
+  const [invOpen, setInvOpen] = useState(false);
   const [invRef, setInvRef] = useState("");
-  const [invAmount, setInvAmount] = useState("");
-  const [invCurrency, setInvCurrency] = useState("USD");
+  const [invAmt, setInvAmt] = useState("");
+  const [invCur, setInvCur] = useState("USD");
   const [invDate, setInvDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [invDueDate, setInvDueDate] = useState("");
+  const [invDue, setInvDue] = useState("");
   const [invNotes, setInvNotes] = useState("");
+  const [invFile, setInvFile] = useState<File | null>(null);
   const [savingInv, setSavingInv] = useState(false);
 
-  // Credit note modal
+  // ── Modal state: Credit Note ───────────────────────────────────
   const [creditOpen, setCreditOpen] = useState(false);
   const [creditRef, setCreditRef] = useState("");
-  const [creditAmount, setCreditAmount] = useState("");
-  const [creditCurrency, setCreditCurrency] = useState("USD");
+  const [creditAmt, setCreditAmt] = useState("");
+  const [creditCur, setCreditCur] = useState("USD");
   const [creditNotes, setCreditNotes] = useState("");
+  const [creditFile, setCreditFile] = useState<File | null>(null);
   const [savingCredit, setSavingCredit] = useState(false);
 
-  // Payment modal
-  const [paymentOpen, setPaymentOpen] = useState(false);
-  const [payAmount, setPayAmount] = useState("");
-  const [payCurrency, setPayCurrency] = useState("USD");
+  // ── Modal state: Payment ───────────────────────────────────────
+  const [payOpen, setPayOpen] = useState(false);
+  const [payAmt, setPayAmt] = useState("");
+  const [payCur, setPayCur] = useState("USD");
   const [payDate, setPayDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [payRef, setPayRef] = useState("");
   const [payNotes, setPayNotes] = useState("");
   const [payFile, setPayFile] = useState<File | null>(null);
-  const [payParentId, setPayParentId] = useState<string | null>(null);
   const [savingPay, setSavingPay] = useState(false);
 
-  // Approve/Reject dialog
-  const [approveDialogTxn, setApproveDialogTxn] = useState<Transaction | null>(null);
-  const [processingApproval, setProcessingApproval] = useState(false);
+  // ── Approve / Reject dialog ────────────────────────────────────
+  const [reviewTxn, setReviewTxn] = useState<AccountTransaction | null>(null);
+  const [processingReview, setProcessingReview] = useState(false);
 
   // ── Data loading ───────────────────────────────────────────────
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const my = await getMyCompany();
-    if (!my) { setLoading(false); return; }
-    setMyCompany(my);
-
-    // Fetch counterpart company info + transactions in parallel
     const supabase = createBrowserSupabaseClient();
-    const [{ data: cpData }, txns] = await Promise.all([
-      supabase.from("companies").select("*").eq("id", counterpartCompanyId).single(),
-      getCompanyTransactions(my.id, counterpartCompanyId),
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setLoading(false); return; }
+
+    // Fetch my profile and partner profile in parallel
+    const [{ data: myProfile }, { data: partnerProfile }] = await Promise.all([
+      supabase.from('profiles').select('company_name').eq('id', user.id).single(),
+      supabase.from('profiles').select('company_name').eq('id', partnerId).single(),
     ]);
 
-    setCounterpartCompany(cpData ?? null);
+    const myName = myProfile?.company_name ?? null;
+    const partnerName = partnerProfile?.company_name ?? "";
+    setMyCompanyName(myName);
+    setPartnerDisplayName(partnerName);
+
+    if (!myName || !partnerName) { setLoading(false); return; }
+
+    // Resolve all user IDs for both companies in parallel
+    const [{ data: myUsersData }, { data: partnerUsersData }] = await Promise.all([
+      supabase.from('profiles').select('id').eq('company_name', myName),
+      supabase.from('profiles').select('id').eq('company_name', partnerName),
+    ]);
+
+    const resolvedMyUserIds = (myUsersData ?? []).map((u: { id: string }) => u.id);
+    const resolvedPartnerUserIds = (partnerUsersData ?? []).map((u: { id: string }) => u.id);
+    setMyUserIds(resolvedMyUserIds);
+    setPartnerUserIds(resolvedPartnerUserIds);
+
+    const txns = await getPartnerTransactions(
+      resolvedMyUserIds, myName, resolvedPartnerUserIds, partnerName
+    );
     setTransactions(txns);
     setLoading(false);
-  }, [counterpartCompanyId]);
+  }, [partnerId]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // ── Computed balance ───────────────────────────────────────────
-  const totalInvoiced = transactions
-    .filter((t) => t.type === "invoice")
-    .reduce((s, t) => s + t.amount, 0);
-  const totalPaid = transactions
-    .filter((t) => t.type === "payment" && t.status === "approved")
-    .reduce((s, t) => s + t.amount, 0);
-  const totalCredits = transactions
-    .filter((t) => t.type === "credit_note" && !["voided", "rejected"].includes(t.status))
-    .reduce((s, t) => s + t.amount, 0);
-  const currentBalance = totalInvoiced - totalPaid - totalCredits;
+  // ── Balance computed from transactions ─────────────────────────
+  const myTxns    = transactions.filter((t) => myUserIdSet.has(t.uploader_user_id));
+  const theirTxns = transactions.filter((t) => partnerUserIdSet.has(t.uploader_user_id));
 
-  // ── Role capabilities ──────────────────────────────────────────
-  // Supplier/broker creates invoices & credit notes; importer submits payments
-  const amICreditor = role === "supplier"; // supplier = creditor perspective
-  const amIDebtor   = role === "importer"; // importer = debtor perspective
-  // For a given transaction, check if I am the creditor
-  const iAmCreditorOf = (t: Transaction) => myCompany && t.creditor_company_id === myCompany.id;
+  const invoicesIssued   = myTxns.filter((t) => t.type === "invoice").reduce((s, t) => s + t.amount, 0);
+  const invoicesOwed     = theirTxns.filter((t) => t.type === "invoice").reduce((s, t) => s + t.amount, 0);
+  const paymentsReceived = theirTxns.filter((t) => t.type === "payment" && t.status === "approved").reduce((s, t) => s + t.amount, 0);
+  const paymentsMade     = myTxns.filter((t) => t.type === "payment" && t.status === "approved").reduce((s, t) => s + t.amount, 0);
+  const creditsIssued    = myTxns.filter((t) => t.type === "credit").reduce((s, t) => s + t.amount, 0);
+  const creditsReceived  = theirTxns.filter((t) => t.type === "credit").reduce((s, t) => s + t.amount, 0);
+
+  // Net from my perspective: positive = they owe me
+  const netBalance = invoicesIssued - paymentsReceived - creditsIssued - invoicesOwed + paymentsMade + creditsReceived;
+
+  // Draft transactions — auto-created from commercial_invoice uploads
+  const drafts = transactions.filter((t) => t.status === "draft");
+
+  // ── Reset helpers ──────────────────────────────────────────────
+
+  function resetInv()    { setInvRef(""); setInvAmt(""); setInvDue(""); setInvNotes(""); setInvFile(null); setInvDate(new Date().toISOString().slice(0, 10)); }
+  function resetCredit() { setCreditRef(""); setCreditAmt(""); setCreditNotes(""); setCreditFile(null); }
+  function resetPay()    { setPayAmt(""); setPayRef(""); setPayNotes(""); setPayFile(null); setPayDate(new Date().toISOString().slice(0, 10)); }
 
   // ── Handlers ──────────────────────────────────────────────────
 
-  const handleIssueInvoice = async () => {
-    if (!invRef.trim() || !invAmount || !invDate || !myCompany) {
-      toast.error("Fill in Invoice #, Amount, and Date.");
-      return;
-    }
+  async function handleUploadInvoice() {
+    if (!invFile) { toast.error("Please attach the invoice document."); return; }
+    if (!invRef.trim() || !invAmt) { toast.error("Invoice # and Amount are required."); return; }
+    if (!myCompanyName) return;
+
     setSavingInv(true);
     try {
-      const result = await createTransaction({
+      const storagePath = await uploadToSwiftBucket(invFile);
+      if (!storagePath) { toast.error("File upload failed. Please try again."); return; }
+
+      const result = await createAccountTransaction({
+        myCompanyName,
+        partnerCompanyName: partnerDisplayName,
+        targetProfileId: partnerId,
         type: "invoice",
-        creditorCompanyId: myCompany.id,
-        debtorCompanyId: counterpartCompanyId,
-        amount: parseFloat(invAmount),
-        currency: invCurrency,
-        referenceNumber: invRef.trim() || undefined,
+        amount: parseFloat(invAmt),
+        currency: invCur,
+        referenceNumber: invRef.trim(),
         notes: invNotes.trim() || undefined,
         transactionDate: invDate,
-        dueDate: invDueDate || undefined,
+        dueDate: invDue || undefined,
+        documentStoragePath: storagePath,
+        documentFileName: invFile.name,
       });
+
       if (!result) { toast.error("Failed to create invoice."); return; }
-      toast.success("Invoice created.");
-      setInvoiceOpen(false);
-      setInvRef(""); setInvAmount(""); setInvDueDate(""); setInvNotes("");
+      toast.success("Invoice uploaded successfully.");
+      setInvOpen(false);
+      resetInv();
       loadData();
     } finally { setSavingInv(false); }
-  };
+  }
 
-  const handleIssueCreditNote = async () => {
-    if (!creditAmount || !myCompany) {
-      toast.error("Enter the credit note amount.");
-      return;
-    }
+  async function handleUploadCreditNote() {
+    if (!creditFile) { toast.error("Please attach the credit note document."); return; }
+    if (!creditAmt) { toast.error("Amount is required."); return; }
+    if (!myCompanyName) return;
+
     setSavingCredit(true);
     try {
-      const result = await createTransaction({
-        type: "credit_note",
-        creditorCompanyId: myCompany.id,
-        debtorCompanyId: counterpartCompanyId,
-        amount: parseFloat(creditAmount),
-        currency: creditCurrency,
+      const storagePath = await uploadToSwiftBucket(creditFile);
+      if (!storagePath) { toast.error("File upload failed. Please try again."); return; }
+
+      const result = await createAccountTransaction({
+        myCompanyName,
+        partnerCompanyName: partnerDisplayName,
+        targetProfileId: partnerId,
+        type: "credit",
+        amount: parseFloat(creditAmt),
+        currency: creditCur,
         referenceNumber: creditRef.trim() || undefined,
         notes: creditNotes.trim() || undefined,
+        documentStoragePath: storagePath,
+        documentFileName: creditFile.name,
       });
+
       if (!result) { toast.error("Failed to create credit note."); return; }
       toast.success("Credit note issued.");
       setCreditOpen(false);
-      setCreditRef(""); setCreditAmount(""); setCreditNotes("");
+      resetCredit();
       loadData();
     } finally { setSavingCredit(false); }
-  };
+  }
 
-  const handleSubmitPayment = async () => {
-    if (!payAmount || !myCompany) {
-      toast.error("Enter the payment amount.");
-      return;
-    }
+  async function handleUploadPayment() {
+    if (!payFile) { toast.error("Please attach your payment proof."); return; }
+    if (!payAmt) { toast.error("Amount is required."); return; }
+    if (!myCompanyName) return;
+
     setSavingPay(true);
     try {
-      const result = await createTransaction({
+      const storagePath = await uploadToSwiftBucket(payFile);
+      if (!storagePath) { toast.error("File upload failed. Please try again."); return; }
+
+      const result = await createAccountTransaction({
+        myCompanyName,
+        partnerCompanyName: partnerDisplayName,
+        targetProfileId: partnerId,
         type: "payment",
-        creditorCompanyId: counterpartCompanyId, // counterpart is the creditor
-        debtorCompanyId: myCompany.id,
-        amount: parseFloat(payAmount),
-        currency: payCurrency,
+        amount: parseFloat(payAmt),
+        currency: payCur,
         referenceNumber: payRef.trim() || undefined,
         notes: payNotes.trim() || undefined,
         transactionDate: payDate,
-        parentTransactionId: payParentId ?? undefined,
+        documentStoragePath: storagePath,
+        documentFileName: payFile.name,
       });
+
       if (!result) { toast.error("Failed to submit payment."); return; }
-
-      // If a proof file was selected, upload it now
-      if (payFile && result.id) {
-        const ok = await uploadTransactionDocument(result.id, payFile);
-        if (!ok) toast.warning("Payment created but file upload failed — retry later.");
-      }
-
-      toast.success("Payment submitted. Awaiting counterpart approval.");
-      setPaymentOpen(false);
-      setPayAmount(""); setPayRef(""); setPayNotes(""); setPayFile(null); setPayParentId(null);
+      toast.success("Payment submitted and proof uploaded. Awaiting approval.");
+      setPayOpen(false);
+      resetPay();
       loadData();
     } finally { setSavingPay(false); }
-  };
+  }
 
-  const handleApprove = async (txn: Transaction) => {
-    setProcessingApproval(true);
-    const ok = await approveTransaction(txn.id);
-    if (ok) {
-      toast.success("Payment approved. Balance updated.");
-    } else {
-      toast.error("Failed to approve payment.");
-    }
-    setApproveDialogTxn(null);
-    setProcessingApproval(false);
+  async function handleApprove(txn: AccountTransaction) {
+    setProcessingReview(true);
+    const ok = await approveAccountTransaction(txn.id);
+    if (ok) toast.success("Payment approved — balance updated.");
+    else toast.error("Approval failed.");
+    setReviewTxn(null);
+    setProcessingReview(false);
     loadData();
-  };
+  }
 
-  const handleReject = async (txn: Transaction) => {
-    setProcessingApproval(true);
-    const ok = await rejectTransaction(txn.id);
-    if (ok) {
-      toast.success("Payment rejected.");
-    } else {
-      toast.error("Failed to reject payment.");
-    }
-    setApproveDialogTxn(null);
-    setProcessingApproval(false);
+  async function handleReject(txn: AccountTransaction) {
+    setProcessingReview(true);
+    const ok = await rejectAccountTransaction(txn.id);
+    if (ok) toast.success("Payment rejected.");
+    else toast.error("Rejection failed.");
+    setReviewTxn(null);
+    setProcessingReview(false);
     loadData();
-  };
+  }
 
-  const handleViewDoc = async (txn: Transaction) => {
+  async function handleApproveDraft(txn: AccountTransaction) {
+    const ok = await approveAccountTransaction(txn.id);
+    if (ok) toast.success("Draft approved — invoice added to ledger.");
+    else toast.error("Approval failed.");
+    loadData();
+  }
+
+  async function handleViewDraftDoc(txn: AccountTransaction) {
+    if (!txn.document_storage_path) return;
+    const supabase = createBrowserSupabaseClient();
+    // Drafts are auto-created from document uploads → always in 'documents' bucket
+    const { data, error } = await supabase.storage
+      .from("documents")
+      .createSignedUrl(txn.document_storage_path, 3600);
+    if (error || !data?.signedUrl) { toast.error("Could not generate download link."); return; }
+    window.open(data.signedUrl, "_blank");
+  }
+
+  async function handleViewDoc(txn: AccountTransaction) {
     if (!txn.document_storage_path) return;
     const supabase = createBrowserSupabaseClient();
     const { data, error } = await supabase.storage
       .from("swift-documents")
       .createSignedUrl(txn.document_storage_path, 3600);
-    if (error || !data?.signedUrl) {
-      toast.error("Could not generate download link.");
-      return;
-    }
+    if (error || !data?.signedUrl) { toast.error("Could not generate download link."); return; }
     window.open(data.signedUrl, "_blank");
-  };
+  }
 
-  // ── Render guards ──────────────────────────────────────────────
+  // ── Loading guard ──────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -303,26 +403,13 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
     );
   }
 
-  if (!counterpartCompany) {
-    return (
-      <DashboardLayout role={role} title="Company Not Found" subtitle="">
-        <div className="text-center py-20">
-          <p className="text-gray-500">Company account not found.</p>
-          <Button variant="outline" className="mt-4" onClick={() => router.back()}>
-            Go Back
-          </Button>
-        </div>
-      </DashboardLayout>
-    );
-  }
-
-  // ── Render ─────────────────────────────────────────────────────
+  const currencies = ["USD", "EUR", "GBP", "ILS"];
 
   return (
     <DashboardLayout
       role={role}
-      title={counterpartCompany.name}
-      subtitle="Transaction ledger and account balance"
+      title={partnerDisplayName}
+      subtitle="Transaction ledger — invoices, payments, and credit notes"
     >
       <Button
         variant="ghost"
@@ -334,61 +421,118 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
         Back to Accounts
       </Button>
 
-      {/* Balance summary */}
+      {/* ── Pending Drafts ────────────────────────────────────── */}
+      {drafts.length > 0 && (
+        <Card className="mb-6 border-amber-200 bg-amber-50/40">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-semibold text-amber-800 flex items-center gap-2">
+              <Clock className="w-4 h-4 text-amber-500" />
+              Pending Drafts
+              <span className="ml-1 inline-flex items-center justify-center rounded-full bg-amber-200 text-amber-800 text-xs font-medium w-5 h-5">
+                {drafts.length}
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 pt-0">
+            {drafts.map((draft) => (
+              <div
+                key={draft.id}
+                className="flex items-center justify-between gap-4 bg-white rounded-lg border border-amber-100 px-4 py-3"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <FileText className="w-4 h-4 text-amber-400 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-gray-900">{fmt(draft.amount, draft.currency)}</p>
+                    <p className="text-xs text-gray-500 truncate">
+                      Auto-extracted · {draft.document_file_name ?? "commercial invoice"} · {fmtDate(draft.created_at)}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex gap-2 shrink-0">
+                  {draft.document_storage_path && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs gap-1"
+                      onClick={() => handleViewDraftDoc(draft)}
+                    >
+                      <FileText className="w-3 h-3" />
+                      View Doc
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    className="h-7 px-3 text-xs gap-1 bg-amber-500 hover:bg-amber-600 text-white"
+                    onClick={() => handleApproveDraft(draft)}
+                  >
+                    <CheckCircle className="w-3 h-3" />
+                    Approve
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── Balance summary ────────────────────────────────────── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Total Invoiced</p>
-            <p className="text-lg font-semibold text-gray-900">{formatCurrency(totalInvoiced)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Approved Payments</p>
-            <p className="text-lg font-semibold text-green-600">{formatCurrency(totalPaid)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Credit Notes</p>
-            <p className="text-lg font-semibold text-blue-600">{formatCurrency(totalCredits)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Current Balance</p>
-            <p className={`text-lg font-semibold ${currentBalance > 0 ? "text-red-600" : currentBalance < 0 ? "text-green-600" : "text-gray-400"}`}>
-              {formatCurrency(Math.abs(currentBalance))}
-              {currentBalance < 0 && <span className="text-xs ml-1 font-normal">credit</span>}
-            </p>
-          </CardContent>
-        </Card>
+        {[
+          { label: "Total Invoiced",    value: fmt(invoicesIssued + invoicesOwed), color: "" },
+          { label: "Approved Payments", value: fmt(paymentsReceived + paymentsMade), color: "text-green-600" },
+          { label: "Credits Issued",    value: fmt(creditsIssued + creditsReceived), color: "text-blue-600" },
+          (() => {
+            const totalPayments = paymentsReceived + paymentsMade + creditsIssued + creditsReceived;
+            const totalInvoices = invoicesIssued + invoicesOwed;
+            const isCredit = totalPayments > totalInvoices + 0.005;
+            return {
+              label: "Net Balance",
+              value: Math.abs(netBalance) <= 0.005
+                ? fmt(0)
+                : isCredit
+                ? `${fmt(Math.abs(netBalance))} credit`
+                : netBalance > 0
+                ? `${fmt(netBalance)} owed to you`
+                : `${fmt(Math.abs(netBalance))} you owe`,
+              color: Math.abs(netBalance) <= 0.005
+                ? "text-gray-400"
+                : isCredit
+                ? "text-emerald-600"
+                : "text-red-600",
+            };
+          })(),
+        ].map(({ label, value, color }) => (
+          <Card key={label}>
+            <CardContent className="pt-4 pb-4">
+              <p className="text-xs text-gray-500 mb-1">{label}</p>
+              <p className={`text-lg font-semibold ${color || "text-gray-900"}`}>{value}</p>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
-      {/* Transaction ledger */}
+      {/* ── Transaction ledger ─────────────────────────────────── */}
       <Card>
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <CardTitle className="text-base">Transaction Ledger</CardTitle>
             <div className="flex gap-2">
-              {/* Creditor actions */}
               {amICreditor && (
                 <>
                   <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setCreditOpen(true)}>
                     <ReceiptText className="w-3.5 h-3.5" />
                     Credit Note
                   </Button>
-                  <Button size="sm" className="gap-1.5" onClick={() => setInvoiceOpen(true)}>
+                  <Button size="sm" className="gap-1.5" onClick={() => setInvOpen(true)}>
                     <Receipt className="w-3.5 h-3.5" />
-                    Issue Invoice
+                    Upload Invoice
                   </Button>
                 </>
               )}
-              {/* Debtor actions */}
               {amIDebtor && (
-                <Button size="sm" className="gap-1.5" onClick={() => { setPayParentId(null); setPaymentOpen(true); }}>
+                <Button size="sm" className="gap-1.5" onClick={() => { resetPay(); setPayOpen(true); }}>
                   <CreditCard className="w-3.5 h-3.5" />
-                  Submit Payment
+                  Upload Payment Proof
                 </Button>
               )}
             </div>
@@ -401,59 +545,60 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
                 <TableRow>
                   <TableHead>Date</TableHead>
                   <TableHead>Type</TableHead>
+                  <TableHead>Uploaded by</TableHead>
                   <TableHead>Reference</TableHead>
-                  <TableHead>Notes</TableHead>
+                  <TableHead>Container</TableHead>
                   <TableHead className="text-right">Amount</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead>Document</TableHead>
+                  <TableHead>Doc</TableHead>
                   <TableHead></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {transactions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="text-center py-10 text-gray-400">
-                      No transactions yet. {amICreditor ? "Issue an invoice to get started." : "Transactions will appear here once your supplier issues an invoice."}
+                    <TableCell colSpan={9} className="text-center py-12 text-sm text-gray-400">
+                      {amICreditor
+                        ? "No transactions yet — click \"Upload Invoice\" to create the first one."
+                        : "No transactions yet — invoices will appear here once your supplier uploads them."}
                     </TableCell>
                   </TableRow>
                 ) : (
                   transactions.map((txn) => {
-                    const isPendingPayment = txn.type === "payment" && txn.status === "pending_approval";
-                    const canApprove = isPendingPayment && iAmCreditorOf(txn);
-                    const canPayAgainst = txn.type === "invoice" && txn.status === "active" && amIDebtor;
+                    const uploaderIsMe = myUserIdSet.has(txn.uploader_user_id);
+                    const isPendingPayment = txn.type === "payment" && txn.status === "pending";
+                    // Creditor can approve payments that were submitted TO them by the partner
+                    const canReview = isPendingPayment && amICreditor && !uploaderIsMe;
 
                     return (
                       <TableRow key={txn.id} className="text-sm">
                         <TableCell className="text-gray-500 whitespace-nowrap">
-                          {formatDate(txn.transaction_date)}
+                          {fmtDate(txn.transaction_date)}
                         </TableCell>
                         <TableCell>
-                          <Badge
-                            variant="secondary"
-                            className={`text-xs font-normal ${TXN_TYPE_STYLES[txn.type] ?? "bg-gray-100"}`}
-                          >
-                            {TXN_TYPE_LABELS[txn.type] ?? txn.type}
+                          <Badge variant="secondary" className={`text-xs font-normal ${TYPE_STYLES[txn.type] ?? "bg-gray-100"}`}>
+                            {TYPE_LABELS[txn.type] ?? txn.type}
                           </Badge>
+                        </TableCell>
+                        <TableCell className="text-xs text-gray-500">
+                          {uploaderIsMe ? "You" : partnerDisplayName}
                         </TableCell>
                         <TableCell className="font-mono text-xs text-gray-700">
                           {txn.reference_number ?? "—"}
                         </TableCell>
-                        <TableCell className="text-gray-500 max-w-[160px] truncate">
-                          {txn.notes ?? "—"}
+                        <TableCell className="text-xs text-gray-700 whitespace-nowrap font-mono">
+                          {txn.container?.container_number ?? "—"}
                         </TableCell>
                         <TableCell className="text-right font-medium whitespace-nowrap">
-                          {txn.type === "payment" || txn.type === "credit_note" ? (
-                            <span className="text-green-600">− {formatCurrency(txn.amount, txn.currency)}</span>
+                          {txn.type === "payment" || txn.type === "credit" ? (
+                            <span className="text-green-600">− {fmt(txn.amount, txn.currency)}</span>
                           ) : (
-                            <span>{formatCurrency(txn.amount, txn.currency)}</span>
+                            fmt(txn.amount, txn.currency)
                           )}
                         </TableCell>
                         <TableCell>
-                          <Badge
-                            variant="secondary"
-                            className={`text-xs font-normal ${TXN_STATUS_STYLES[txn.status] ?? "bg-gray-100"}`}
-                          >
-                            {TXN_STATUS_LABELS[txn.status] ?? txn.status}
+                          <Badge variant="secondary" className={`text-xs font-normal ${STATUS_STYLES[txn.status] ?? "bg-gray-100"}`}>
+                            {STATUS_LABELS[txn.status] ?? txn.status}
                           </Badge>
                         </TableCell>
                         <TableCell>
@@ -467,42 +612,32 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
                               <FileText className="w-3 h-3" />
                               <span className="text-xs">View</span>
                             </Button>
+                          ) : txn.container_id ? (
+                            <a
+                              href={`/${role}/containers/${txn.container_id}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 text-xs text-blue-500 hover:text-blue-700 hover:underline py-1 px-2"
+                            >
+                              <FileText className="w-3 h-3" />
+                              View
+                            </a>
                           ) : (
-                            <span className="text-xs text-gray-400">—</span>
+                            <span className="text-xs text-gray-300">—</span>
                           )}
                         </TableCell>
                         <TableCell>
-                          <div className="flex gap-1">
-                            {/* Creditor: approve/reject pending payments */}
-                            {canApprove && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="text-green-600 border-green-200 hover:bg-green-50 h-7 px-2 text-xs gap-1"
-                                onClick={() => setApproveDialogTxn(txn)}
-                              >
-                                <CheckCircle className="w-3 h-3" />
-                                Review
-                              </Button>
-                            )}
-                            {/* Debtor: pay against an invoice */}
-                            {canPayAgainst && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-7 px-2 text-xs gap-1"
-                                onClick={() => {
-                                  setPayParentId(txn.id);
-                                  setPayAmount(String(txn.amount));
-                                  setPayCurrency(txn.currency);
-                                  setPaymentOpen(true);
-                                }}
-                              >
-                                <CreditCard className="w-3 h-3" />
-                                Pay
-                              </Button>
-                            )}
-                          </div>
+                          {canReview && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="text-green-600 border-green-200 hover:bg-green-50 h-7 px-2 text-xs gap-1"
+                              onClick={() => setReviewTxn(txn)}
+                            >
+                              <CheckCircle className="w-3 h-3" />
+                              Review
+                            </Button>
+                          )}
                         </TableCell>
                       </TableRow>
                     );
@@ -514,13 +649,18 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
         </CardContent>
       </Card>
 
-      {/* ── Issue Invoice Modal ─────────────────────────────────── */}
-      <Dialog open={invoiceOpen} onOpenChange={(o) => { if (!o && !savingInv) setInvoiceOpen(false); }}>
+      {/* ═══════════════════════════════════════════════
+          MODALS
+         ═══════════════════════════════════════════════ */}
+
+      {/* Upload Invoice */}
+      <Dialog open={invOpen} onOpenChange={(o) => { if (!o && !savingInv) { setInvOpen(false); resetInv(); } }}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Issue Invoice</DialogTitle>
+            <DialogTitle>Upload Invoice</DialogTitle>
             <DialogDescription>
-              Create a new invoice for <strong>{counterpartCompany.name}</strong>.
+              Issue an invoice to <strong>{partnerDisplayName}</strong>.
+              All fields marked <span className="text-red-500">*</span> are required.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -531,18 +671,13 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label>Amount <span className="text-red-500">*</span></Label>
-                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={invAmount} onChange={(e) => setInvAmount(e.target.value)} />
+                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={invAmt} onChange={(e) => setInvAmt(e.target.value)} />
               </div>
               <div className="space-y-1.5">
                 <Label>Currency</Label>
-                <Select value={invCurrency} onValueChange={setInvCurrency}>
+                <Select value={invCur} onValueChange={setInvCur}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="USD">USD</SelectItem>
-                    <SelectItem value="EUR">EUR</SelectItem>
-                    <SelectItem value="GBP">GBP</SelectItem>
-                    <SelectItem value="ILS">ILS</SelectItem>
-                  </SelectContent>
+                  <SelectContent>{currencies.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="space-y-1.5">
@@ -551,32 +686,31 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
               </div>
               <div className="space-y-1.5">
                 <Label>Due Date</Label>
-                <Input type="date" value={invDueDate} onChange={(e) => setInvDueDate(e.target.value)} />
+                <Input type="date" value={invDue} onChange={(e) => setInvDue(e.target.value)} />
               </div>
             </div>
             <div className="space-y-1.5">
               <Label>Notes</Label>
-              <Textarea rows={2} placeholder="Optional notes…" value={invNotes} onChange={(e) => setInvNotes(e.target.value)} />
+              <Textarea rows={2} placeholder="Optional…" value={invNotes} onChange={(e) => setInvNotes(e.target.value)} />
             </div>
+            <FileField file={invFile} onChange={setInvFile} />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setInvoiceOpen(false)} disabled={savingInv}>Cancel</Button>
-            <Button onClick={handleIssueInvoice} disabled={savingInv}>
-              {savingInv ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Creating…</> : <>
-                <Receipt className="w-4 h-4 mr-2" />Create Invoice
-              </>}
+            <Button variant="outline" onClick={() => { setInvOpen(false); resetInv(); }} disabled={savingInv}>Cancel</Button>
+            <Button onClick={handleUploadInvoice} disabled={savingInv || !invFile}>
+              {savingInv ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Uploading…</> : <><Receipt className="w-4 h-4 mr-2" />Create Invoice</>}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* ── Issue Credit Note Modal ─────────────────────────────── */}
-      <Dialog open={creditOpen} onOpenChange={(o) => { if (!o && !savingCredit) setCreditOpen(false); }}>
+      {/* Issue Credit Note */}
+      <Dialog open={creditOpen} onOpenChange={(o) => { if (!o && !savingCredit) { setCreditOpen(false); resetCredit(); } }}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Issue Credit Note</DialogTitle>
             <DialogDescription>
-              Immediately reduces the outstanding balance for <strong>{counterpartCompany.name}</strong>.
+              Immediately reduces the outstanding balance for <strong>{partnerDisplayName}</strong>.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -587,67 +721,52 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label>Amount <span className="text-red-500">*</span></Label>
-                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={creditAmount} onChange={(e) => setCreditAmount(e.target.value)} />
+                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={creditAmt} onChange={(e) => setCreditAmt(e.target.value)} />
               </div>
               <div className="space-y-1.5">
                 <Label>Currency</Label>
-                <Select value={creditCurrency} onValueChange={setCreditCurrency}>
+                <Select value={creditCur} onValueChange={setCreditCur}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="USD">USD</SelectItem>
-                    <SelectItem value="EUR">EUR</SelectItem>
-                    <SelectItem value="GBP">GBP</SelectItem>
-                    <SelectItem value="ILS">ILS</SelectItem>
-                  </SelectContent>
+                  <SelectContent>{currencies.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
             </div>
             <div className="space-y-1.5">
               <Label>Notes</Label>
-              <Textarea rows={2} placeholder="Reason for credit note…" value={creditNotes} onChange={(e) => setCreditNotes(e.target.value)} />
+              <Textarea rows={2} placeholder="Reason for credit…" value={creditNotes} onChange={(e) => setCreditNotes(e.target.value)} />
             </div>
+            <FileField file={creditFile} onChange={setCreditFile} />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setCreditOpen(false)} disabled={savingCredit}>Cancel</Button>
-            <Button onClick={handleIssueCreditNote} disabled={savingCredit}>
-              {savingCredit ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Issuing…</> : <>
-                <ReceiptText className="w-4 h-4 mr-2" />Issue Credit Note
-              </>}
+            <Button variant="outline" onClick={() => { setCreditOpen(false); resetCredit(); }} disabled={savingCredit}>Cancel</Button>
+            <Button onClick={handleUploadCreditNote} disabled={savingCredit || !creditFile}>
+              {savingCredit ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Issuing…</> : <><ReceiptText className="w-4 h-4 mr-2" />Issue Credit Note</>}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* ── Submit Payment Modal ────────────────────────────────── */}
-      <Dialog open={paymentOpen} onOpenChange={(o) => { if (!o && !savingPay) { setPaymentOpen(false); setPayFile(null); setPayParentId(null); } }}>
+      {/* Upload Payment Proof */}
+      <Dialog open={payOpen} onOpenChange={(o) => { if (!o && !savingPay) { setPayOpen(false); resetPay(); } }}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Submit Payment</DialogTitle>
+            <DialogTitle>Upload Payment Proof</DialogTitle>
             <DialogDescription>
-              Submit a payment to <strong>{counterpartCompany.name}</strong>. It will be marked as pending until they approve it.
+              Submit a payment to <strong>{partnerDisplayName}</strong>. It will be{" "}
+              <em>Pending Approval</em> until they confirm it.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            {payParentId && (
-              <div className="rounded bg-blue-50 px-3 py-2 text-xs text-blue-700">
-                Linked to invoice — amount pre-filled.
-              </div>
-            )}
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label>Amount <span className="text-red-500">*</span></Label>
-                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={payAmount} onChange={(e) => setPayAmount(e.target.value)} />
+                <Input type="number" min="0.01" step="0.01" placeholder="0.00" value={payAmt} onChange={(e) => setPayAmt(e.target.value)} />
               </div>
               <div className="space-y-1.5">
                 <Label>Currency</Label>
-                <Select value={payCurrency} onValueChange={setPayCurrency}>
+                <Select value={payCur} onValueChange={setPayCur}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="USD">USD</SelectItem>
-                    <SelectItem value="EUR">EUR</SelectItem>
-                    <SelectItem value="GBP">GBP</SelectItem>
-                    <SelectItem value="ILS">ILS</SelectItem>
-                  </SelectContent>
+                  <SelectContent>{currencies.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="space-y-1.5">
@@ -655,62 +774,41 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
                 <Input type="date" value={payDate} onChange={(e) => setPayDate(e.target.value)} />
               </div>
               <div className="space-y-1.5">
-                <Label>Reference / SWIFT Ref</Label>
+                <Label>SWIFT / Bank Reference</Label>
                 <Input placeholder="Optional" value={payRef} onChange={(e) => setPayRef(e.target.value)} />
               </div>
             </div>
             <div className="space-y-1.5">
               <Label>Notes</Label>
-              <Textarea rows={2} placeholder="Optional notes…" value={payNotes} onChange={(e) => setPayNotes(e.target.value)} />
+              <Textarea rows={2} placeholder="Optional…" value={payNotes} onChange={(e) => setPayNotes(e.target.value)} />
             </div>
-            <div className="space-y-1.5">
-              <Label>Payment Proof (optional)</Label>
-              <Input
-                type="file"
-                accept=".pdf,.jpg,.jpeg,.png"
-                onChange={(e) => setPayFile(e.target.files?.[0] ?? null)}
-              />
-              {payFile && (
-                <p className="text-xs text-gray-500">{payFile.name} ({(payFile.size / 1024).toFixed(1)} KB)</p>
-              )}
-            </div>
+            <FileField file={payFile} onChange={setPayFile} />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => { setPaymentOpen(false); setPayFile(null); setPayParentId(null); }} disabled={savingPay}>
-              Cancel
-            </Button>
-            <Button onClick={handleSubmitPayment} disabled={savingPay}>
-              {savingPay ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Submitting…</> : <>
-                <Upload className="w-4 h-4 mr-2" />Submit Payment
-              </>}
+            <Button variant="outline" onClick={() => { setPayOpen(false); resetPay(); }} disabled={savingPay}>Cancel</Button>
+            <Button onClick={handleUploadPayment} disabled={savingPay || !payFile}>
+              {savingPay ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Submitting…</> : <><CreditCard className="w-4 h-4 mr-2" />Submit Payment</>}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* ── Approve / Reject Dialog ─────────────────────────────── */}
-      <Dialog
-        open={!!approveDialogTxn}
-        onOpenChange={(o) => { if (!o && !processingApproval) setApproveDialogTxn(null); }}
-      >
-        {approveDialogTxn && (
+      {/* Approve / Reject Dialog */}
+      <Dialog open={!!reviewTxn} onOpenChange={(o) => { if (!o && !processingReview) setReviewTxn(null); }}>
+        {reviewTxn && (
           <DialogContent className="max-w-sm">
             <DialogHeader>
               <DialogTitle>Review Payment</DialogTitle>
               <DialogDescription>
-                {formatCurrency(approveDialogTxn.amount, approveDialogTxn.currency)} submitted by{" "}
-                <strong>{counterpartCompany.name}</strong> on{" "}
-                {formatDate(approveDialogTxn.transaction_date)}.
-                {approveDialogTxn.reference_number && ` Ref: ${approveDialogTxn.reference_number}.`}
+                {fmt(reviewTxn.amount, reviewTxn.currency)} submitted by{" "}
+                <strong>{partnerDisplayName}</strong> on {fmtDate(reviewTxn.transaction_date)}.
+                {reviewTxn.reference_number && (
+                  <> Ref: <span className="font-mono">{reviewTxn.reference_number}</span>.</>
+                )}
               </DialogDescription>
             </DialogHeader>
-            {approveDialogTxn.document_storage_path && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full gap-2"
-                onClick={() => handleViewDoc(approveDialogTxn)}
-              >
+            {reviewTxn.document_storage_path && (
+              <Button variant="outline" size="sm" className="w-full gap-2" onClick={() => handleViewDoc(reviewTxn)}>
                 <FileText className="w-4 h-4" />
                 View Payment Proof
               </Button>
@@ -719,17 +817,13 @@ export function AccountDetailPage({ role }: AccountDetailPageProps) {
               <Button
                 variant="outline"
                 className="flex-1 text-red-600 border-red-200 hover:bg-red-50"
-                onClick={() => handleReject(approveDialogTxn)}
-                disabled={processingApproval}
+                onClick={() => handleReject(reviewTxn)}
+                disabled={processingReview}
               >
-                {processingApproval ? <Loader2 className="w-4 h-4 animate-spin" /> : <><XCircle className="w-4 h-4 mr-1" />Reject</>}
+                {processingReview ? <Loader2 className="w-4 h-4 animate-spin" /> : <><XCircle className="w-4 h-4 mr-1" />Reject</>}
               </Button>
-              <Button
-                className="flex-1"
-                onClick={() => handleApprove(approveDialogTxn)}
-                disabled={processingApproval}
-              >
-                {processingApproval ? <Loader2 className="w-4 h-4 animate-spin" /> : <><CheckCircle className="w-4 h-4 mr-1" />Approve</>}
+              <Button className="flex-1" onClick={() => handleApprove(reviewTxn)} disabled={processingReview}>
+                {processingReview ? <Loader2 className="w-4 h-4 animate-spin" /> : <><CheckCircle className="w-4 h-4 mr-1" />Approve</>}
               </Button>
             </DialogFooter>
           </DialogContent>

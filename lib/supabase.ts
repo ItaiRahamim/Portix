@@ -70,68 +70,6 @@ export type DocumentType =
 export type DocumentStatus = 'missing' | 'uploaded' | 'under_review' | 'approved' | 'rejected'
 export type InvoiceStatus = 'unpaid' | 'partially_paid' | 'paid'
 
-// ── B2B Companies & Transactions (Migration 00317) ────────────────────────────
-export type CompanyType = 'importer' | 'supplier' | 'broker'
-
-export type TransactionType = 'invoice' | 'payment' | 'credit_note'
-
-export type TransactionStatus =
-  | 'active'            // invoice issued / credit note issued (in force immediately)
-  | 'pending_approval'  // payment submitted, awaiting creditor confirmation
-  | 'approved'          // payment confirmed → offsets debt
-  | 'rejected'          // payment proof rejected
-  | 'voided'            // cancelled, no balance effect
-
-export interface Company {
-  id: string
-  name: string
-  type: CompanyType
-  country: string | null
-  created_at: string
-  updated_at: string
-}
-
-export interface Transaction {
-  id: string
-  type: TransactionType
-  status: TransactionStatus
-  creditor_company_id: string
-  debtor_company_id: string
-  created_by: string
-  amount: number
-  currency: string
-  parent_transaction_id: string | null
-  container_id: string | null
-  document_storage_path: string | null
-  document_file_name: string | null
-  document_uploaded_by: string | null
-  transaction_date: string
-  due_date: string | null
-  approved_by: string | null
-  approved_at: string | null
-  reference_number: string | null
-  notes: string | null
-  created_at: string
-  updated_at: string
-  // Joined fields (populated by enriched queries)
-  creditor_company?: Company
-  debtor_company?: Company
-  created_by_profile?: { full_name: string }
-}
-
-export interface CompanyBalance {
-  creditor_company_id: string
-  debtor_company_id: string
-  total_invoiced: number
-  total_paid: number
-  total_credits: number
-  current_balance: number
-}
-
-// Combined view used by the accounts list & ledger
-export interface CompanyWithBalance extends Company {
-  balance: CompanyBalance | null
-}
 
 export type ClaimStatus = 'open' | 'under_review' | 'negotiation' | 'resolved' | 'closed'
 export type ClaimType = 'damaged_goods' | 'missing_goods' | 'short_shipment' | 'quality_issue' | 'documentation_error' | 'delay' | 'other'
@@ -149,7 +87,6 @@ export interface Profile {
   phone: string | null
   avatar_url: string | null
   supplier_org_id: string | null
-  company_id: string | null   // FK → portix.companies (migration 00317)
   created_at: string
   updated_at: string
 }
@@ -293,6 +230,8 @@ export interface ImportLicenseView {
   importer_id: string
   supplier_id: string
   license_number: string
+  /** Commodity/product description — AI-extracted from the license document */
+  product_type: string | null
   issue_date: string
   expiration_date: string
   storage_path: string | null

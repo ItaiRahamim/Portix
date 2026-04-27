@@ -14,7 +14,8 @@ import { Ship, XCircle, CheckCircle, Clock, Eye, Filter } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
 import { ContainerStatusBadge } from "@/components/status-badge";
-import { getContainers } from "@/lib/db";
+import { getContainersForCustomsAgent } from "@/lib/db";
+import { createBrowserSupabaseClient } from "@/lib/supabase";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
 
 function formatDate(dateStr: string): string {
@@ -33,7 +34,13 @@ export default function CustomsAgentDashboardPage() {
 
   const loadContainers = useCallback(async () => {
     setLoading(true);
-    const data = await getContainers();
+    // Resolve current user first so we can scope to assigned shipments only.
+    // getContainersForCustomsAgent filters by shipments.customs_agent_id = agentId,
+    // ensuring unassigned containers are never shown (and can't crash the detail page).
+    const supabase = createBrowserSupabaseClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setLoading(false); return; }
+    const data = await getContainersForCustomsAgent(user.id);
     setContainers(data);
     setLoading(false);
   }, []);

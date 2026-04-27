@@ -38,7 +38,7 @@ import {
   type DocumentType,
 } from "@/lib/supabase";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
-import { uploadDocumentRecord, getCurrentUserId } from "@/lib/db";
+import { uploadDocumentRecord, getCurrentUserId, createDraftInvoiceTransaction } from "@/lib/db";
 
 interface DocumentUploadModalProps {
   open: boolean;
@@ -50,6 +50,8 @@ interface DocumentUploadModalProps {
   preselectedDocType?: DocumentType;
   isReplacement?: boolean;
   onUploaded?: () => void;
+  /** importer_id (profile UUID) of the container — enables auto-draft invoice creation */
+  containerImporterId?: string;
 }
 
 export function DocumentUploadModal({
@@ -61,6 +63,7 @@ export function DocumentUploadModal({
   preselectedDocType,
   isReplacement,
   onUploaded,
+  containerImporterId,
 }: DocumentUploadModalProps) {
   const [docType, setDocType] = useState<DocumentType | "">(preselectedDocType ?? "");
   const [docNumber, setDocNumber] = useState("");
@@ -132,6 +135,16 @@ export function DocumentUploadModal({
       });
 
       if (!ok) throw new Error("Failed to update document record");
+
+      // Auto-create a draft invoice transaction when a commercial_invoice is uploaded
+      if (docType === "commercial_invoice" && containerImporterId && !storageError) {
+        createDraftInvoiceTransaction({
+          documentStoragePath: storagePath,
+          documentFileName: file.name,
+          fileSizeBytes: file.size,
+          importerProfileId: containerImporterId,
+        }).catch((e) => console.warn("[upload] draft invoice skipped:", e));
+      }
 
       const action = isReplacement ? "replaced" : "uploaded";
       toast.success(`${DOCUMENT_TYPE_LABELS[docType as DocumentType]} ${action} successfully.`);

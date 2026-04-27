@@ -11,9 +11,11 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Plus, Trash2, Ship, Container as ContainerIcon, CheckCircle2, Loader2, Sparkles } from "lucide-react";
-import { createShipmentWithContainers, getCurrentProfile, getAccountProfiles } from "@/lib/db";
+import { createShipmentWithContainers, getCurrentProfile, getAccountProfiles, createOrderDraftTransaction, uploadDocumentRecord } from "@/lib/db";
 import { useRef } from "react";
 import type { Profile } from "@/lib/supabase";
+import { createBrowserSupabaseClient, STORAGE_BUCKETS } from "@/lib/supabase";
+import type { DocumentType } from "@/lib/supabase";
 import { toast } from "sonner";
 
 interface NewContainerFields {
@@ -63,6 +65,13 @@ export function NewShipmentModal({
   // Step 2 – Containers list
   const [containers, setContainers] = useState<NewContainerFields[]>([emptyContainer()]);
 
+  // Invoice total extracted by Make.com OCR during AI auto-fill
+  const [totalAmount, setTotalAmount] = useState<number | null>(null);
+
+  // File used for AI auto-fill — saved to Storage + documents table on submit
+  const [aiFile, setAiFile] = useState<File | null>(null);
+  const [aiDocType, setAiDocType] = useState<DocumentType>("commercial_invoice");
+
   // Load counterpart profiles when modal opens
   const counterpartRole = role === "importer" ? "supplier" : "importer";
 
@@ -97,6 +106,9 @@ export function NewShipmentModal({
     setOriginCountry("");
     setDestinationPort("");
     setContainers([emptyContainer()]);
+    setTotalAmount(null);
+    setAiFile(null);
+    setAiDocType("commercial_invoice");
   };
 
   const handleClose = () => { resetForm(); onClose(); };
@@ -177,17 +189,21 @@ export function NewShipmentModal({
   }
 
   async function handleAiAutofill(file: File) {
+    setAiFile(file);   // retain for post-submit upload
     setAiParsing(true);
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch("/api/parse-shipment", { method: "POST", body: form });
-      if (!res.ok) {
-        const { error } = await res.json().catch(() => ({ error: "AI parsing failed" }));
-        toast.error(error ?? "AI parsing failed");
+      const supabase = createBrowserSupabaseClient();
+      const { data: payload, error: fnError } = await supabase.functions.invoke(
+        "parse-shipment",
+        { body: form },
+      );
+      if (fnError || !payload?.shipment) {
+        toast.error(fnError?.message ?? payload?.error ?? "AI parsing failed");
         return;
       }
-      const { shipment, containers: parsedContainers } = await res.json();
+      const { shipment, containers: parsedContainers } = payload;
 
       // ── Party — role-aware extraction then fuzzy match → UUID ────────────────
       // Supplier creates shipment → counterpart is an importer → read importerName
@@ -203,6 +219,22 @@ export function NewShipmentModal({
           toast.warning(`Could not match "${partyRawName}" to a known ${isSupplier ? "importer" : "supplier"}. Select manually.`);
         }
       }
+
+      // ── Document type (AI may return explicit type, default commercial_invoice) ─
+      const extractedDocType = (shipment.documentType ?? shipment.docType ?? "") as string;
+      const VALID_DOC_TYPES: DocumentType[] = [
+        "commercial_invoice","packing_list","phytosanitary_certificate",
+        "bill_of_lading","certificate_of_origin","cooling_report","insurance_certificate",
+      ];
+      if (VALID_DOC_TYPES.includes(extractedDocType as DocumentType)) {
+        setAiDocType(extractedDocType as DocumentType);
+      }
+
+      // ── Invoice total (Make.com OCR) ─────────────────────────────────────────
+      const parsedAmount = Number(
+        shipment.totalAmount ?? shipment.invoiceAmount ?? shipment.amount ?? 0
+      );
+      if (parsedAmount > 0) setTotalAmount(parsedAmount);
 
       // ── Scalar fields ───────────────────────────────────────────────────────
       if (shipment.productName)    setProductName(shipment.productName);
@@ -285,6 +317,68 @@ export function NewShipmentModal({
       if (!result) {
         toast.error("Failed to create shipment. Please try again.");
         return;
+      }
+
+      // ── Save AI file to Storage + documents table (one per container) ────
+      // Only fires when the user uploaded a file for AI auto-fill.
+      if (aiFile && result.container_ids?.length > 0) {
+        const supabase = createBrowserSupabaseClient();
+        const ext = aiFile.name.split(".").pop() ?? "pdf";
+        // Upload once; reference the same path across all containers
+        const storagePath = `${result.container_ids[0]}/${aiDocType}/${Date.now()}_${aiFile.name}`;
+        const { error: uploadErr } = await supabase.storage
+          .from(STORAGE_BUCKETS.documents)
+          .upload(storagePath, aiFile, { upsert: true });
+
+        if (!uploadErr) {
+          await Promise.allSettled(
+            result.container_ids.map((containerId) =>
+              uploadDocumentRecord({
+                containerId,
+                documentType: aiDocType,
+                storagePath,
+                fileName:      aiFile.name,
+                fileSizeBytes: aiFile.size,
+                mimeType:      aiFile.type || `application/${ext}`,
+                uploadedBy:    profile.id,
+                notes:         "Uploaded during new order creation via AI auto-fill",
+              })
+            )
+          );
+        } else {
+          console.warn("[new-order] Storage upload failed:", uploadErr.message);
+        }
+
+        // ── Auto-classify via Gemini for every new container ─────────────────
+        // Invokes the classify-documents Unified Orchestrator in parallel.
+        // It runs Gemini classification, uploads to smart_uploads/, and patches
+        // all matching portix.documents rows server-side — no extra client work.
+        // UI stays in submitting=true until all promises settle.
+        toast.info("Running AI document classification…");
+        await Promise.allSettled(
+          result.container_ids.map((containerId) => {
+            const classifyForm = new FormData();
+            classifyForm.append("file", aiFile);
+            classifyForm.append("containerId", containerId);
+            return supabase.functions.invoke("classify-documents", { body: classifyForm });
+          })
+        );
+      }
+
+      // ── Draft account transactions (one per container) ────────────────────
+      // Only fires when Make.com OCR returned a totalAmount during AI auto-fill.
+      if (totalAmount && totalAmount > 0 && result.container_ids?.length > 0) {
+        await Promise.allSettled(
+          result.container_ids.map((containerId, idx) =>
+            createOrderDraftTransaction({
+              supplierProfileId: supplierId,
+              importerProfileId: importerId,
+              amount:            totalAmount,
+              containerId,
+              containerNumber:   containers[idx]?.containerNumber ?? containerId,
+            })
+          )
+        );
       }
 
       toast.success(

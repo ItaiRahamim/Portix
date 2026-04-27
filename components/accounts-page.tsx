@@ -4,224 +4,217 @@ import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import { Eye, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { Eye } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { getMyCompany, getCompanyAccounts } from "@/lib/db";
-import type { CompanyWithBalance } from "@/lib/db";
+import { getPartnerAccounts } from "@/lib/db";
+import type { PartnerAccount } from "@/lib/db";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface AccountsPageProps {
   role: "importer" | "supplier" | "customs-agent";
 }
 
-function formatCurrency(amount: number, currency = "USD") {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function fmt(amount: number, currency = "USD") {
   return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    style: "currency", currency,
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
   }).format(amount);
 }
 
-function BalanceCell({ balance }: { balance: number }) {
-  if (balance > 0) {
-    return (
-      <span className="flex items-center justify-end gap-1 text-red-600 font-medium">
-        <TrendingUp className="w-3.5 h-3.5" />
-        {formatCurrency(balance)}
-      </span>
-    );
-  }
-  if (balance < 0) {
-    return (
-      <span className="flex items-center justify-end gap-1 text-green-600 font-medium">
-        <TrendingDown className="w-3.5 h-3.5" />
-        {formatCurrency(Math.abs(balance))} credit
-      </span>
-    );
-  }
+function BalanceCell({ account }: { account: PartnerAccount }) {
+  const { current_balance: balance, total_invoiced, total_paid, total_credits } = account;
+  // True credit = payments + credits exceed all invoices (overpayment scenario)
+  const isCredit = total_paid + total_credits > total_invoiced + 0.005;
+
+  if (Math.abs(balance) <= 0.005) return <span className="text-gray-400">{fmt(0)}</span>;
+  if (isCredit) return <span className="font-medium text-emerald-600">{fmt(Math.abs(balance))} credit</span>;
+  if (balance > 0) return <span className="font-medium text-red-600">{fmt(balance)} owed to you</span>;
+  return <span className="font-medium text-red-600">{fmt(Math.abs(balance))} you owe</span>;
+}
+
+// ─── Single company table section ────────────────────────────────────────────
+
+function CompanySection({
+  title,
+  accounts,
+  basePath,
+  router,
+}: {
+  title: string;
+  accounts: PartnerAccount[];
+  basePath: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  router: any;
+}) {
+  const totalInvoiced  = accounts.reduce((s, a) => s + a.total_invoiced,  0);
+  const totalPaid      = accounts.reduce((s, a) => s + a.total_paid,      0);
+  const totalOutstanding = accounts.reduce(
+    (s, a) => s + Math.max(0, a.current_balance), 0
+  );
+
   return (
-    <span className="flex items-center justify-end gap-1 text-gray-400">
-      <Minus className="w-3.5 h-3.5" />
-      {formatCurrency(0)}
-    </span>
+    <Card className="mb-6">
+      <CardHeader className="pb-0">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <CardTitle className="text-base">{title}</CardTitle>
+          <div className="flex gap-4 text-xs text-gray-500">
+            <span>Invoiced: <span className="font-medium text-gray-700">{fmt(totalInvoiced)}</span></span>
+            <span>Paid: <span className="font-medium text-green-600">{fmt(totalPaid)}</span></span>
+            <span>
+              Outstanding:{" "}
+              <span className={`font-medium ${totalOutstanding > 0 ? "text-red-600" : "text-gray-400"}`}>
+                {fmt(totalOutstanding)}
+              </span>
+            </span>
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="pt-4">
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Company</TableHead>
+                <TableHead className="text-right">Total Invoiced</TableHead>
+                <TableHead className="text-right">Paid</TableHead>
+                <TableHead className="text-right">Credits</TableHead>
+                <TableHead className="text-right">Balance</TableHead>
+                <TableHead></TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {accounts.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-center py-8 text-gray-400 text-sm">
+                    No {title.toLowerCase()} found
+                  </TableCell>
+                </TableRow>
+              ) : (
+                accounts.map((account) => {
+                  const href = `${basePath}/${account.partner_id}`;
+                  return (
+                    <TableRow
+                      key={account.partner_id}
+                      className="cursor-pointer hover:bg-gray-50"
+                      onClick={() => router.push(href)}
+                    >
+                      <TableCell className="font-medium text-sm">{account.company_name}</TableCell>
+                      <TableCell className="text-right text-sm">
+                        {account.total_invoiced > 0 ? fmt(account.total_invoiced) : <span className="text-gray-400">—</span>}
+                      </TableCell>
+                      <TableCell className="text-right text-sm text-green-600">
+                        {account.total_paid > 0 ? fmt(account.total_paid) : <span className="text-gray-400">—</span>}
+                      </TableCell>
+                      <TableCell className="text-right text-sm text-blue-600">
+                        {account.total_credits > 0 ? fmt(account.total_credits) : <span className="text-gray-400">—</span>}
+                      </TableCell>
+                      <TableCell className="text-right text-sm">
+                        <BalanceCell account={account} />
+                      </TableCell>
+                      <TableCell>
+                        <div onClick={(e) => e.stopPropagation()}>
+                          <Button variant="outline" size="sm" onClick={() => router.push(href)}>
+                            <Eye className="w-3.5 h-3.5 mr-1" />
+                            Ledger
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
-const COMPANY_TYPE_LABELS: Record<string, string> = {
-  importer: "Importer",
-  supplier: "Supplier",
-  broker: "Broker",
-};
-
-const COMPANY_TYPE_COLORS: Record<string, string> = {
-  importer: "bg-blue-100 text-blue-700",
-  supplier: "bg-green-100 text-green-700",
-  broker: "bg-purple-100 text-purple-700",
-};
+// ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function AccountsPage({ role }: AccountsPageProps) {
   const router = useRouter();
-  const [accounts, setAccounts] = useState<CompanyWithBalance[]>([]);
-  const [myCompanyId, setMyCompanyId] = useState<string | null>(null);
+  const [accounts, setAccounts] = useState<PartnerAccount[]>([]);
   const [loading, setLoading] = useState(true);
-
-  const columnLabel =
-    role === "importer" ? "Supplier / Broker"
-    : role === "supplier" ? "Importer"
-    : "Company";
 
   const basePath = `/${role}/accounts`;
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const myCompany = await getMyCompany();
-    if (!myCompany) {
-      setLoading(false);
-      return;
-    }
-    setMyCompanyId(myCompany.id);
-    const companyAccounts = await getCompanyAccounts(myCompany.id);
-    // Sort: highest outstanding balance first
-    companyAccounts.sort(
-      (a, b) => (b.balance?.current_balance ?? 0) - (a.balance?.current_balance ?? 0)
-    );
-    setAccounts(companyAccounts);
+    const result = await getPartnerAccounts();
+    // Sort: highest outstanding first, then alphabetically
+    result.sort((a, b) => {
+      const diff = Math.abs(b.current_balance) - Math.abs(a.current_balance);
+      return diff !== 0 ? diff : a.company_name.localeCompare(b.company_name);
+    });
+    setAccounts(result);
     setLoading(false);
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // KPI aggregates
-  const totalOutstanding = accounts.reduce(
-    (sum, a) => sum + Math.max(0, a.balance?.current_balance ?? 0), 0
-  );
-  const totalInvoiced = accounts.reduce(
-    (sum, a) => sum + (a.balance?.total_invoiced ?? 0), 0
-  );
-  const totalPaid = accounts.reduce(
-    (sum, a) => sum + (a.balance?.total_paid ?? 0), 0
-  );
+  // Categorise by the counterpart's role for importer's two-table view
+  const suppliers = accounts.filter((a) => a.partner_role === "supplier");
+  // migration 00312 stores the role as 'customs' in the DB; guard both values
+  const brokers   = accounts.filter((a) => a.partner_role === "customs_agent" || a.partner_role === "customs");
+  const importers = accounts.filter((a) => a.partner_role === "importer");
+
+  const subtitle =
+    role === "importer"
+      ? "Your suppliers and customs brokers — click a row to view the full ledger"
+      : "Your importer accounts — click a row to view the full ledger";
 
   return (
-    <DashboardLayout
-      role={role}
-      title="Accounts"
-      subtitle={`Company-level financial relationships and transaction ledger`}
-    >
-      {/* KPI row */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Total Invoiced</p>
-            <p className="text-xl font-semibold text-gray-900">{formatCurrency(totalInvoiced)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Total Paid</p>
-            <p className="text-xl font-semibold text-green-600">{formatCurrency(totalPaid)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-4 pb-4">
-            <p className="text-xs text-gray-500 mb-1">Outstanding Balance</p>
-            <p className={`text-xl font-semibold ${totalOutstanding > 0 ? "text-red-600" : "text-gray-400"}`}>
-              {formatCurrency(totalOutstanding)}
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Accounts table */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">{columnLabel}s</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="py-10 text-center text-gray-400 text-sm">Loading accounts…</div>
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Company</TableHead>
-                    <TableHead>Type</TableHead>
-                    <TableHead>Country</TableHead>
-                    <TableHead className="text-right">Total Invoiced</TableHead>
-                    <TableHead className="text-right">Total Paid</TableHead>
-                    <TableHead className="text-right">Credits</TableHead>
-                    <TableHead className="text-right">Balance</TableHead>
-                    <TableHead></TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {accounts.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={8} className="text-center py-10 text-gray-400">
-                        No company accounts found. Transactions will appear here once invoices are issued.
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    accounts.map((company) => {
-                      const bal = company.balance;
-                      const detailPath = myCompanyId
-                        ? `${basePath}/${company.id}`
-                        : "#";
-                      return (
-                        <TableRow
-                          key={company.id}
-                          className="cursor-pointer hover:bg-gray-50"
-                          onClick={() => router.push(detailPath)}
-                        >
-                          <TableCell className="font-medium text-sm">{company.name}</TableCell>
-                          <TableCell>
-                            <Badge
-                              className={`text-xs font-normal ${COMPANY_TYPE_COLORS[company.type] ?? "bg-gray-100 text-gray-600"}`}
-                              variant="secondary"
-                            >
-                              {COMPANY_TYPE_LABELS[company.type] ?? company.type}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="text-sm text-gray-500">{company.country ?? "—"}</TableCell>
-                          <TableCell className="text-right text-sm">
-                            {bal ? formatCurrency(bal.total_invoiced) : "—"}
-                          </TableCell>
-                          <TableCell className="text-right text-sm text-green-600">
-                            {bal ? formatCurrency(bal.total_paid) : "—"}
-                          </TableCell>
-                          <TableCell className="text-right text-sm text-blue-600">
-                            {bal && bal.total_credits > 0 ? formatCurrency(bal.total_credits) : "—"}
-                          </TableCell>
-                          <TableCell className="text-right text-sm">
-                            <BalanceCell balance={bal?.current_balance ?? 0} />
-                          </TableCell>
-                          <TableCell>
-                            <div onClick={(e) => e.stopPropagation()}>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => router.push(detailPath)}
-                              >
-                                <Eye className="w-3.5 h-3.5 mr-1" />
-                                Ledger
-                              </Button>
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })
-                  )}
-                </TableBody>
-              </Table>
-            </div>
+    <DashboardLayout role={role} title="Accounts" subtitle={subtitle}>
+      {loading ? (
+        <div className="py-16 text-center text-gray-400 text-sm">Loading accounts…</div>
+      ) : (
+        <>
+          {/* Importer sees two sections: Suppliers + Brokers */}
+          {role === "importer" && (
+            <>
+              <CompanySection
+                title="Suppliers"
+                accounts={suppliers}
+                basePath={basePath}
+                router={router}
+              />
+              <CompanySection
+                title="Customs Brokers"
+                accounts={brokers}
+                basePath={basePath}
+                router={router}
+              />
+              {suppliers.length === 0 && brokers.length === 0 && (
+                <Card>
+                  <CardContent className="py-12 text-center text-gray-400 text-sm">
+                    No partners found. Partners appear here automatically once a
+                    container links your account with a supplier or broker.
+                  </CardContent>
+                </Card>
+              )}
+            </>
           )}
-        </CardContent>
-      </Card>
+
+          {/* Supplier / Customs-Agent sees one section: Importers */}
+          {role !== "importer" && (
+            <CompanySection
+              title="Importers"
+              accounts={importers.length > 0 ? importers : accounts}
+              basePath={basePath}
+              router={router}
+            />
+          )}
+        </>
+      )}
     </DashboardLayout>
   );
 }

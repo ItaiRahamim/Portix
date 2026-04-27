@@ -1,5 +1,10 @@
 # CLAUDE.md — Portix Project Guide
 
+## Workflow Strategy
+- **Context First**: Before scanning the codebase or executing complex tasks, always read this file (`CLAUDE.md`) and `knowledge/ERRORS.md`.
+- **Minimal Scanning**: Rely on the architectural maps and patterns defined here to locate files instead of broad grep searches.
+- **Continuous Learning**: Update these docs immediately after every fix, discovery, or schema change.
+
 > This file is the single source of truth for working on **Portix**.
 > Update it whenever a new pattern, bug, or preference is discovered — don't wait to be asked.
 > Errors, gotchas, and fixes go to `knowledge/ERRORS.md`.
@@ -485,15 +490,25 @@ Portix/
 │   └── use-auth.ts                 # Current user + role detection
 ├── supabase/
 │   ├── migrations/
-│   │   ├── 00001_initial_schema.sql
-│   │   ├── 00002_rls_policies.sql
-│   │   ├── 00003_triggers.sql
-│   │   ├── 00004_seed_data.sql
-│   │   ├── 00314_add_claims_and_messages.sql
+│   │   ├── 00301_initial_schema.sql           # 23 tables, views, enums
+│   │   ├── 00302_rls_policies.sql             # Row-level security for all tables
+│   │   ├── 00303_triggers.sql                 # Auto-advance status triggers
+│   │   ├── 00304_seed_data.sql                # Dev seed data
+│   │   ├── 00305_rpc_create_shipment.sql      # Atomic shipment+container RPC
+│   │   ├── 00306–00313_*.sql                  # Incremental fixes + customs agent
+│   │   ├── 00314_claimix_integration.sql      # Claims + Realtime + Storage
 │   │   ├── 00315_fix_claim_messages_schema.sql
-│   │   └── 00316_setup_daily_ai_summary.sql
+│   │   ├── 00316_setup_daily_ai_summary.sql   # pg_cron + Vault nightly summaries
+│   │   ├── 00317_companies_and_transactions.sql # account_transactions table
+│   │   ├── 00318_make_invoice_draft_rpc.sql   # Make.com OCR auto-draft RPC
+│   │   ├── 00319_add_container_id_to_transactions.sql
+│   │   ├── 00320_create_swift_bucket.sql      # swift-documents bucket + RLS
+│   │   ├── 00321_uuid_partner_transactions.sql # target_profile_id UUID column
+│   │   ├── 00322_backfill_target_profile_id.sql # 3-pass legacy data rescue
+│   │   └── 00323_license_product_type_bucket.sql # product_type + license-files bucket
 │   ├── functions/
-│   │   └── generate-claim-summary/index.ts    # Deno runtime, Gemini API
+│   │   ├── generate-claim-summary/index.ts    # Deno, Gemini 2.5 Flash — claim AI
+│   │   └── extract-license-data/index.ts      # Deno, Gemini 2.5 Flash — license OCR
 │   └── storage.md                  # Bucket definitions & security rules
 ├── knowledge/
 │   └── ERRORS.md                   # Bug catalog + fixes
@@ -706,6 +721,7 @@ Stale `.next` cache → `MODULE_NOT_FOUND` chunk errors → white/unstyled page.
 | Call Edge Function without CORS | All functions must have OPTIONS handler + corsHeaders |
 | Allow unsigned file downloads | Always use signed URLs with 1-hour expiry |
 | Edit `components/ui/*.tsx` files | Use them as-is — shadcn/ui treats as read-only |
+| Infer DB relationships from UI states/statuses (e.g. container.status) | ALWAYS use explicit Foreign Keys (e.g. `shipments.customs_agent_id`) |
 
 ---
 
@@ -755,42 +771,144 @@ Stale `.next` cache → `MODULE_NOT_FOUND` chunk errors → white/unstyled page.
 
 ---
 
-## 17. Phase 2: Tauri Desktop App (Future)
+## 17. Phase 2: Tauri Desktop App (Preparation)
 
-Not yet started. Will include:
-- `src-tauri/` directory with Rust backend
-- IPC between Next.js and Rust for file operations
-- Offline mode with local SQLite + sync
-- Native window management
-- Auto-update system
+Web MVP is complete. Phase 2 converts Portix into an offline-capable desktop app
+using Tauri v2 (Rust backend) wrapping the existing Next.js frontend.
+
+### Architecture target
+
+```
+┌──────────────────────────────────────────┐
+│  Tauri window (WebView2 / WKWebView)     │
+│  ┌────────────────────────────────────┐  │
+│  │  Next.js (static export)           │  │
+│  │  - All existing UI components      │  │
+│  │  - Calls Tauri commands via IPC    │  │
+│  └────────────────────────────────────┘  │
+│  ┌────────────────────────────────────┐  │
+│  │  Rust (src-tauri/)                 │  │
+│  │  - Native file dialog / FS access  │  │
+│  │  - SQLite (local cache)            │  │
+│  │  - Sync engine (online/offline)    │  │
+│  │  - Auto-updater (tauri-plugin)     │  │
+│  └────────────────────────────────────┘  │
+└──────────────────────────────────────────┘
+         ↕ when online
+  Supabase PostgreSQL (cloud)
+```
+
+### Required steps (gap analysis)
+
+**A. Tauri initialisation**
+- `npm install --save-dev @tauri-apps/cli @tauri-apps/api`
+- `npx tauri init` → generates `src-tauri/` (Cargo.toml, tauri.conf.json, main.rs)
+- Set `"beforeBuildCommand": "next build"` and `"distDir": "../out"` in tauri.conf.json
+- Add `"output": "export"` + `"trailingSlash": true` to `next.config.ts` (static export)
+- Remove any `getServerSideProps` / Route Handlers (not compatible with static export)
+  → replace with client-side Supabase calls (already the pattern; minimal change)
+
+**B. Rust IPC for native file handling**
+- Add Tauri commands (`#[tauri::command]`) for:
+  - `pick_file(filter)` → native OS file picker (replaces `<input type="file">`)
+  - `read_file(path) -> Vec<u8>` → returns bytes for upload to Supabase Storage
+  - `open_url(url)` → open signed URLs in system browser (for PDF/file viewing)
+- Expose via `invoke("pick_file", { filter: "pdf,jpg" })` in TS with `@tauri-apps/api`
+
+**C. Local SQLite (offline cache)**
+- Add `tauri-plugin-sql` with `sqlx` + SQLite feature
+- Schema mirrors critical portix tables: `containers`, `documents`, `account_transactions`
+- On app start (online): pull latest data → write to SQLite
+- On action (offline): write mutation to `pending_sync` table; replay on reconnect
+- Conflict strategy: server wins (Supabase timestamp > local timestamp)
+
+**D. Offline sync engine (Rust)**
+- Watch `tauri::api::network::available()` or `ping` to detect connectivity
+- On reconnect: drain `pending_sync` queue → POST to Supabase REST API
+- Realtime subscriptions become optional (only active when online)
+
+**E. Auto-updater**
+- `tauri-plugin-updater` reads `tauri.conf.json → updater.endpoints`
+- Publish releases to GitHub Releases with `.sig` files
+- Show in-app "Update available" toast using the plugin event
+
+**F. Platform packaging**
+- macOS: `.dmg` via `tauri build --target universal-apple-darwin`
+- Windows: `.msi` / `.exe` via cross-compile or GitHub Actions runner
+- GitHub Actions CI: `tauri-action` handles signing + release upload
+
+### Key constraint
+Next.js must be exported as a **static site** (`next export`). Server Actions,
+Route Handlers (`/api/*`), and `getServerSideProps` are not available in static
+export mode. The Portix codebase already uses client-side Supabase calls
+everywhere — the only breaking change is moving any `/api/` Route Handlers
+to Supabase Edge Functions (already the pattern for Gemini AI calls).
 
 ---
 
-## 18. Current Status (as of 2026-04-19)
+## 18. Current Status (as of 2026-04-25)
 
-### ✅ Completed (Web MVP)
+### ✅ Completed (Web MVP — fully shipped)
+
+**Foundation**
 - Portix branding and logo
-- Supabase PostgreSQL schema (17 tables, RLS, triggers)
-- Supabase Auth (email/password, 3 roles)
-- Container lifecycle (CRUD, status flows)
-- Document management (upload, approval, rejection)
-- Claims module with Realtime chat + file attachments
-- Google Gemini AI summary generation (manual + nightly cron)
-- Signed URL downloads (all 4 storage buckets)
-- TanStack Query caching + Realtime invalidation
-- Role-based access control (RLS + UI enforcement)
+- Supabase PostgreSQL schema (23 tables, views, enums, RLS, triggers) — migrations 00301–00323
+- Supabase Auth (email/password, 3 roles: importer / supplier / customs_agent)
+- Role-based access control (RLS per table + UI enforcement)
+- TanStack Query caching + Supabase Realtime invalidation
+
+**Container & Document lifecycle**
+- Container CRUD (create via AI-assisted New Order modal, full status flow)
+- Document management (upload, customs review, approval, rejection with mandatory reason)
+- Auto-advance DB triggers (all docs approved → `ready_for_clearance`)
+- Cargo media module — pre-loading photos/videos in container detail page
+- Signed URL downloads (all 4 storage buckets: `documents`, `cargo-media`, `swift-documents`, `license-files`)
+
+**Claims module**
+- Claims CRUD — importer opens, supplier responds
+- Realtime chat with file attachments (images, videos, documents)
+- Google Gemini 2.5 Flash AI summaries (manual "Generate Now" button + nightly pg_cron job)
+- AI summary stored in `portix.claims.claim_summary`, refreshed via Vault-secured Edge Function
+
+**Accounts & Ledger module** (migrations 00317–00322)
+- Partner discovery via container FKs (supplier ↔ importer ↔ customs agent via `shipments.customs_agent_id`)
+- Full transaction ledger: invoices, payments, credit notes
+- SWIFT payment proof upload → `swift-documents` bucket (migration 00320)
+- Three-state balance display: overpayment (green credit) / debt (red) / zero (gray)
+- Draft transaction system: Make.com OCR auto-creates drafts linked to containers
+- Make.com RPC `handle_make_invoice_draft` (migration 00318, fixed in 00322)
+- **UUID-based ledger routing** — routes by `partner_id` UUID, not company name string; rename-proof (migration 00321)
+- Three-pass legacy data backfill: container FK → company name → heuristic (migration 00322)
+
+**Import Licenses module** (migration 00323)
+- License CRUD per importer-supplier pair with expiry warnings (valid / expiring_soon / expired)
+- `license-files` Storage bucket (private, 20 MB, PDF + images)
+- `product_type` column on `import_licenses`
+- **AI-powered license extraction** — `extract-license-data` Edge Function sends file to Gemini 2.5 Flash multimodal, auto-fills license_number, product_type, expiration_date, issue_date
+- Two-tab dialog: AI Extract (default) + Manual Entry fallback
+
+**Bug fixes shipped**
+- URL `%20` encoding on ledger pages (`decodeURIComponent`)
+- `customs` vs `customs_agent` dual-value role check (migration 00312 rename)
+- `swift-documents` bucket creation (was only referenced in comments — migration 00320)
+- `license-files` bucket creation (same pattern — migration 00323)
+- Customs agent partner visibility via explicit FK, not status inference
+- Balance color logic (three-state, never infers direction from sign alone)
+- `approveAccountTransaction` guard updated to include `draft` status
 
 ### 🔄 In Progress
-- Full end-to-end testing (all claim scenarios)
-- Customs agent permissions verification
-- Accounts/invoices module (SWIFT upload, payment tracking)
-- Import licenses CRUD (expiry warnings)
-- Cargo media module (pre-loading photos/videos)
+- Full end-to-end testing (all claim + ledger scenarios)
+- Customs agent permissions verification (edge cases)
+- Maersk API container tracking integration (polling for ETA updates)
 
-### ⏳ Not Yet Started (Phase 2)
-- Tauri desktop app setup
-- Offline mode + local sync
-- Maersk API container tracking integration
-- Advanced search & filtering
-- Performance optimization (pagination, lazy load)
+### ⏳ Not Yet Started (Phase 2 — Tauri Desktop)
+- Tauri v2 project initialisation (`npx tauri init`)
+- Next.js static export mode (`output: "export"`)
+- Rust IPC commands for native file picker + FS access
+- Local SQLite cache (tauri-plugin-sql) with offline-first schema
+- Sync engine: detect connectivity → drain `pending_sync` queue
+- Auto-updater (tauri-plugin-updater + GitHub Releases)
+- Platform packaging: macOS DMG + Windows MSI via GitHub Actions
+- Advanced search & filtering (containers, transactions)
+- Performance optimization: pagination, lazy load, virtual scroll
 
