@@ -355,7 +355,7 @@ export function NewShipmentModal({
         // all matching portix.documents rows server-side — no extra client work.
         // UI stays in submitting=true until all promises settle.
         toast.info("Running AI document classification…");
-        await Promise.allSettled(
+        const classifyResults = await Promise.allSettled(
           result.container_ids.map((containerId) => {
             const classifyForm = new FormData();
             classifyForm.append("file", aiFile);
@@ -363,6 +363,15 @@ export function NewShipmentModal({
             return supabase.functions.invoke("classify-documents", { body: classifyForm });
           })
         );
+
+        // Surface classification failures — don't silently swallow them.
+        const failedClassifications = classifyResults.filter((r) => r.status === "rejected");
+        if (failedClassifications.length > 0) {
+          toast.warning(
+            `AI document classification failed for ${failedClassifications.length} container(s). ` +
+            "Your documents were saved — you can re-upload manually from the container page."
+          );
+        }
       }
 
       // ── Draft account transactions (one per container) ────────────────────

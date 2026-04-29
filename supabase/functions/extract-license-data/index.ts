@@ -36,13 +36,27 @@ const supabaseAdmin = createClient(
 
 // ─── Gemini helpers ───────────────────────────────────────────────────────────
 
-const GEMINI_MODEL = "gemini-2.5-flash";
-const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
+const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-3-flash", "gemini-2.5-pro"];
+const GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/models";
 
-function geminiUrl(): string {
-  const key = Deno.env.get("GEMINI_API_KEY") ?? "";
-  if (!key) throw new Error("GEMINI_API_KEY secret is not set.");
-  return `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent?key=${key}`;
+const RETRIABLE_STATUSES = new Set([429, 503]);
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 2,
+): Promise<Response> {
+  let lastRes!: Response;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      const delayMs = Math.pow(2, attempt - 1) * 1000;
+      console.warn(`[extract-license-data] fetchWithRetry attempt ${attempt + 1}/${maxRetries + 1} after ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    lastRes = await fetch(url, init);
+    if (lastRes.ok || !RETRIABLE_STATUSES.has(lastRes.status)) break;
+  }
+  return lastRes;
 }
 
 /** Derive MIME type from file extension (Gemini requires accurate MIME types). */
@@ -125,38 +139,55 @@ serve(async (req) => {
 
     console.log(`[extract-license-data] File size: ${uint8.length} bytes, MIME: ${mimeType}`);
 
-    // ── Call Gemini multimodal ──────────────────────────────────────────────
-    const geminiRes = await fetch(geminiUrl(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data: base64Data,
-              },
-            },
-            {
-              text: EXTRACTION_PROMPT,
-            },
-          ],
-        }],
-        generationConfig: {
-          maxOutputTokens: 256,
-          temperature: 0.1, // very low — we want deterministic structured output
-        },
-      }),
+    // ── Call Gemini multimodal — model fallback + per-model retry ──────────
+    const apiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
+    if (!apiKey) throw new Error("GEMINI_API_KEY secret is not set.");
+
+    const geminiBody = JSON.stringify({
+      contents: [{
+        parts: [
+          { inline_data: { mime_type: mimeType, data: base64Data } },
+          { text: EXTRACTION_PROMPT },
+        ],
+      }],
+      generationConfig: {
+        maxOutputTokens: 256,
+        temperature: 0.1, // very low — deterministic structured output
+      },
     });
 
-    const geminiRaw = await geminiRes.text();
+    let geminiRaw = "";
+    let succeeded = false;
 
-    if (!geminiRes.ok) {
+    for (const model of FALLBACK_MODELS) {
+      const url = `${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`;
+      const res = await fetchWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: geminiBody,
+      }, 2);
+
+      geminiRaw = await res.text();
+
+      if (res.ok) { succeeded = true; break; }
+
+      if (res.status === 503 || res.status === 429 || res.status === 404) {
+        console.warn(`[extract-license-data] Model ${model} exhausted, trying next...`);
+        continue;
+      }
+
+      // Any other error — fail fast
       console.error("[extract-license-data] Gemini error:", geminiRaw.slice(0, 400));
       return new Response(
-        JSON.stringify({ ok: false, error: `Gemini API error (HTTP ${geminiRes.status})` }),
+        JSON.stringify({ ok: false, error: `Gemini API error (HTTP ${res.status})` }),
         { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } },
+      );
+    }
+
+    if (!succeeded) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "All Gemini models overloaded. Try again later." }),
+        { status: 503, headers: { "Content-Type": "application/json", ...corsHeaders } },
       );
     }
 

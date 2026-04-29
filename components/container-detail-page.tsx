@@ -11,7 +11,13 @@ import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
+  Pencil,
 } from "lucide-react";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useRef } from "react";
 import { CustomsAgentSelector } from "@/components/customs-agent-selector";
 import { DashboardLayout } from "@/components/dashboard-layout";
@@ -27,6 +33,7 @@ import {
   uploadCargoMedia,
   updateDocumentStatus,
   updateContainerStatus,
+  updateContainerDates,
   getCurrentUserId,
   type CargoMedia,
 } from "@/lib/db";
@@ -56,112 +63,226 @@ interface TimelineStep {
   description: string;
 }
 
+// Order reflects real-world logistics: docs must be approved BEFORE arrival
+// to avoid storage fees at destination port.
 const TIMELINE_STEPS: TimelineStep[] = [
   { key: "created",      label: "Created",           icon: Package,     description: "Container created & documents requested" },
   { key: "loaded",       label: "Loaded at Port",    icon: Anchor,      description: "Cargo loaded onto vessel" },
   { key: "sailed",       label: "Sailed (ETD)",      icon: Ship,        description: "Vessel departed port of loading" },
-  { key: "arrived",      label: "Arrived (ETA)",     icon: Globe,       description: "Vessel arrived at destination port" },
   { key: "docs_approved",label: "Docs Approved",     icon: CheckCheck,  description: "All 7 documents reviewed and approved" },
+  { key: "arrived",      label: "Arrived (ETA)",     icon: Globe,       description: "Vessel arrived at destination port" },
   { key: "in_clearance", label: "In Clearance",      icon: FileText,    description: "Customs clearance process underway" },
   { key: "released",     label: "Released",          icon: Truck,       description: "Container released from customs" },
 ];
 
+// Statuses that confirm physical arrival at destination port
+const ARRIVED_STATUSES = new Set(["ready_for_clearance", "in_clearance", "released"]);
+
 function getCompletedStages(container: ContainerView): Set<TimelineStage> {
   const now = Date.now();
   const etd = new Date(container.etd).getTime();
-  const eta = new Date(container.eta).getTime();
+  const s = container.status;
   const completed = new Set<TimelineStage>();
 
+  // Date-driven steps
   completed.add("created");
-  if (now > etd - 3 * 86400000) completed.add("loaded");
-  if (now > etd) completed.add("sailed");
-  if (now > eta) completed.add("arrived");
+  if (now >= etd - 3 * 86400000) completed.add("loaded");  // ~3 days pre-departure
+  if (now >= etd)                 completed.add("sailed");  // past ETD
 
-  const s = container.status;
-  if (s === "ready_for_clearance" || s === "in_clearance" || s === "released") {
+  // "arrived" ONLY green when status confirms physical arrival.
+  // Passing ETA date alone is insufficient — vessel can be delayed.
+  if (ARRIVED_STATUSES.has(s)) completed.add("arrived");
+
+  // docs_approved: explicit count match OR status already past this gate
+  const docsAllApproved =
+    container.docs_total > 0 &&
+    container.docs_approved === container.docs_total;
+  if (docsAllApproved || ARRIVED_STATUSES.has(s)) {
     completed.add("docs_approved");
   }
-  if (s === "in_clearance" || s === "released") {
-    completed.add("in_clearance");
-  }
-  if (s === "released") {
-    completed.add("released");
-  }
+
+  // Status-driven steps
+  if (s === "in_clearance" || s === "released") completed.add("in_clearance");
+  if (s === "released")                          completed.add("released");
 
   return completed;
 }
 
-function LogisticsTimeline({ container }: { container: ContainerView }) {
-  const completed = getCompletedStages(container);
+/**
+ * Returns steps that are "delayed" — past their expected date but not yet confirmed complete.
+ * Only "arrived" can be delayed: ETA has passed but status hasn't reached arrived-statuses.
+ */
+function getDelayedStages(container: ContainerView): Set<TimelineStage> {
+  const now = Date.now();
+  const eta = new Date(container.eta).getTime();
+  const delayed = new Set<TimelineStage>();
+  if (now >= eta && !ARRIVED_STATUSES.has(container.status)) {
+    delayed.add("arrived");
+  }
+  return delayed;
+}
 
-  // Find current active step index
-  const lastCompleted = [...TIMELINE_STEPS].reverse().findIndex(
-    (s) => completed.has(s.key)
-  );
-  const currentIdx = lastCompleted >= 0
-    ? TIMELINE_STEPS.length - 1 - lastCompleted
-    : 0;
+function LogisticsTimeline({
+  container,
+  role,
+  onDateSaved,
+}: {
+  container: ContainerView;
+  role: "importer" | "supplier" | "customs-agent";
+  onDateSaved: () => void;
+}) {
+  const completed = getCompletedStages(container);
+  const delayed   = getDelayedStages(container);
+
+  // Active step = first incomplete, non-delayed step after the last completed one
+  const lastCompleted = [...TIMELINE_STEPS].reverse().findIndex((s) => completed.has(s.key));
+  const currentIdx = lastCompleted >= 0 ? TIMELINE_STEPS.length - 1 - lastCompleted : 0;
+
+  // ── Edit Dates dialog state ────────────────────────────────────────────────
+  const [editOpen, setEditOpen] = useState(false);
+  const [editEtd, setEditEtd]   = useState(container.etd.slice(0, 10));
+  const [editEta, setEditEta]   = useState(container.eta.slice(0, 10));
+  const [saving, setSaving]     = useState(false);
+
+  const handleSaveDates = async () => {
+    if (!editEtd || !editEta) { toast.error("Both dates required."); return; }
+    if (editEta <= editEtd)   { toast.error("ETA must be after ETD."); return; }
+    setSaving(true);
+    const ok = await updateContainerDates(container.id, { etd: editEtd, eta: editEta });
+    setSaving(false);
+    if (ok) {
+      toast.success("Dates updated.");
+      setEditOpen(false);
+      onDateSaved();
+    } else {
+      toast.error("Failed to update dates. Check permissions.");
+    }
+  };
+
+  const canEditDates = role === "importer" || role === "supplier";
 
   return (
-    <Card className="mt-6">
-      <CardHeader className="pb-3">
-        <CardTitle className="text-base flex items-center gap-2">
-          <Ship className="w-4 h-4" />
-          Logistics Timeline
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="relative">
-          {/* Connector line */}
-          <div className="absolute top-5 left-5 right-5 h-0.5 bg-gray-200" />
-
-          <div className="relative flex justify-between">
-            {TIMELINE_STEPS.map((step, idx) => {
-              const Icon = step.icon;
-              const done = completed.has(step.key);
-              const active = !done && idx === currentIdx + 1;
-
-              return (
-                <div key={step.key} className="flex flex-col items-center gap-2 flex-1">
-                  <div
-                    className={`relative z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 transition-all ${
-                      done
-                        ? "bg-green-500 border-green-500 text-white"
-                        : active
-                        ? "bg-white border-blue-500 text-blue-600"
-                        : "bg-white border-gray-300 text-gray-400"
-                    }`}
-                  >
-                    {done ? (
-                      <CheckCircle className="w-5 h-5" />
-                    ) : (
-                      <Icon className="w-4 h-4" />
-                    )}
-                  </div>
-                  <div className="text-center">
-                    <p className={`text-[11px] font-medium leading-tight ${
-                      done ? "text-green-700" : active ? "text-blue-700" : "text-gray-400"
-                    }`}>
-                      {step.label}
-                    </p>
-                    {(step.key === "sailed") && (
-                      <p className="text-[10px] text-gray-400 mt-0.5">
-                        {new Date(container.etd).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
-                      </p>
-                    )}
-                    {(step.key === "arrived") && (
-                      <p className="text-[10px] text-gray-400 mt-0.5">
-                        {new Date(container.eta).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+    <>
+      <Card className="mt-6">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Ship className="w-4 h-4" />
+              Logistics Timeline
+            </CardTitle>
+            {canEditDates && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => {
+                  setEditEtd(container.etd.slice(0, 10));
+                  setEditEta(container.eta.slice(0, 10));
+                  setEditOpen(true);
+                }}
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                Edit Dates
+              </Button>
+            )}
           </div>
-        </div>
-      </CardContent>
-    </Card>
+        </CardHeader>
+        <CardContent>
+          <div className="relative">
+            {/* Connector line */}
+            <div className="absolute top-5 left-5 right-5 h-0.5 bg-gray-200" />
+
+            <div className="relative flex justify-between">
+              {TIMELINE_STEPS.map((step, idx) => {
+                const Icon = step.icon;
+                const done    = completed.has(step.key);
+                const warn    = !done && delayed.has(step.key);
+                const active  = !done && !warn && idx === currentIdx + 1;
+
+                return (
+                  <div key={step.key} className="flex flex-col items-center gap-2 flex-1">
+                    <div
+                      className={`relative z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 transition-all ${
+                        done ? "bg-green-500 border-green-500 text-white"
+                        : warn ? "bg-amber-400 border-amber-400 text-white"
+                        : active ? "bg-white border-blue-500 text-blue-600"
+                        : "bg-white border-gray-300 text-gray-400"
+                      }`}
+                    >
+                      {done ? (
+                        <CheckCircle className="w-5 h-5" />
+                      ) : warn ? (
+                        <AlertTriangle className="w-4 h-4" />
+                      ) : (
+                        <Icon className="w-4 h-4" />
+                      )}
+                    </div>
+                    <div className="text-center">
+                      <p className={`text-[11px] font-medium leading-tight ${
+                        done   ? "text-green-700"
+                        : warn   ? "text-amber-600"
+                        : active ? "text-blue-700"
+                        : "text-gray-400"
+                      }`}>
+                        {warn ? "Delayed / Pending" : step.label}
+                      </p>
+                      {step.key === "sailed" && (
+                        <p className="text-[10px] text-gray-400 mt-0.5">
+                          {new Date(container.etd).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
+                        </p>
+                      )}
+                      {step.key === "arrived" && (
+                        <p className={`text-[10px] mt-0.5 ${warn ? "text-amber-500" : "text-gray-400"}`}>
+                          {new Date(container.eta).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Edit Dates dialog */}
+      <Dialog open={editOpen} onOpenChange={(o) => { if (!o) setEditOpen(false); }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Update Shipping Dates</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-1.5">
+              <Label>ETD — Estimated Departure</Label>
+              <Input
+                type="date"
+                value={editEtd}
+                onChange={(e) => setEditEtd(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>ETA — Estimated Arrival</Label>
+              <Input
+                type="date"
+                value={editEta}
+                onChange={(e) => setEditEta(e.target.value)}
+              />
+            </div>
+            <p className="text-xs text-gray-400">
+              Timeline and delay indicators update immediately after save.
+            </p>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setEditOpen(false)} disabled={saving}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveDates} disabled={saving}>
+              {saving ? "Saving…" : "Save Dates"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
@@ -979,7 +1100,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       </Card>
 
       {/* Logistics Timeline */}
-      <LogisticsTimeline container={container} />
+      <LogisticsTimeline container={container} role={role} onDateSaved={loadData} />
 
       {/* Pre-Loading Cargo Photos — not for customs agent */}
       {role !== "customs-agent" && (

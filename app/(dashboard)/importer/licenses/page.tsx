@@ -179,6 +179,7 @@ export default function ImporterLicensesPage() {
       console.error("[extract-license]", msg);
       setAiError(msg);
       setExtractState("error");
+      toast.error(`AI extraction failed: ${msg}`);
     }
   }
 

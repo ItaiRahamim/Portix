@@ -771,12 +771,24 @@ export default function CalculatorPage() {
                   </>
                 )}
 
-                {/* Export buttons */}
+                {/* Export buttons — coming post-MVP */}
                 <div className="flex gap-2 pt-1">
-                  <Button variant="outline" size="sm" className="flex-1 text-xs h-8 gap-1" onClick={() => toast.success("Export to PDF coming soon")}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 text-xs h-8 gap-1 cursor-not-allowed opacity-50"
+                    disabled
+                    title="Coming soon"
+                  >
                     <Download className="w-3 h-3" /> PDF
                   </Button>
-                  <Button variant="outline" size="sm" className="flex-1 text-xs h-8 gap-1" onClick={() => toast.success("Export to Excel coming soon")}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 text-xs h-8 gap-1 cursor-not-allowed opacity-50"
+                    disabled
+                    title="Coming soon"
+                  >
                     <Download className="w-3 h-3" /> Excel
                   </Button>
                 </div>

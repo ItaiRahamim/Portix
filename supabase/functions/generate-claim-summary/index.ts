@@ -33,15 +33,28 @@ const supabaseAdmin = createClient(
 );
 
 // ─── Gemini REST endpoint ─────────────────────────────────────────────────────
-// Using gemini-2.5-flash — fast, cheap, more than sufficient for summaries.
 
-const GEMINI_MODEL = "gemini-2.5-flash";
-const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
+const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-3-flash", "gemini-2.5-pro"];
+const GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/models";
 
-function geminiUrl(): string {
-  const key = Deno.env.get("GEMINI_API_KEY") ?? "";
-  if (!key) throw new Error("GEMINI_API_KEY secret is not set in Edge Function secrets.");
-  return `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent?key=${key}`;
+const RETRIABLE_STATUSES = new Set([429, 503]);
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 2,
+): Promise<Response> {
+  let lastRes!: Response;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      const delayMs = Math.pow(2, attempt - 1) * 1000;
+      console.warn(`[generate-claim-summary] fetchWithRetry attempt ${attempt + 1}/${maxRetries + 1} after ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    lastRes = await fetch(url, init);
+    if (lastRes.ok || !RETRIABLE_STATUSES.has(lastRes.status)) break;
+  }
+  return lastRes;
 }
 
 // ─── Prompt builder ───────────────────────────────────────────────────────────
@@ -93,31 +106,50 @@ function buildPrompt(claim: ClaimRow, messages: MessageRow[]): string {
 // ─── Gemini call ──────────────────────────────────────────────────────────────
 
 async function callGemini(prompt: string): Promise<string> {
-  const url = geminiUrl();
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        maxOutputTokens: 500,  // enough for 2-3 complete sentences with headroom
-        temperature: 0.3,      // low temperature = deterministic, factual output
-      },
-    }),
+  const geminiBody = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      maxOutputTokens: 500,  // enough for 2-3 complete sentences with headroom
+      temperature: 0.3,      // low temperature = deterministic, factual output
+    },
   });
 
-  const raw = await res.text();
+  const apiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
+  if (!apiKey) throw new Error("GEMINI_API_KEY secret is not set.");
 
-  if (!res.ok) {
-    throw new Error(`Gemini HTTP ${res.status}: ${raw.slice(0, 400)}`);
+  let geminiRaw = "";
+  let succeeded = false;
+
+  for (const model of FALLBACK_MODELS) {
+    const url = `${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`;
+    const res = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: geminiBody,
+    }, 2);
+
+    geminiRaw = await res.text();
+
+    if (res.ok) { succeeded = true; break; }
+
+    if (res.status === 503 || res.status === 429 || res.status === 404) {
+      console.warn(`[generate-claim-summary] Model ${model} exhausted, trying next...`);
+      continue;
+    }
+
+    // Any other error (400 bad prompt, 401 invalid key) — fail fast
+    throw new Error(`Gemini HTTP ${res.status}: ${geminiRaw.slice(0, 400)}`);
+  }
+
+  if (!succeeded) {
+    throw new Error("All Gemini models overloaded. Try again later.");
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(geminiRaw);
   } catch {
-    throw new Error(`Gemini returned non-JSON: ${raw.slice(0, 300)}`);
+    throw new Error(`Gemini returned non-JSON: ${geminiRaw.slice(0, 300)}`);
   }
 
   // Standard Gemini response path: candidates[0].content.parts[0].text
@@ -126,7 +158,7 @@ async function callGemini(prompt: string): Promise<string> {
     (parsed as any)?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
 
   if (!text?.trim()) {
-    throw new Error(`Gemini response contained no text. Full response: ${raw.slice(0, 500)}`);
+    throw new Error(`Gemini response contained no text. Full response: ${geminiRaw.slice(0, 500)}`);
   }
 
   return text.trim();
@@ -227,29 +259,44 @@ serve(async (req) => {
       claims = (data ?? []) as ClaimRow[];
     }
 
-    console.log(`[generate-claim-summary] Processing ${claims.length} claim(s)`);
+    console.log(`[generate-claim-summary] Processing ${claims.length} claim(s) in parallel`);
 
-    // ── Process each claim ─────────────────────────────────────────────────
-    const results: Record<string, unknown>[] = [];
+    // ── Process all claims in parallel — partial failure safe ──────────────
+    const settled = await Promise.allSettled(claims.map((c) => processClaim(c)));
 
-    for (const claim of claims) {
-      const result = await processClaim(claim);
-      const entry = { claim_id: claim.id, ...result };
-
-      if (result.skipped) {
-        console.log(`[generate-claim-summary] Skipped ${claim.id}: ${result.skipped}`);
-      } else if (!result.ok) {
-        console.error(`[generate-claim-summary] Failed ${claim.id}: ${result.error}`);
+    const results = settled.map((r, i) => {
+      const entry = {
+        claim_id: claims[i].id,
+        ...(r.status === "fulfilled"
+          ? r.value
+          : { ok: false, error: (r.reason as Error).message }),
+      };
+      // Log per-claim outcome
+      if (entry.skipped) {
+        console.log(`[generate-claim-summary] Skipped ${entry.claim_id}: ${entry.skipped}`);
+      } else if (!entry.ok) {
+        console.error(`[generate-claim-summary] Failed ${entry.claim_id}: ${entry.error}`);
       } else {
-        console.log(`[generate-claim-summary] ✓ ${claim.id} — ${result.length} chars`);
+        console.log(`[generate-claim-summary] ✓ ${entry.claim_id} — ${entry.length} chars`);
       }
+      return entry;
+    });
 
-      results.push(entry);
-    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const successItems = results.filter((r: any) => r.ok && !r.skipped);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const failedItems  = results.filter((r: any) => !r.ok);
+    const httpStatus   = failedItems.length > 0 && successItems.length > 0 ? 207 : 200;
 
     return new Response(
-      JSON.stringify({ ok: true, processed: results.length, results }),
-      { headers: { "Content-Type": "application/json", ...corsHeaders } },
+      JSON.stringify({
+        ok: true,
+        processed: results.length,
+        results,               // backward compat
+        success: successItems,
+        failed:  failedItems,
+      }),
+      { status: httpStatus, headers: { "Content-Type": "application/json", ...corsHeaders } },
     );
   } catch (err) {
     console.error("[generate-claim-summary] Fatal:", (err as Error).message);

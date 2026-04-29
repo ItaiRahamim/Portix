@@ -116,15 +116,16 @@ export function DocumentUploadModal({
         .upload(storagePath, file, { upsert: true });
 
       if (storageError) {
-        // If storage bucket doesn't exist yet, continue with record-only upload
-        console.warn("[upload] Storage bucket not ready:", storageError.message);
+        // Storage failure is fatal — do NOT write a DB record with a null path.
+        // A document row with storage_path="" is unrecoverable from the UI.
+        throw new Error(`File upload failed: ${storageError.message}`);
       }
 
       // Update the document record in DB
       const ok = await uploadDocumentRecord({
         containerId: preselectedContainerId,
         documentType: docType as DocumentType,
-        storagePath: storageError ? "" : storagePath,
+        storagePath,
         fileName: file.name,
         fileSizeBytes: file.size,
         mimeType: file.type,
@@ -137,7 +138,9 @@ export function DocumentUploadModal({
       if (!ok) throw new Error("Failed to update document record");
 
       // Auto-create a draft invoice transaction when a commercial_invoice is uploaded
-      if (docType === "commercial_invoice" && containerImporterId && !storageError) {
+      // storageError guard removed — we throw above on storage failure, so if we
+      // reach this line, the upload was successful.
+      if (docType === "commercial_invoice" && containerImporterId) {
         createDraftInvoiceTransaction({
           documentStoragePath: storagePath,
           documentFileName: file.name,

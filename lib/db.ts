@@ -33,12 +33,16 @@ export async function getCurrentProfile(): Promise<Profile | null> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("profiles")
     .select("*")
     .eq("id", user.id)
-    .single();
+    .maybeSingle();  // .single() throws when RLS returns 0 rows; maybeSingle() returns null safely
 
+  if (error) {
+    console.error("[db] getCurrentProfile:", error.message);
+    return null;
+  }
   return data ?? null;
 }
 
@@ -97,6 +101,27 @@ export async function updateContainerStatus(
 
   if (error) {
     console.error("[db] updateContainerStatus:", error.message);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Updates ETD and/or ETA on a container.
+ * RLS allows importer (importer_id = uid) and supplier (supplier_id = uid).
+ */
+export async function updateContainerDates(
+  containerId: string,
+  dates: { etd?: string; eta?: string }
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("containers")
+    .update({ ...dates })
+    .eq("id", containerId);
+
+  if (error) {
+    console.error("[db] updateContainerDates:", error.message);
     return false;
   }
   return true;
@@ -574,6 +599,38 @@ export async function getProfileById(id: string): Promise<Profile | null> {
     return null;
   }
   return data ?? null;
+}
+
+/**
+ * Updates the current user's own profile row.
+ * Only the fields passed are updated — other columns are unchanged.
+ * RLS ensures users can only update their own row (profiles.id = auth.uid()).
+ */
+export async function updateProfile(fields: {
+  full_name?: string;
+  phone?: string;
+  company_name?: string;
+}): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    console.error("[db] updateProfile: not authenticated");
+    return false;
+  }
+
+  const { error } = await supabase
+    .from("profiles")
+    .update({
+      ...fields,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", user.id);
+
+  if (error) {
+    console.error("[db] updateProfile:", error.message);
+    return false;
+  }
+  return true;
 }
 
 // ─── Cargo Media ──────────────────────────────────────────────────────────────

@@ -42,13 +42,33 @@ const supabaseAdmin = createClient(
 // ── Gemini helpers ─────────────────────────────────────────────────────────────
 
 // Primary model first; fallback to less-loaded models on 503 "High Demand" errors.
-const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
+const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-3-flash", "gemini-2.5-pro"];
 const GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/models";
 
 function geminiUrl(model: string): string {
   const key = Deno.env.get("GEMINI_API_KEY") ?? "";
   if (!key) throw new Error("GEMINI_API_KEY secret is not set.");
   return `${GEMINI_BASE}/${model}:generateContent?key=${key}`;
+}
+
+const RETRIABLE_STATUSES = new Set([429, 503]);
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 2,
+): Promise<Response> {
+  let lastRes!: Response;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      const delayMs = Math.pow(2, attempt - 1) * 1000;
+      console.warn(`[classify-documents] fetchWithRetry attempt ${attempt + 1}/${maxRetries + 1} after ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    lastRes = await fetch(url, init);
+    if (lastRes.ok || !RETRIABLE_STATUSES.has(lastRes.status)) break;
+  }
+  return lastRes;
 }
 
 function resolvedMime(fileName: string, declaredType: string): string {
@@ -213,11 +233,11 @@ serve(async (req) => {
     let succeeded = false;
 
     for (const model of FALLBACK_MODELS) {
-      const res = await fetch(geminiUrl(model), {
+      const res = await fetchWithRetry(geminiUrl(model), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: geminiBody,
-      });
+      }, 2);
 
       geminiRaw = await res.text();
 
@@ -226,8 +246,8 @@ serve(async (req) => {
         break;
       }
 
-      if (res.status === 503 || res.status === 429) {
-        const reason = res.status === 503 ? "overloaded (503)" : "rate-limited (429)";
+      if (res.status === 503 || res.status === 429 || res.status === 404) {
+        const reason = res.status === 503 ? "overloaded (503)" : res.status === 429 ? "rate-limited (429)" : "not found (404)";
         console.warn(`[classify-documents] Model ${model} is ${reason}, trying next...`);
         continue;
       }
@@ -400,9 +420,19 @@ serve(async (req) => {
       });
     }
 
+    const successDocs = results.filter((r) => r.success);
+    const failedDocs  = results.filter((r) => !r.success);
+    const httpStatus  = failedDocs.length > 0 && successDocs.length > 0 ? 207 : 200;
+
     return new Response(
-      JSON.stringify({ ok: true, results, storage_path: finalStoragePath }),
-      { headers: { "Content-Type": "application/json", ...corsHeaders } },
+      JSON.stringify({
+        ok: true,
+        results,                        // backward compat
+        success: successDocs,
+        failed:  failedDocs,
+        storage_path: finalStoragePath,
+      }),
+      { status: httpStatus, headers: { "Content-Type": "application/json", ...corsHeaders } },
     );
   } catch (err) {
     console.error("[classify-documents] Fatal:", (err as Error).message);
