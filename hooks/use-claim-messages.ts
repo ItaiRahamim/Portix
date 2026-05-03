@@ -31,18 +31,23 @@ export function useClaimMessages(claimId: string) {
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (payload: any) => {
-          // Push the new row directly into the query cache — no network round-trip.
-          // This makes the message appear immediately for both sender and receiver.
-          const newMessage = payload.new as ClaimMessage;
-          queryClient.setQueryData<ClaimMessage[]>(
-            ["claim-messages", claimId],
-            (prev) => {
-              if (!prev) return [newMessage];
-              // Deduplicate in case an optimistic update already added this row
-              const alreadyExists = prev.some((m) => m.id === newMessage.id);
-              return alreadyExists ? prev : [...prev, newMessage];
-            }
-          );
+          // postgres_changes payload.new is a raw DB row — it has no joined
+          // sender:profiles data, so direct setQueryData would show generic
+          // "Supplier"/"Importer" labels instead of real names.
+          //
+          // Strategy: if the sender is the current user, the message was already
+          // added optimistically by the send handler (setQueryData with full data).
+          // Deduplicate by id; for incoming messages from the other party,
+          // invalidate so getClaimMessages (which joins profiles) re-fetches.
+          const incomingId: string = payload.new?.id;
+          const cached = queryClient.getQueryData<ClaimMessage[]>(["claim-messages", claimId]);
+          const alreadyInCache = cached?.some((m) => m.id === incomingId);
+
+          if (!alreadyInCache) {
+            // Refetch to get the row with sender.full_name joined
+            queryClient.invalidateQueries({ queryKey: ["claim-messages", claimId] });
+          }
+          // If already in cache (own optimistic message), do nothing — avoid duplicate
         }
       )
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

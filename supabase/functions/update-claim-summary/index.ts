@@ -71,7 +71,11 @@ serve(async (req) => {
     // ── Update claim ──────────────────────────────────────────────────────────
     const { data, error } = await supabase
       .from("claims")
-      .update({ claim_summary, updated_at: new Date().toISOString() })
+      .update({
+        claim_summary,
+        last_summary_at: new Date().toISOString(),  // keeps change-detection accurate
+        updated_at:      new Date().toISOString(),
+      })
       .eq("id", claim_id)
       .select("id")
       .single();

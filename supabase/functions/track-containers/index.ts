@@ -1,8 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: { 'Access-Control-Allow-Origin': '*' } })
+    return new Response('ok', { headers: corsHeaders });
   }
 
   try {
@@ -26,7 +31,10 @@ serve(async (req) => {
 
     if (!authRes.ok) {
       const authErr = await authRes.text();
-      return new Response(JSON.stringify({ error: `Auth Failed: ${authErr}` }), { status: 400 });
+      return new Response(
+        JSON.stringify({ error: `Auth Failed: ${authErr}` }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } },
+      );
     }
 
     const { access_token } = await authRes.json();
@@ -44,12 +52,15 @@ serve(async (req) => {
 
     const data = await trackRes.json();
 
-    // Return response directly to Supabase dashboard
-    return new Response(JSON.stringify({ ok: true, data }), {
-      headers: { "Content-Type": "application/json" }
-    });
+    return new Response(
+      JSON.stringify({ ok: true, data }),
+      { headers: { "Content-Type": "application/json", ...corsHeaders } },
+    );
 
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+    return new Response(
+      JSON.stringify({ error: (err as Error).message }),
+      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } },
+    );
   }
 })
