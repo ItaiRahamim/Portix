@@ -45,6 +45,10 @@ const supabaseAdmin = createClient(
 const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-3-flash", "gemini-2.5-pro"];
 const GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/models";
 
+// Files above this threshold are uploaded via Gemini Files API instead of inline base64.
+// Avoids O(n²) string encoding overhead and large JSON payloads that cause timeouts.
+const FILES_API_THRESHOLD = 2 * 1024 * 1024; // 2 MB
+
 function geminiUrl(model: string): string {
   const key = Deno.env.get("GEMINI_API_KEY") ?? "";
   if (!key) throw new Error("GEMINI_API_KEY secret is not set.");
@@ -84,6 +88,51 @@ function resolvedMime(fileName: string, declaredType: string): string {
     heif: "image/heif",
   };
   return map[ext] ?? "application/octet-stream";
+}
+
+/**
+ * Fast chunked base64 encoding.
+ * The naive char-by-char approach is O(n²) in memory — ~100× slower for large files.
+ * Chunking to 8 KiB slices stays within JS call-stack limits and runs in linear time.
+ */
+function toBase64Fast(uint8: Uint8Array): string {
+  const CHUNK = 8192;
+  const parts: string[] = [];
+  for (let i = 0; i < uint8.length; i += CHUNK) {
+    parts.push(String.fromCharCode(...uint8.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(""));
+}
+
+/**
+ * Upload a file to Gemini Files API and return its hosted URI.
+ * Used for files > FILES_API_THRESHOLD to avoid large inline base64 JSON payloads.
+ * Uploaded files are available for 48 hours on Gemini's servers.
+ */
+async function uploadToGeminiFiles(
+  data: ArrayBuffer,
+  mimeType: string,
+  apiKey: string,
+): Promise<string> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media&key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": mimeType,
+        "X-Goog-Upload-Protocol": "raw",
+      },
+      body: data,
+    },
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini Files API upload failed (${res.status}): ${err.slice(0, 200)}`);
+  }
+  const json = await res.json();
+  const uri: string = json?.file?.uri ?? "";
+  if (!uri) throw new Error("Gemini Files API returned no file URI");
+  return uri;
 }
 
 /**
@@ -204,29 +253,38 @@ serve(async (req) => {
       );
     }
 
-    // ── Base64 encode ─────────────────────────────────────────────────────────
+    // ── Prepare file for Gemini ───────────────────────────────────────────────
     const arrayBuffer = await file.arrayBuffer();
-    const uint8 = new Uint8Array(arrayBuffer);
-    let binary = "";
-    for (let i = 0; i < uint8.length; i++) {
-      binary += String.fromCharCode(uint8[i]);
-    }
-    const base64Data = btoa(binary);
-    const mimeType = resolvedMime(file.name, file.type);
+    const uint8       = new Uint8Array(arrayBuffer);
+    const mimeType    = resolvedMime(file.name, file.type);
+    const apiKey      = Deno.env.get("GEMINI_API_KEY") ?? "";
+    if (!apiKey) throw new Error("GEMINI_API_KEY secret is not set.");
 
     console.log(
       `[classify-documents] File: ${file.name}, ${uint8.length} bytes, MIME: ${mimeType}, container: ${containerId}`,
     );
 
+    // For large PDFs: upload via Files API (avoids base64 encoding overhead + huge JSON body).
+    // For small files: encode inline — one fewer round-trip.
+    let filePart: Record<string, unknown>;
+    if (uint8.length > FILES_API_THRESHOLD) {
+      console.log(`[classify-documents] PDF > 2 MB — uploading via Gemini Files API`);
+      const fileUri = await uploadToGeminiFiles(arrayBuffer, mimeType, apiKey);
+      filePart = { file_data: { mime_type: mimeType, file_uri: fileUri } };
+    } else {
+      filePart = { inline_data: { mime_type: mimeType, data: toBase64Fast(uint8) } };
+    }
+
     // ── Call Gemini with model fallback on 503 High-Demand errors ────────────
     const geminiBody = JSON.stringify({
       contents: [{
-        parts: [
-          { inline_data: { mime_type: mimeType, data: base64Data } },
-          { text: CLASSIFICATION_PROMPT },
-        ],
+        parts: [filePart, { text: CLASSIFICATION_PROMPT }],
       }],
-      generationConfig: { maxOutputTokens: 2048, temperature: 0.1 },
+      generationConfig: {
+        maxOutputTokens: 1024,              // 5 docs × ~200 tokens each — plenty
+        temperature:     0.1,
+        thinkingConfig:  { thinkingBudget: 0 }, // disable extended thinking → faster response
+      },
     });
 
     let geminiRaw = "";
