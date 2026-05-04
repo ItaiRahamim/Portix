@@ -114,6 +114,14 @@ export interface Container {
   docs_approved: number
   docs_rejected: number
   notes: string | null
+  /**
+   * Normalized shipping-line key (msc, maersk, zim, hapag-lloyd, cma-cgm,
+   * evergreen, cosco, one, yang-ming, hmm). Populated by parse-shipment AI on
+   * shipment creation and by classify-documents when a Bill of Lading is
+   * uploaded. Drives the clickable carrier-tracking link on container cards.
+   * Null = unknown carrier → render plain text instead of a link.
+   */
+  carrier: string | null
   // Carrier tracking fields (populated by track-containers Edge Function)
   current_location: string | null
   api_eta: string | null

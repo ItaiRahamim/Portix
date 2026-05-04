@@ -100,9 +100,36 @@ function extractJsonText(text: string): string {
   return s;
 }
 
+// ── Carrier normalization (keep in sync with lib/tracking.ts) ────────────────
+//
+// Maps an arbitrary carrier string from the AI / document (e.g. "Maersk Line",
+// "MSC", "HAPAG-LLOYD AG") to a canonical lowercase kebab-case key that the
+// frontend uses to build the official tracking URL. Returns null when no
+// match — unknown carriers must NOT be persisted as the raw string.
+type CarrierKey =
+  | "msc" | "maersk" | "zim" | "hapag-lloyd" | "cma-cgm"
+  | "evergreen" | "cosco" | "one" | "yang-ming" | "hmm";
+
+function normalizeCarrier(raw: string | null | undefined): CarrierKey | null {
+  if (!raw) return null;
+  const s = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!s) return null;
+  if (s.includes("msc")) return "msc";
+  if (s.includes("maersk")) return "maersk";
+  if (s.includes("zim")) return "zim";
+  if (s.includes("hapag") || s.includes("lloyd")) return "hapag-lloyd";
+  if (s.includes("cmacgm") || s.includes("cma")) return "cma-cgm";
+  if (s.includes("evergreen")) return "evergreen";
+  if (s.includes("cosco")) return "cosco";
+  if (s === "one" || s.includes("oceannetwork")) return "one";
+  if (s.includes("yangming")) return "yang-ming";
+  if (s.includes("hmm") || s.includes("hyundaimerchant")) return "hmm";
+  return null;
+}
+
 // ── Extraction prompt ──────────────────────────────────────────────────────────
 
-const EXTRACTION_PROMPT = `You are an expert logistics AI. Analyze the uploaded document (likely a Proforma Invoice, Quote, or Packing List).
+const EXTRACTION_PROMPT = `You are an expert logistics AI. Analyze the uploaded document (likely a Proforma Invoice, Quote, Bill of Lading, or Packing List).
 Your task is to extract shipment details, container details, and financial totals.
 
 CRITICAL RULES:
@@ -110,6 +137,7 @@ CRITICAL RULES:
 2. If a value is not found, return null (for strings) or empty string (for enums).
 3. Dates MUST be in ISO format (YYYY-MM-DD).
 4. For "totalAmount", extract the grand total of the document. Numeric only.
+5. For "carrier", extract the shipping line / ocean carrier name from the carrier logo, header, or footer of the document (e.g. "MSC", "Maersk", "ZIM", "Hapag-Lloyd", "CMA CGM", "Evergreen", "COSCO", "ONE"). Return null if unclear or not a carrier-issued document.
 
 Return a JSON object with this EXACT structure:
 {
@@ -120,6 +148,7 @@ Return a JSON object with this EXACT structure:
     "currency": "String",
     "vesselName": "String",
     "voyageNumber": "String",
+    "carrier": "String. Shipping line / ocean carrier name. null if not visible.",
     "etd": "YYYY-MM-DD",
     "eta": "YYYY-MM-DD",
     "originCountry": "String",
@@ -254,9 +283,21 @@ serve(async (req) => {
       );
     }
 
+    // Normalize the carrier value to a canonical key (msc / maersk / zim / …)
+    // so the frontend can directly build the tracking URL via getTrackingLink().
+    // Raw value left untouched in the original string field for audit / debugging.
+    const rawCarrier = (extracted.shipment as Record<string, unknown>).carrier;
+    const normalizedCarrier = normalizeCarrier(
+      typeof rawCarrier === "string" ? rawCarrier : null,
+    );
+    const shipment = {
+      ...extracted.shipment,
+      carrier: normalizedCarrier, // canonical key or null; replaces raw string
+    };
+
     return new Response(
       JSON.stringify({
-        shipment: extracted.shipment,
+        shipment,
         containers: Array.isArray(extracted.containers) ? extracted.containers : [],
       }),
       { headers: { "Content-Type": "application/json", ...corsHeaders } },

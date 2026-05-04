@@ -41,6 +41,8 @@ import {
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
 import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/lib/supabase";
+import { getTrackingLink, CARRIER_LABELS } from "@/lib/tracking";
+import type { CarrierKey } from "@/lib/tracking";
 import { toast } from "sonner";
 
 interface ContainerDetailPageProps {
@@ -849,7 +851,26 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
             <div>
               <p className="text-gray-500 text-xs">Container Number</p>
-              <p className="mt-0.5 font-medium">{container.container_number}</p>
+              <p className="mt-0.5 font-medium">
+                {(() => {
+                  const link = getTrackingLink(container.carrier, container.container_number);
+                  if (!link) return container.container_number;
+                  const label = container.carrier
+                    ? CARRIER_LABELS[container.carrier as CarrierKey] ?? container.carrier
+                    : "carrier";
+                  return (
+                    <a
+                      href={link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:underline"
+                      title={`Track on ${label}`}
+                    >
+                      {container.container_number}
+                    </a>
+                  );
+                })()}
+              </p>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Shipment</p>

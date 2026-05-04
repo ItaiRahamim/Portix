@@ -16,6 +16,7 @@ import { KPICard } from "@/components/kpi-card";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
 import { getContainers } from "@/lib/db";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
+import { getTrackingLink } from "@/lib/tracking";
 
 function daysUntil(dateStr: string): number {
   return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
@@ -176,7 +177,25 @@ export default function SupplierDashboardPage() {
                         onClick={() => router.push(`/supplier/containers/${c.id}`)}
                       >
                         <TableCell className="whitespace-nowrap font-mono text-sm">{c.bill_of_lading_number ?? <span className="text-gray-400">—</span>}</TableCell>
-                        <TableCell className="whitespace-nowrap font-medium">{c.container_number}</TableCell>
+                        <TableCell className="whitespace-nowrap font-medium">
+                          {(() => {
+                            const link = getTrackingLink(c.carrier, c.container_number);
+                            return link ? (
+                              <a
+                                href={link}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                                onClick={(e) => e.stopPropagation()}
+                                title={`Track on ${c.carrier} carrier site`}
+                              >
+                                {c.container_number}
+                              </a>
+                            ) : (
+                              c.container_number
+                            );
+                          })()}
+                        </TableCell>
                         <TableCell className="text-sm">{c.importer_company}</TableCell>
                         <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>
                         <TableCell className="text-sm whitespace-nowrap">

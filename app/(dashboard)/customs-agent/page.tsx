@@ -17,6 +17,7 @@ import { ContainerStatusBadge } from "@/components/status-badge";
 import { getContainersForCustomsAgent } from "@/lib/db";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
+import { getTrackingLink } from "@/lib/tracking";
 
 function formatDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString("en-GB", {
@@ -153,7 +154,25 @@ export default function CustomsAgentDashboardPage() {
                         onClick={() => router.push(`/customs-agent/containers/${c.id}`)}
                       >
                         <TableCell className="whitespace-nowrap font-mono text-sm">{c.bill_of_lading_number ?? <span className="text-gray-400">—</span>}</TableCell>
-                        <TableCell className="whitespace-nowrap font-medium">{c.container_number}</TableCell>
+                        <TableCell className="whitespace-nowrap font-medium">
+                          {(() => {
+                            const link = getTrackingLink(c.carrier, c.container_number);
+                            return link ? (
+                              <a
+                                href={link}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                                onClick={(e) => e.stopPropagation()}
+                                title={`Track on ${c.carrier} carrier site`}
+                              >
+                                {c.container_number}
+                              </a>
+                            ) : (
+                              c.container_number
+                            );
+                          })()}
+                        </TableCell>
                         <TableCell className="text-sm">{c.importer_company}</TableCell>
                         <TableCell className="text-sm">{c.supplier_company}</TableCell>
                         <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>

@@ -24,6 +24,8 @@ interface NewContainerFields {
   temperature: string;
   portOfLoading: string;
   portOfDestination: string;
+  /** Normalized carrier key (msc/maersk/zim/…) or null. Set by parse-shipment AI. */
+  carrier: string | null;
 }
 
 const emptyContainer = (): NewContainerFields => ({
@@ -32,6 +34,7 @@ const emptyContainer = (): NewContainerFields => ({
   temperature: "",
   portOfLoading: "",
   portOfDestination: "",
+  carrier: null,
 });
 
 interface NewShipmentModalProps {
@@ -250,6 +253,12 @@ export function NewShipmentModal({
         );
       }
 
+      // ── Carrier (shipment-level, applies to every container) ───────────────
+      // parse-shipment already normalizes the carrier server-side, so the value
+      // here is either a canonical key (msc/maersk/zim/…) or null.
+      const shipmentCarrier: string | null =
+        typeof shipment.carrier === "string" && shipment.carrier ? shipment.carrier : null;
+
       // ── Containers ─────────────────────────────────────────────────────────
       if (Array.isArray(parsedContainers) && parsedContainers.length > 0) {
         setContainers(
@@ -265,8 +274,13 @@ export function NewShipmentModal({
             portOfLoading:     pc.portOfLoading    ?? "",
             portOfDestination: pc.portOfDestination ?? shipment.destinationPort ?? "",
             temperature:       pc.temperature      ?? "",
+            carrier:           shipmentCarrier,
           }))
         );
+      } else if (shipmentCarrier) {
+        // No container array returned but carrier was extracted — merge it into
+        // the existing manually-entered rows.
+        setContainers((prev) => prev.map((c) => ({ ...c, carrier: shipmentCarrier })));
       }
 
       toast.success("Form filled from document — review and adjust before submitting.");
@@ -311,6 +325,7 @@ export function NewShipmentModal({
           portOfLoading:      cf.portOfLoading.trim(),
           portOfDestination:  cf.portOfDestination.trim(),
           temperatureSetting: cf.temperature.trim() || undefined,
+          carrier:            cf.carrier ?? null,
         })),
       });
 

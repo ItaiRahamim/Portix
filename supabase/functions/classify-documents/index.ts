@@ -188,6 +188,33 @@ const SUPPLEMENTARY_DOC_TYPES = new Set([
   "import_license_doc",
 ]);
 
+// ── Carrier normalization (keep in sync with lib/tracking.ts) ────────────────
+//
+// Maps an arbitrary carrier string from the AI / document (e.g. "Maersk Line",
+// "MSC", "HAPAG-LLOYD AG") to a canonical lowercase kebab-case key that the
+// frontend uses to build the official tracking URL. Returns null when no
+// match — unknown carriers must NOT be persisted as the raw string.
+type CarrierKey =
+  | "msc" | "maersk" | "zim" | "hapag-lloyd" | "cma-cgm"
+  | "evergreen" | "cosco" | "one" | "yang-ming" | "hmm";
+
+function normalizeCarrier(raw: string | null | undefined): CarrierKey | null {
+  if (!raw) return null;
+  const s = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!s) return null;
+  if (s.includes("msc")) return "msc";
+  if (s.includes("maersk")) return "maersk";
+  if (s.includes("zim")) return "zim";
+  if (s.includes("hapag") || s.includes("lloyd")) return "hapag-lloyd";
+  if (s.includes("cmacgm") || s.includes("cma")) return "cma-cgm";
+  if (s.includes("evergreen")) return "evergreen";
+  if (s.includes("cosco")) return "cosco";
+  if (s === "one" || s.includes("oceannetwork")) return "one";
+  if (s.includes("yangming")) return "yang-ming";
+  if (s.includes("hmm") || s.includes("hyundaimerchant")) return "hmm";
+  return null;
+}
+
 // ── Classification prompt ──────────────────────────────────────────────────────
 
 const CLASSIFICATION_PROMPT = `You are an expert logistics AI. Analyze the uploaded PDF file.
@@ -210,6 +237,7 @@ CRITICAL RULES:
    'insurance_certificate'     — cargo insurance certificate
    'customs_declaration'       — customs export/import declaration (e.g. EXA, SAD)
    'other'                     — anything not matching the above
+3. For "carrier", extract the shipping line / ocean carrier name (e.g. "MSC", "Maersk", "ZIM", "Hapag-Lloyd", "CMA CGM", "Evergreen", "COSCO", "ONE"). Look at the carrier logo / header / footer. ONLY meaningful for 'bill_of_lading' and 'bl_draft' — return null for all other document types or when not visible.
 
 Return a JSON object with this EXACT structure:
 {
@@ -219,6 +247,7 @@ Return a JSON object with this EXACT structure:
       "document_number": "String (e.g., Invoice Number, BL Number, or Certificate Number. null if not found)",
       "issue_date": "YYYY-MM-DD (null if not found)",
       "container_number": "String. CRITICAL: Look for the specific container number (e.g., MSKU1234567) this document refers to. If the document applies to ALL containers or no specific container is listed, return 'ALL'",
+      "carrier": "String. Shipping line / carrier name. Only for bill_of_lading and bl_draft. null otherwise.",
       "extractedData": {
         "supplierName": "String",
         "totalAmount": Number,
@@ -236,6 +265,7 @@ interface DocumentFound {
   container_number: string | null;
   document_number: string | null;
   issue_date: string | null;
+  carrier: string | null; // only for bill_of_lading / bl_draft
   extractedData: {
     supplierName: string | null;
     totalAmount: number | null;
@@ -566,6 +596,42 @@ serve(async (req) => {
             }
           }
           // If row exists but is approved/rejected → skip (correct behavior)
+        }
+      }
+
+      // ── Carrier persist: B/L (canonical) and B/L Draft (only if empty) ─────
+      // Writes the normalized carrier key to portix.containers.carrier so the
+      // dashboard can render the container number as a clickable tracking link.
+      // - Final bill_of_lading is canonical → unconditional update.
+      // - bl_draft only fills when carrier IS NULL (don't downgrade a confirmed B/L).
+      if (
+        anySuccess &&
+        (doc.document_type === "bill_of_lading" || doc.document_type === "bl_draft")
+      ) {
+        const normalizedCarrier = normalizeCarrier(doc.carrier);
+        if (normalizedCarrier) {
+          for (const cid of targetIds) {
+            let q = supabaseAdmin
+              .from("containers")
+              .update({ carrier: normalizedCarrier })
+              .eq("id", cid);
+
+            if (doc.document_type === "bl_draft") {
+              q = q.is("carrier", null);
+            }
+
+            const { error: carrierErr } = await q;
+            if (carrierErr) {
+              console.warn(
+                `[classify-documents] carrier update failed (${cid}):`,
+                carrierErr.message,
+              );
+            } else {
+              console.log(
+                `[classify-documents] carrier=${normalizedCarrier} written to container ${cid} via ${doc.document_type}`,
+              );
+            }
+          }
         }
       }
 

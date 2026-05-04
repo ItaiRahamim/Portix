@@ -791,6 +791,7 @@ export async function createShipmentWithContainers(opts: {
     portOfLoading?: string;     // optional — fallback handled in RPC
     portOfDestination?: string; // optional — fallback handled in RPC
     temperatureSetting?: string;
+    carrier?: string | null;    // normalized carrier key from parse-shipment AI
   }[];
 }): Promise<CreateShipmentResult | null> {
   const supabase = createBrowserSupabaseClient();
@@ -815,6 +816,7 @@ export async function createShipmentWithContainers(opts: {
       port_of_loading:     c.portOfLoading     ?? firstContainer?.portOfLoading     ?? "",
       port_of_destination: c.portOfDestination ?? firstContainer?.portOfDestination ?? "",
       temperature_setting: c.temperatureSetting ?? "",
+      carrier:             c.carrier ?? "",
     })),
   });
 
