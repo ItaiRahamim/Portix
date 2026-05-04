@@ -664,6 +664,10 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const [rejectDoc, setRejectDoc] = useState<Document | null>(null);
   const [advancingStatus, setAdvancingStatus] = useState(false);
 
+  // Row-level direct upload (no modal)
+  const rowFileInputsRef = useRef<Map<string, HTMLInputElement>>(new Map());
+  const [uploadingRows, setUploadingRows] = useState<Set<string>>(new Set());
+
   const loadData = useCallback(async () => {
     setLoading(true);
     const [c, d] = await Promise.all([
@@ -711,6 +715,44 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       window.open(url, "_blank", "noopener,noreferrer");
     } else {
       toast.error("Could not generate a view link. Please try again.");
+    }
+  }
+
+  async function handleRowUpload(file: File, docType: DocumentType) {
+    if (!container) return;
+    setUploadingRows((prev) => new Set(prev).add(docType));
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("containerId", container.id);
+      form.append("forcedDocType", docType);
+
+      const supabase = createBrowserSupabaseClient();
+      const { data: body, error: fnError } = await supabase.functions.invoke(
+        "classify-documents",
+        { body: form },
+      );
+
+      if (fnError) {
+        toast.error(fnError.message ?? "Upload failed");
+        return;
+      }
+
+      const results: ClassifyResult[] = body?.results ?? [];
+      if (results.some((r) => r.success)) {
+        toast.success(`${DOCUMENT_TYPE_LABELS[docType]} uploaded successfully.`);
+        loadData();
+      } else {
+        toast.error("Upload failed. Please try again.");
+      }
+    } catch {
+      toast.error("Upload failed.");
+    } finally {
+      setUploadingRows((prev) => {
+        const next = new Set(prev);
+        next.delete(docType);
+        return next;
+      });
     }
   }
 
@@ -1046,22 +1088,56 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                       ) : <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
                     <TableCell>
-                      {/* Supplier Actions */}
+                      {/* Supplier Actions — direct file picker, no modal */}
                       {role === "supplier" && doc.status === "missing" && (
-                        <Button
-                          variant="outline" size="sm"
-                          onClick={() => { setUploadPreselect({ docType: doc.document_type }); setUploadOpen(true); }}
-                        >
-                          <Upload className="w-3.5 h-3.5 mr-1" />Upload
-                        </Button>
+                        <>
+                          <input
+                            type="file"
+                            hidden
+                            accept=".pdf,.jpg,.jpeg,.png,.webp"
+                            ref={(el) => { if (el) rowFileInputsRef.current.set(doc.document_type, el); }}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) handleRowUpload(f, doc.document_type);
+                              e.target.value = "";
+                            }}
+                          />
+                          <Button
+                            variant="outline" size="sm"
+                            disabled={uploadingRows.has(doc.document_type)}
+                            onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
+                          >
+                            {uploadingRows.has(doc.document_type)
+                              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                              : <Upload className="w-3.5 h-3.5 mr-1" />}
+                            {uploadingRows.has(doc.document_type) ? "Uploading…" : "Upload"}
+                          </Button>
+                        </>
                       )}
                       {role === "supplier" && doc.status === "rejected" && (
-                        <Button
-                          variant="outline" size="sm" className="text-red-600 border-red-200"
-                          onClick={() => { setUploadPreselect({ docType: doc.document_type, isReplacement: true }); setUploadOpen(true); }}
-                        >
-                          <Upload className="w-3.5 h-3.5 mr-1" />Replace
-                        </Button>
+                        <>
+                          <input
+                            type="file"
+                            hidden
+                            accept=".pdf,.jpg,.jpeg,.png,.webp"
+                            ref={(el) => { if (el) rowFileInputsRef.current.set(doc.document_type, el); }}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) handleRowUpload(f, doc.document_type);
+                              e.target.value = "";
+                            }}
+                          />
+                          <Button
+                            variant="outline" size="sm" className="text-red-600 border-red-200"
+                            disabled={uploadingRows.has(doc.document_type)}
+                            onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
+                          >
+                            {uploadingRows.has(doc.document_type)
+                              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                              : <Upload className="w-3.5 h-3.5 mr-1" />}
+                            {uploadingRows.has(doc.document_type) ? "Uploading…" : "Replace"}
+                          </Button>
+                        </>
                       )}
                       {role === "supplier" && doc.status !== "missing" && doc.status !== "rejected" && (
                         <span className="text-xs text-gray-400">—</span>

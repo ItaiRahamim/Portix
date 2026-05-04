@@ -243,13 +243,75 @@ serve(async (req) => {
       );
     }
 
-    const file        = formData.get("file") as File | null;
-    const containerId = formData.get("containerId") as string | null;
+    const file          = formData.get("file") as File | null;
+    const containerId   = formData.get("containerId") as string | null;
+    const forcedDocType = formData.get("forcedDocType") as string | null;
 
     if (!file || !containerId) {
       return new Response(
         JSON.stringify({ error: "file and containerId are required" }),
         { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } },
+      );
+    }
+
+    // ── Forced assignment: row-level upload — skip AI classification ──────────
+    // Triggered when the supplier clicks Upload/Replace on a specific document row.
+    // We know the target document_type, so no Gemini round-trip needed.
+    if (forcedDocType && VALID_DOC_TYPES.has(forcedDocType)) {
+      const arrayBuffer = await file.arrayBuffer();
+      const mimeType    = resolvedMime(file.name, file.type);
+
+      console.log(`[classify-documents] Forced type: ${forcedDocType}, ${file.size} bytes`);
+
+      // Resolve shipment_id for storage path
+      const { data: cRow } = await supabaseAdmin
+        .from("containers")
+        .select("shipment_id")
+        .eq("id", containerId)
+        .single();
+
+      const shipmentId  = cRow?.shipment_id ?? containerId;
+      const safeName    = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const storagePath = `smart_uploads/${shipmentId}/${Date.now()}_${safeName}`;
+
+      const { error: uploadErr } = await supabaseAdmin.storage
+        .from("documents")
+        .upload(storagePath, arrayBuffer, { contentType: mimeType, upsert: true });
+
+      if (uploadErr) console.warn("[classify-documents] Storage upload failed:", uploadErr.message);
+      const finalPath = uploadErr ? null : storagePath;
+
+      // Patch exact row — allow replacing rejected docs too (Replace button path)
+      const { error: dbErr } = await supabaseAdmin
+        .from("documents")
+        .update({
+          status:           "uploaded",
+          storage_path:     finalPath,
+          file_name:        file.name,
+          file_size_bytes:  file.size,
+          mime_type:        mimeType,
+          uploaded_at:      new Date().toISOString(),
+          rejection_reason: null,
+          reviewed_by:      null,
+          reviewed_at:      null,
+        })
+        .eq("container_id",  containerId)
+        .eq("document_type", forcedDocType)
+        .in("status",        ["missing", "uploaded", "rejected"]);
+
+      if (dbErr) console.warn("[classify-documents] Forced DB update failed:", dbErr.message);
+      const success = !dbErr;
+
+      const resultItem = { document_type: forcedDocType, container_number: null, success };
+      return new Response(
+        JSON.stringify({
+          ok:           true,
+          results:      [resultItem],
+          success:      success ? [resultItem] : [],
+          failed:       success ? [] : [resultItem],
+          storage_path: finalPath,
+        }),
+        { headers: { "Content-Type": "application/json", ...corsHeaders } },
       );
     }
 
