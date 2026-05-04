@@ -24,7 +24,7 @@ import { DashboardLayout } from "@/components/dashboard-layout";
 import { DocStatusBadge, ContainerStatusBadge } from "@/components/status-badge";
 import { DocumentUploadModal } from "@/components/document-upload-modal";
 import { RejectDocumentModal } from "@/components/reject-document-modal";
-import { DOCUMENT_TYPE_LABELS } from "@/lib/supabase";
+import { DOCUMENT_TYPE_LABELS, DUAL_APPROVAL_DOC_TYPES } from "@/lib/supabase";
 import type { Document, DocumentType, ContainerView } from "@/lib/supabase";
 import {
   getContainerById,
@@ -35,6 +35,8 @@ import {
   updateContainerStatus,
   updateContainerDates,
   getCurrentUserId,
+  approveDocumentAsImporter,
+  approveDocumentAsAgent,
   type CargoMedia,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
@@ -682,13 +684,25 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   useEffect(() => { loadData(); }, [loadData]);
 
   async function handleApproveDoc(doc: Document) {
-    const userId = await getCurrentUserId();
-    const ok = await updateDocumentStatus(doc.id, "approved", { reviewedBy: userId });
+    // Dual-approval docs: agent sets agent_approved_at; DB trigger auto-approves when both set
+    const ok = DUAL_APPROVAL_DOC_TYPES.has(doc.document_type)
+      ? await approveDocumentAsAgent(doc.id)
+      : await updateDocumentStatus(doc.id, "approved", { reviewedBy: await getCurrentUserId() });
     if (ok) {
       toast.success(`${DOCUMENT_TYPE_LABELS[doc.document_type]} approved.`);
       loadData();
     } else {
       toast.error("Failed to approve document.");
+    }
+  }
+
+  async function handleImporterApproveDoc(doc: Document) {
+    const ok = await approveDocumentAsImporter(doc.id);
+    if (ok) {
+      toast.success(`${DOCUMENT_TYPE_LABELS[doc.document_type]} — your approval recorded.`);
+      loadData();
+    } else {
+      toast.error("Failed to record approval.");
     }
   }
 
@@ -1051,12 +1065,36 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {docs.map((doc) => (
+                {docs.map((doc) => {
+                  // Compute dual-approval intermediate label (only for bl_draft / proforma_invoice)
+                  const isDualApproval = DUAL_APPROVAL_DOC_TYPES.has(doc.document_type);
+                  const dualLabel: string | null = (() => {
+                    if (!isDualApproval || doc.status === "approved" || doc.status === "missing") return null;
+                    if (doc.importer_approved_at && !doc.agent_approved_at) return "Awaiting Agent";
+                    if (!doc.importer_approved_at && doc.agent_approved_at) return "Awaiting Importer";
+                    return null;
+                  })();
+                  return (
                   <TableRow key={doc.id}>
                     <TableCell className="text-sm font-medium">
-                      {DOCUMENT_TYPE_LABELS[doc.document_type] ?? doc.document_type}
+                      <div className="flex items-center gap-1.5">
+                        {DOCUMENT_TYPE_LABELS[doc.document_type] ?? doc.document_type}
+                        {isDualApproval && (
+                          <span className="text-[10px] px-1 py-0.5 rounded bg-purple-100 text-purple-700 border border-purple-200 leading-none">
+                            Dual
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
-                    <TableCell><DocStatusBadge status={doc.status} /></TableCell>
+                    <TableCell>
+                      {dualLabel ? (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs border bg-purple-50 text-purple-700 border-purple-200">
+                          {dualLabel}
+                        </span>
+                      ) : (
+                        <DocStatusBadge status={doc.status} />
+                      )}
+                    </TableCell>
                     <TableCell className="text-sm text-gray-500">
                       {doc.uploaded_at
                         ? new Date(doc.uploaded_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
@@ -1146,12 +1184,21 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                       {/* Customs Agent Actions */}
                       {role === "customs-agent" && (doc.status === "uploaded" || doc.status === "under_review") && (
                         <div className="flex gap-1">
-                          <Button
-                            variant="outline" size="sm" className="text-green-600 border-green-200"
-                            onClick={() => handleApproveDoc(doc)}
-                          >
-                            <CheckCircle className="w-3.5 h-3.5 mr-1" />Approve
-                          </Button>
+                          {/* Dual-approval: only show Approve if agent hasn't approved yet */}
+                          {(!isDualApproval || !doc.agent_approved_at) && (
+                            <Button
+                              variant="outline" size="sm" className="text-green-600 border-green-200"
+                              onClick={() => handleApproveDoc(doc)}
+                            >
+                              <CheckCircle className="w-3.5 h-3.5 mr-1" />
+                              {isDualApproval ? "Approve (Agent)" : "Approve"}
+                            </Button>
+                          )}
+                          {isDualApproval && doc.agent_approved_at && (
+                            <span className="text-xs text-green-600 flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" />Agent approved
+                            </span>
+                          )}
                           <Button
                             variant="outline" size="sm" className="text-red-600 border-red-200"
                             onClick={() => setRejectDoc(doc)}
@@ -1164,11 +1211,34 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                         <span className="text-xs text-gray-400">—</span>
                       )}
 
-                      {/* Importer (read-only) */}
-                      {role === "importer" && <span className="text-xs text-gray-400">—</span>}
+                      {/* Importer — read-only for standard docs; Approve button for dual-approval docs */}
+                      {role === "importer" && !isDualApproval && (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
+                      {role === "importer" && isDualApproval && (
+                        <>
+                          {doc.status !== "missing" && doc.status !== "approved" && !doc.importer_approved_at && (
+                            <Button
+                              variant="outline" size="sm" className="text-green-600 border-green-200"
+                              onClick={() => handleImporterApproveDoc(doc)}
+                            >
+                              <CheckCircle className="w-3.5 h-3.5 mr-1" />Approve (Importer)
+                            </Button>
+                          )}
+                          {doc.importer_approved_at && doc.status !== "approved" && (
+                            <span className="text-xs text-green-600 flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" />You approved
+                            </span>
+                          )}
+                          {(doc.status === "missing" || doc.status === "approved") && (
+                            <span className="text-xs text-gray-400">—</span>
+                          )}
+                        </>
+                      )}
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>

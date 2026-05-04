@@ -175,12 +175,10 @@ const VALID_DOC_TYPES = new Set([
   "bl_draft",
 ]);
 
-// These types are NOT pre-seeded as "missing" rows when a container is created.
-// On first detection, classify-documents will INSERT the row instead of updating.
+// Supplementary types are NOT pre-seeded as "missing" rows.
+// eur_1 / proforma_invoice / bl_draft are now MANDATORY (seeded by trigger/RPC)
+// so they are NOT listed here — UPDATE path handles them correctly.
 const SUPPLEMENTARY_DOC_TYPES = new Set([
-  "eur_1",
-  "proforma_invoice",
-  "bl_draft",
   "customs_declaration",
   "inspection_certificate",
   "dangerous_goods_declaration",

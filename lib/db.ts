@@ -196,6 +196,54 @@ export async function updateDocumentStatus(
   return true;
 }
 
+// ── Dual-approval functions ────────────────────────────────────────────────────
+// Used for bl_draft and proforma_invoice which need sign-off from both
+// the importer AND the customs agent. The DB trigger (handle_dual_approval)
+// auto-sets status = 'under_review' (one party) or 'approved' (both parties).
+
+export async function approveDocumentAsImporter(documentId: string): Promise<boolean> {
+  const profile = await getCurrentProfile();
+  if (profile?.role !== "importer") {
+    console.error("[db] approveDocumentAsImporter: permission denied — only importer");
+    return false;
+  }
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("documents")
+    .update({ importer_approved_at: new Date().toISOString() })
+    .eq("id", documentId);
+  if (error) {
+    console.error("[db] approveDocumentAsImporter:", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function approveDocumentAsAgent(
+  documentId: string,
+  opts?: { internalNote?: string | null }
+): Promise<boolean> {
+  const profile = await getCurrentProfile();
+  if (profile?.role !== "customs_agent" && profile?.role !== "customs") {
+    console.error("[db] approveDocumentAsAgent: permission denied — only customs agent");
+    return false;
+  }
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("documents")
+    .update({
+      agent_approved_at: new Date().toISOString(),
+      reviewed_by:       profile.id,
+      internal_note:     opts?.internalNote ?? null,
+    })
+    .eq("id", documentId);
+  if (error) {
+    console.error("[db] approveDocumentAsAgent:", error.message);
+    return false;
+  }
+  return true;
+}
+
 export async function uploadDocumentRecord(opts: {
   containerId: string;
   documentType: DocumentType;

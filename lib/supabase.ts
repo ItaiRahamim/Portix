@@ -154,6 +154,9 @@ export interface Document {
   created_at: string
   updated_at: string
   ai_data: Record<string, unknown> | null // raw AI extraction from Make classify_documents
+  // Dual-approval fields (only used for bl_draft + proforma_invoice)
+  importer_approved_at: string | null
+  agent_approved_at: string | null
 }
 
 export interface DocumentWithInternalNote extends Document {
@@ -262,7 +265,14 @@ export const REQUIRED_DOCUMENT_TYPES: DocumentType[] = [
   'certificate_of_origin',
   'cooling_report',
   'insurance_certificate',
+  'eur_1',
+  'proforma_invoice',
+  'bl_draft',
 ]
+
+// Doc types that require approval from BOTH the importer AND the customs agent.
+// DB trigger (handle_dual_approval) auto-sets status based on importer_approved_at + agent_approved_at.
+export const DUAL_APPROVAL_DOC_TYPES = new Set<DocumentType>(['bl_draft', 'proforma_invoice'])
 
 export const DOCUMENT_TYPE_LABELS: Record<DocumentType, string> = {
   commercial_invoice: 'Commercial Invoice',
