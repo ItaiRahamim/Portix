@@ -170,6 +170,21 @@ const VALID_DOC_TYPES = new Set([
   "certificate_of_origin",
   "cooling_report",
   "insurance_certificate",
+  "eur_1",
+  "proforma_invoice",
+  "bl_draft",
+]);
+
+// These types are NOT pre-seeded as "missing" rows when a container is created.
+// On first detection, classify-documents will INSERT the row instead of updating.
+const SUPPLEMENTARY_DOC_TYPES = new Set([
+  "eur_1",
+  "proforma_invoice",
+  "bl_draft",
+  "customs_declaration",
+  "inspection_certificate",
+  "dangerous_goods_declaration",
+  "import_license_doc",
 ]);
 
 // ── Classification prompt ──────────────────────────────────────────────────────
@@ -182,7 +197,18 @@ Task: Identify every document type present and extract its specific metadata.
 CRITICAL RULES:
 1. Output RAW JSON ONLY. No markdown.
 2. For "document_type", you MUST use ONLY these exact allowed values:
-   'commercial_invoice', 'packing_list', 'phytosanitary_certificate', 'bill_of_lading', 'certificate_of_origin', 'cooling_report', 'insurance_certificate', 'customs_declaration', 'other'.
+   'commercial_invoice'        — standard commercial invoice from seller to buyer
+   'proforma_invoice'          — preliminary invoice issued before shipment (pre-shipment phase)
+   'packing_list'              — itemized list of package contents and weights
+   'phytosanitary_certificate' — plant health certificate issued by agricultural authority
+   'bill_of_lading'            — original B/L issued by shipping line after loading
+   'bl_draft'                  — draft B/L sent for importer approval before final issuance
+   'certificate_of_origin'     — country-of-origin declaration (generic)
+   'eur_1'                     — EUR.1 movement certificate for preferential EU tariff treatment
+   'cooling_report'            — reefer/temperature monitoring report
+   'insurance_certificate'     — cargo insurance certificate
+   'customs_declaration'       — customs export/import declaration (e.g. EXA, SAD)
+   'other'                     — anything not matching the above
 
 Return a JSON object with this EXACT structure:
 {
@@ -497,20 +523,48 @@ serve(async (req) => {
 
       let anySuccess = false;
       for (const cid of targetIds) {
-        const { error: dbErr } = await supabaseAdmin
+        // Try UPDATE first — only touches rows that aren't yet approved/rejected.
+        const { data: updated, error: dbErr } = await supabaseAdmin
           .from("documents")
           .update(patch)
-          .eq("container_id",   cid)
-          .eq("document_type",  doc.document_type)
-          .in("status",         ["missing", "uploaded"]);  // never overwrite approved/rejected
+          .eq("container_id",  cid)
+          .eq("document_type", doc.document_type)
+          .in("status",        ["missing", "uploaded"])   // never overwrite approved/rejected
+          .select("id");
 
         if (dbErr) {
           console.warn(
             `[classify-documents] DB update failed (${doc.document_type}/${cid}):`,
             dbErr.message,
           );
-        } else {
+        } else if (updated && updated.length > 0) {
           anySuccess = true;
+        } else if (SUPPLEMENTARY_DOC_TYPES.has(doc.document_type)) {
+          // UPDATE returned 0 rows — row doesn't exist yet (supplementary type not pre-seeded).
+          // Verify it genuinely doesn't exist (vs. being approved/rejected — leave those alone).
+          const { data: existing } = await supabaseAdmin
+            .from("documents")
+            .select("id")
+            .eq("container_id",  cid)
+            .eq("document_type", doc.document_type)
+            .maybeSingle();
+
+          if (!existing) {
+            const { error: insertErr } = await supabaseAdmin
+              .from("documents")
+              .insert({ ...patch, container_id: cid, document_type: doc.document_type });
+
+            if (insertErr) {
+              console.warn(
+                `[classify-documents] INSERT failed (${doc.document_type}/${cid}):`,
+                insertErr.message,
+              );
+            } else {
+              anySuccess = true;
+              console.log(`[classify-documents] Created new supplementary row: ${doc.document_type}/${cid}`);
+            }
+          }
+          // If row exists but is approved/rejected → skip (correct behavior)
         }
       }
 

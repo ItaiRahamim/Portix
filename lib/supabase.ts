@@ -65,6 +65,9 @@ export type DocumentType =
   | 'inspection_certificate'
   | 'dangerous_goods_declaration'
   | 'import_license_doc'
+  | 'eur_1'
+  | 'proforma_invoice'
+  | 'bl_draft'
   | 'other'
 
 export type DocumentStatus = 'missing' | 'uploaded' | 'under_review' | 'approved' | 'rejected'
@@ -272,6 +275,9 @@ export const DOCUMENT_TYPE_LABELS: Record<DocumentType, string> = {
   inspection_certificate: 'Inspection Certificate',
   dangerous_goods_declaration: 'Dangerous Goods Declaration',
   import_license_doc: 'Import License',
+  eur_1: 'EUR.1 Movement Certificate',
+  proforma_invoice: 'Proforma Invoice',
+  bl_draft: 'B/L Draft',
   other: 'Other',
 }
 
