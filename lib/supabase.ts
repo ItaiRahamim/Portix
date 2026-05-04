@@ -263,7 +263,6 @@ export const REQUIRED_DOCUMENT_TYPES: DocumentType[] = [
   'phytosanitary_certificate',
   'bill_of_lading',
   'certificate_of_origin',
-  'cooling_report',
   'eur_1',
   'proforma_invoice',
   'bl_draft',
