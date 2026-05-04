@@ -176,9 +176,11 @@ const VALID_DOC_TYPES = new Set([
 ]);
 
 // Supplementary types are NOT pre-seeded as "missing" rows.
-// eur_1 / proforma_invoice / bl_draft are now MANDATORY (seeded by trigger/RPC)
-// so they are NOT listed here — UPDATE path handles them correctly.
+// eur_1 / proforma_invoice / bl_draft are MANDATORY (seeded by trigger/RPC).
+// insurance_certificate is now supplementary — AI still recognises and stores it,
+// but it won't block clearance or appear as a missing row.
 const SUPPLEMENTARY_DOC_TYPES = new Set([
+  "insurance_certificate",
   "customs_declaration",
   "inspection_certificate",
   "dangerous_goods_declaration",

@@ -264,7 +264,6 @@ export const REQUIRED_DOCUMENT_TYPES: DocumentType[] = [
   'bill_of_lading',
   'certificate_of_origin',
   'cooling_report',
-  'insurance_certificate',
   'eur_1',
   'proforma_invoice',
   'bl_draft',
