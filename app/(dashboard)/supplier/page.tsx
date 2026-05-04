@@ -10,7 +10,7 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
-import { FileWarning, XCircle, Upload, AlertTriangle, Eye, Plus, Filter } from "lucide-react";
+import { FileWarning, XCircle, Upload, AlertTriangle, Eye, Plus, Filter, ExternalLink } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
@@ -177,24 +177,27 @@ export default function SupplierDashboardPage() {
                         onClick={() => router.push(`/supplier/containers/${c.id}`)}
                       >
                         <TableCell className="whitespace-nowrap font-mono text-sm">{c.bill_of_lading_number ?? <span className="text-gray-400">—</span>}</TableCell>
-                        <TableCell className="whitespace-nowrap font-medium">
-                          {(() => {
-                            const link = getTrackingLink(c.carrier, c.container_number);
-                            return link ? (
-                              <a
-                                href={link}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-blue-600 hover:underline"
-                                onClick={(e) => e.stopPropagation()}
-                                title={`Track on ${c.carrier} carrier site`}
-                              >
-                                {c.container_number}
-                              </a>
-                            ) : (
-                              c.container_number
-                            );
-                          })()}
+                        <TableCell className="whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-medium">{c.container_number}</span>
+                            {(() => {
+                              const link = getTrackingLink(c.carrier, c.container_number);
+                              if (!link) return null;
+                              return (
+                                <a
+                                  href={link}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title={`Track on ${c.carrier} carrier site`}
+                                  className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-xs text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-colors"
+                                >
+                                  <ExternalLink className="h-3 w-3" />
+                                  Track
+                                </a>
+                              );
+                            })()}
+                          </div>
                         </TableCell>
                         <TableCell className="text-sm">{c.importer_company}</TableCell>
                         <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>

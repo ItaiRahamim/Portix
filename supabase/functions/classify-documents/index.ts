@@ -237,7 +237,7 @@ CRITICAL RULES:
    'insurance_certificate'     — cargo insurance certificate
    'customs_declaration'       — customs export/import declaration (e.g. EXA, SAD)
    'other'                     — anything not matching the above
-3. For "carrier", extract the shipping line / ocean carrier name (e.g. "MSC", "Maersk", "ZIM", "Hapag-Lloyd", "CMA CGM", "Evergreen", "COSCO", "ONE"). Look at the carrier logo / header / footer. ONLY meaningful for 'bill_of_lading' and 'bl_draft' — return null for all other document types or when not visible.
+3. For "carrier": String. The shipping line / carrier that issued the document (e.g., ZIM, MSC, Maersk). IMPORTANT: Look at the main logo/header of the document or the B/L number prefix. Do NOT confuse the carrier with the Vessel name (e.g., if the document is issued by ZIM but the vessel is 'MSC LORETTA', the carrier is 'ZIM'). ONLY meaningful for 'bill_of_lading' and 'bl_draft' — return null for all other document types or when not visible.
 
 Return a JSON object with this EXACT structure:
 {
@@ -247,7 +247,7 @@ Return a JSON object with this EXACT structure:
       "document_number": "String (e.g., Invoice Number, BL Number, or Certificate Number. null if not found)",
       "issue_date": "YYYY-MM-DD (null if not found)",
       "container_number": "String. CRITICAL: Look for the specific container number (e.g., MSKU1234567) this document refers to. If the document applies to ALL containers or no specific container is listed, return 'ALL'",
-      "carrier": "String. Shipping line / carrier name. Only for bill_of_lading and bl_draft. null otherwise.",
+      "carrier": "String. The shipping line / carrier that issued the document (e.g., ZIM, MSC, Maersk). IMPORTANT: Look at the main logo/header of the document or the B/L number prefix. Do NOT confuse the carrier with the Vessel name (e.g., if the document is issued by ZIM but the vessel is 'MSC LORETTA', the carrier is 'ZIM'). ONLY for bill_of_lading and bl_draft. null for all other types or when not visible.",
       "extractedData": {
         "supplierName": "String",
         "totalAmount": Number,

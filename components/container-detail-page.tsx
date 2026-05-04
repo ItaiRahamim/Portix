@@ -11,7 +11,7 @@ import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
-  Pencil,
+  Pencil, ExternalLink,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
@@ -851,10 +851,11 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
             <div>
               <p className="text-gray-500 text-xs">Container Number</p>
-              <p className="mt-0.5 font-medium">
+              <div className="mt-0.5 flex items-center gap-1.5">
+                <span className="font-medium">{container.container_number}</span>
                 {(() => {
                   const link = getTrackingLink(container.carrier, container.container_number);
-                  if (!link) return container.container_number;
+                  if (!link) return null;
                   const label = container.carrier
                     ? CARRIER_LABELS[container.carrier as CarrierKey] ?? container.carrier
                     : "carrier";
@@ -863,14 +864,15 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                       href={link}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-blue-600 hover:underline"
                       title={`Track on ${label}`}
+                      className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-xs text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-colors"
                     >
-                      {container.container_number}
+                      <ExternalLink className="h-3 w-3" />
+                      Track
                     </a>
                   );
                 })()}
-              </p>
+              </div>
             </div>
             <div>
               <p className="text-gray-500 text-xs">Shipment</p>

@@ -137,7 +137,7 @@ CRITICAL RULES:
 2. If a value is not found, return null (for strings) or empty string (for enums).
 3. Dates MUST be in ISO format (YYYY-MM-DD).
 4. For "totalAmount", extract the grand total of the document. Numeric only.
-5. For "carrier", extract the shipping line / ocean carrier name from the carrier logo, header, or footer of the document (e.g. "MSC", "Maersk", "ZIM", "Hapag-Lloyd", "CMA CGM", "Evergreen", "COSCO", "ONE"). Return null if unclear or not a carrier-issued document.
+5. For "carrier": String. The shipping line / carrier that issued the document (e.g., ZIM, MSC, Maersk). IMPORTANT: Look at the main logo/header of the document or the B/L number prefix. Do NOT confuse the carrier with the Vessel name (e.g., if the document is issued by ZIM but the vessel is 'MSC LORETTA', the carrier is 'ZIM'). null if unclear.
 
 Return a JSON object with this EXACT structure:
 {
@@ -148,7 +148,7 @@ Return a JSON object with this EXACT structure:
     "currency": "String",
     "vesselName": "String",
     "voyageNumber": "String",
-    "carrier": "String. Shipping line / ocean carrier name. null if not visible.",
+    "carrier": "String. The shipping line / carrier that issued the document (e.g., ZIM, MSC, Maersk). IMPORTANT: Look at the main logo/header of the document or the B/L number prefix. Do NOT confuse the carrier with the Vessel name (e.g., if the document is issued by ZIM but the vessel is 'MSC LORETTA', the carrier is 'ZIM'). null if unclear.",
     "etd": "YYYY-MM-DD",
     "eta": "YYYY-MM-DD",
     "originCountry": "String",
