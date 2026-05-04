@@ -141,8 +141,8 @@ export default function ImporterDashboardPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>Bill of Lading</TableHead>
                     <TableHead>Container</TableHead>
-                    <TableHead>Shipment</TableHead>
                     <TableHead>Supplier</TableHead>
                     <TableHead>Product</TableHead>
                     <TableHead>Vessel</TableHead>
@@ -178,8 +178,8 @@ export default function ImporterDashboardPage() {
                           className="cursor-pointer hover:bg-gray-50"
                           onClick={() => router.push(`/importer/containers/${c.id}`)}
                         >
+                          <TableCell className="whitespace-nowrap font-mono text-sm">{c.bill_of_lading_number ?? <span className="text-gray-400">—</span>}</TableCell>
                           <TableCell className="whitespace-nowrap font-medium">{c.container_number}</TableCell>
-                          <TableCell className="whitespace-nowrap text-sm text-gray-500">{c.shipment_number}</TableCell>
                           <TableCell className="text-sm">{c.supplier_company}</TableCell>
                           <TableCell className="text-sm max-w-[130px] truncate">{c.product_name}</TableCell>
                           <TableCell className="text-sm">{c.vessel_name}</TableCell>

@@ -131,6 +131,7 @@ export interface ContainerView extends Container {
   customs_agent_id: string | null   // UUID of the assigned customs agent (from shipments join)
   importer_company: string
   supplier_company: string
+  bill_of_lading_number: string | null  // document_number from bill_of_lading doc row (null until uploaded)
 }
 
 export interface Document {
