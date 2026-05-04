@@ -65,6 +65,19 @@ interface TimelineStep {
   description: string;
 }
 
+// Chronological import process order for the Document Checklist table.
+// Supplementary / unlisted types fall to the bottom (rank = Infinity).
+const DOC_DISPLAY_ORDER: Record<string, number> = {
+  proforma_invoice:           1,
+  bl_draft:                   2,
+  commercial_invoice:         3,
+  packing_list:               4,
+  bill_of_lading:             5,
+  certificate_of_origin:      6,
+  phytosanitary_certificate:  7,
+  eur_1:                      8,
+};
+
 // Order reflects real-world logistics: docs must be approved BEFORE arrival
 // to avoid storage fees at destination port.
 const TIMELINE_STEPS: TimelineStep[] = [
@@ -1065,7 +1078,12 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {docs.map((doc) => {
+                {[...docs]
+                  .sort((a, b) =>
+                    (DOC_DISPLAY_ORDER[a.document_type] ?? Infinity) -
+                    (DOC_DISPLAY_ORDER[b.document_type] ?? Infinity)
+                  )
+                  .map((doc) => {
                   // Compute dual-approval intermediate label (only for bl_draft / proforma_invoice)
                   const isDualApproval = DUAL_APPROVAL_DOC_TYPES.has(doc.document_type);
                   const dualLabel: string | null = (() => {
