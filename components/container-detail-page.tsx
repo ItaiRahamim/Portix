@@ -45,6 +45,7 @@ import { getTrackingLink, CARRIER_LABELS } from "@/lib/tracking";
 import type { CarrierKey } from "@/lib/tracking";
 import { toast } from "sonner";
 import { EditContainerDialog } from "@/components/edit-container-dialog";
+import { ActivityLog } from "@/components/activity-log";
 
 interface ContainerDetailPageProps {
   role: "importer" | "supplier" | "customs-agent";
@@ -1302,6 +1303,9 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       {role !== "customs-agent" && (
         <CargoPhotosSection containerId={container.id} role={role as "importer" | "supplier"} />
       )}
+
+      {/* Activity Log — audit trail for all roles */}
+      <ActivityLog containerId={container.id} />
 
       {/* Modals */}
       <DocumentUploadModal

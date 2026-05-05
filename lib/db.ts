@@ -106,12 +106,79 @@ export async function updateContainerStatus(
   return true;
 }
 
+// ─── Activity Log ─────────────────────────────────────────────────────────────
+
+export interface ActivityLog {
+  id: string;
+  container_id: string;
+  actor: string;
+  action: string;
+  details: string | null;
+  created_at: string;
+}
+
+/**
+ * Append an entry to portix.activity_logs.
+ * Actor is resolved automatically from the current user's profile (full_name + role).
+ * Never throws — failure is logged to console only (audit log is best-effort).
+ */
+export async function logActivity(
+  containerId: string,
+  action: string,
+  details?: string | null,
+): Promise<void> {
+  const supabase = createBrowserSupabaseClient();
+
+  // Resolve current user's display name
+  const { data: { user } } = await supabase.auth.getUser();
+  let actor = "Unknown User";
+  if (user?.id) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("full_name, role")
+      .eq("id", user.id)
+      .single();
+    if (profile) {
+      actor = `${profile.full_name} (${profile.role})`;
+    }
+  }
+
+  const { error } = await supabase
+    .from("activity_logs")
+    .insert({ container_id: containerId, actor, action, details: details ?? null });
+
+  if (error) {
+    console.error("[db] logActivity:", error.message);
+  }
+}
+
+/**
+ * Fetches activity log entries for a container, most recent first.
+ */
+export async function getActivityLogs(containerId: string): Promise<ActivityLog[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("activity_logs")
+    .select("*")
+    .eq("container_id", containerId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getActivityLogs:", error.message);
+    return [];
+  }
+  return (data ?? []) as ActivityLog[];
+}
+
+// ─── Container Details ─────────────────────────────────────────────────────────
+
 /**
  * Updates core AI-extracted fields for a container (manual override).
  * Touches three tables atomically-ish (best-effort — partial failures logged):
  *   - portix.containers  → carrier, etd, eta
  *   - portix.shipments   → vessel_name  (via shipmentId FK)
  *   - portix.documents   → document_number on the bill_of_lading row
+ * After a successful update, appends a MANUAL_UPDATE entry to activity_logs.
  *
  * RLS for containers: importer_id=uid() OR supplier_id=uid().
  * RLS for shipments: created_by=uid() or importer/supplier FK.
@@ -173,6 +240,9 @@ export async function updateContainerDetails(
       return false;
     }
   }
+
+  // 4. Audit log (best-effort — don't fail the whole operation if this fails)
+  await logActivity(containerId, "MANUAL_UPDATE", "Manually updated container details");
 
   return true;
 }
