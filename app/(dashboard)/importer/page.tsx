@@ -22,6 +22,7 @@ import { NewShipmentModal } from "@/components/new-shipment-modal";
 import { getContainers } from "@/lib/db";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
 import { getTrackingLink, CARRIER_LABELS, type CarrierKey } from "@/lib/tracking";
+import { EtaCalendarWidget } from "@/components/eta-calendar-widget";
 
 function daysUntil(dateStr: string): number {
   return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
@@ -223,6 +224,8 @@ export default function ImporterDashboardPage() {
         <KPICard label="Rejected Containers" value={rejectedContainers} icon={XCircle} color="text-red-600" iconColor="text-red-600" />
         <KPICard label="Ready for Clearance" value={readyOrReleased} icon={CheckCircle} color="text-green-600" iconColor="text-green-600" />
       </div>
+
+      <EtaCalendarWidget containers={containers} />
 
       <Card>
         <CardHeader className="pb-3">
