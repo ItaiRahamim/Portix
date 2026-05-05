@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -11,7 +12,8 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import {
-  Ship, FileWarning, Clock, XCircle, CheckCircle, AlertTriangle, Eye, Filter, Plus, ExternalLink,
+  Ship, FileWarning, Clock, XCircle, CheckCircle, AlertTriangle, Eye,
+  Filter, Plus, ExternalLink, LayoutList, LayoutGrid,
 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
@@ -19,7 +21,7 @@ import { ContainerStatusBadge } from "@/components/status-badge";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
 import { getContainers } from "@/lib/db";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
-import { getTrackingLink } from "@/lib/tracking";
+import { getTrackingLink, CARRIER_LABELS, type CarrierKey } from "@/lib/tracking";
 
 function daysUntil(dateStr: string): number {
   return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
@@ -31,6 +33,142 @@ function formatDate(dateStr: string): string {
   });
 }
 
+/** Inline Track badge — shared between table and board views */
+function TrackBadge({ carrier, containerNumber }: { carrier: string | null | undefined; containerNumber: string }) {
+  const link = getTrackingLink(carrier, containerNumber);
+  if (!link) return null;
+  return (
+    <a
+      href={link}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      title={`Track on ${carrier} carrier site`}
+      className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-xs text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-colors"
+    >
+      <ExternalLink className="h-3 w-3" />
+      Track
+    </a>
+  );
+}
+
+/** Bucket containers into 3 Kanban columns. */
+function useBoardBuckets(containers: ContainerView[]) {
+  return useMemo(() => {
+    const missing: ContainerView[] = [];
+    const pending: ContainerView[] = [];
+    const cleared: ContainerView[] = [];
+
+    for (const c of containers) {
+      if (
+        c.status === "documents_missing" ||
+        c.status === "rejected_documents" ||
+        c.status === "claim_open"
+      ) {
+        missing.push(c);
+      } else if (c.status === "waiting_customs_review") {
+        pending.push(c);
+      } else {
+        // ready_for_clearance | in_clearance | released
+        cleared.push(c);
+      }
+    }
+
+    return { missing, pending, cleared };
+  }, [containers]);
+}
+
+interface BoardColumnProps {
+  title: string;
+  count: number;
+  containers: ContainerView[];
+  headerClass: string;
+  onNavigate: (id: string) => void;
+}
+
+function BoardColumn({ title, count, containers, headerClass, onNavigate }: BoardColumnProps) {
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Column header */}
+      <div className={`flex items-center justify-between rounded-lg px-3 py-2 ${headerClass}`}>
+        <span className="text-sm font-semibold">{title}</span>
+        <span className="text-xs font-medium opacity-70">{count}</span>
+      </div>
+
+      {/* Cards */}
+      {containers.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-gray-200 py-8 text-center text-xs text-gray-400">
+          No containers
+        </div>
+      ) : (
+        containers.map((c) => {
+          const daysToArrival = daysUntil(c.eta);
+          const etaUrgent = daysToArrival <= 3 && daysToArrival > 0 && c.status !== "released";
+          const carrierLabel = c.carrier
+            ? (CARRIER_LABELS[c.carrier as CarrierKey] ?? c.carrier.toUpperCase())
+            : null;
+
+          return (
+            <Card
+              key={c.id}
+              className="cursor-pointer shadow-sm hover:shadow-md transition-shadow border border-gray-200"
+              onClick={() => onNavigate(c.id)}
+            >
+              <CardContent className="p-3 space-y-2">
+                {/* Row 1: container number + Track */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="font-medium text-sm">{c.container_number}</span>
+                  <TrackBadge carrier={c.carrier} containerNumber={c.container_number} />
+                </div>
+
+                {/* Row 2: carrier + status badge */}
+                <div className="flex items-center justify-between gap-2">
+                  {carrierLabel ? (
+                    <span className="text-xs text-gray-500">{carrierLabel}</span>
+                  ) : (
+                    <span className="text-xs text-gray-300">—</span>
+                  )}
+                  <ContainerStatusBadge status={c.status} />
+                </div>
+
+                {/* Row 3: doc progress */}
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-green-500 rounded-full"
+                      style={{ width: `${c.docs_total > 0 ? (c.docs_approved / c.docs_total) * 100 : 0}%` }}
+                    />
+                  </div>
+                  <span className="text-xs text-gray-500 whitespace-nowrap">
+                    {c.docs_uploaded}/{c.docs_total} uploaded
+                  </span>
+                </div>
+
+                {/* Row 4: ETA */}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-400">ETA</span>
+                  <span className={etaUrgent ? "text-red-600 font-medium" : "text-gray-600"}>
+                    {formatDate(c.eta)}
+                    {etaUrgent && " ⚡"}
+                  </span>
+                </div>
+
+                {/* Rejected docs alert */}
+                {c.docs_rejected > 0 && (
+                  <div className="flex items-center gap-1 text-xs text-red-600">
+                    <AlertTriangle className="h-3 w-3" />
+                    {c.docs_rejected} doc{c.docs_rejected > 1 ? "s" : ""} rejected
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
 export default function ImporterDashboardPage() {
   const router = useRouter();
   const [containers, setContainers] = useState<ContainerView[]>([]);
@@ -39,6 +177,7 @@ export default function ImporterDashboardPage() {
   const [statusFilter, setStatusFilter] = useState<ContainerStatus | "all">("all");
   const [showFilters, setShowFilters] = useState(false);
   const [newShipmentOpen, setNewShipmentOpen] = useState(false);
+  const [view, setView] = useState<"table" | "board">("table");
 
   const loadContainers = useCallback(async () => {
     setLoading(true);
@@ -60,6 +199,8 @@ export default function ImporterDashboardPage() {
     if (statusFilter !== "all" && c.status !== statusFilter) return false;
     return true;
   });
+
+  const { missing, pending, cleared } = useBoardBuckets(filtered);
 
   const activeContainers = containers.filter((c) => c.status !== "released").length;
   const waitingDocs = containers.filter((c) => c.status === "documents_missing").length;
@@ -85,9 +226,21 @@ export default function ImporterDashboardPage() {
 
       <Card>
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-4 flex-wrap">
             <CardTitle className="text-base">Containers</CardTitle>
             <div className="flex items-center gap-2">
+              {/* View toggle */}
+              <Tabs value={view} onValueChange={(v) => setView(v as "table" | "board")}>
+                <TabsList className="h-8">
+                  <TabsTrigger value="table" className="h-7 px-2.5 gap-1.5 text-xs">
+                    <LayoutList className="h-3.5 w-3.5" /> Table
+                  </TabsTrigger>
+                  <TabsTrigger value="board" className="h-7 px-2.5 gap-1.5 text-xs">
+                    <LayoutGrid className="h-3.5 w-3.5" /> Board
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+
               <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)} className="gap-1.5">
                 <Filter className="w-4 h-4" /> Filters
               </Button>
@@ -137,7 +290,8 @@ export default function ImporterDashboardPage() {
         <CardContent>
           {loading ? (
             <div className="py-12 text-center text-gray-400 text-sm">Loading containers…</div>
-          ) : (
+          ) : view === "table" ? (
+            /* ── Table view ───────────────────────────────────────── */
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -183,23 +337,7 @@ export default function ImporterDashboardPage() {
                           <TableCell className="whitespace-nowrap">
                             <div className="flex items-center gap-1.5">
                               <span className="font-medium">{c.container_number}</span>
-                              {(() => {
-                                const link = getTrackingLink(c.carrier, c.container_number);
-                                if (!link) return null;
-                                return (
-                                  <a
-                                    href={link}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    onClick={(e) => e.stopPropagation()}
-                                    title={`Track on ${c.carrier} carrier site`}
-                                    className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-xs text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-colors"
-                                  >
-                                    <ExternalLink className="h-3 w-3" />
-                                    Track
-                                  </a>
-                                );
-                              })()}
+                              <TrackBadge carrier={c.carrier} containerNumber={c.container_number} />
                             </div>
                           </TableCell>
                           <TableCell className="text-sm">{c.supplier_company}</TableCell>
@@ -251,6 +389,31 @@ export default function ImporterDashboardPage() {
                   )}
                 </TableBody>
               </Table>
+            </div>
+          ) : (
+            /* ── Board view ───────────────────────────────────────── */
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 min-h-[300px]">
+              <BoardColumn
+                title="Missing Documents"
+                count={missing.length}
+                containers={missing}
+                headerClass="bg-red-50 text-red-800 border border-red-200"
+                onNavigate={(id) => router.push(`/importer/containers/${id}`)}
+              />
+              <BoardColumn
+                title="Pending Customs"
+                count={pending.length}
+                containers={pending}
+                headerClass="bg-yellow-50 text-yellow-800 border border-yellow-200"
+                onNavigate={(id) => router.push(`/importer/containers/${id}`)}
+              />
+              <BoardColumn
+                title="Cleared / Released"
+                count={cleared.length}
+                containers={cleared}
+                headerClass="bg-green-50 text-green-800 border border-green-200"
+                onNavigate={(id) => router.push(`/importer/containers/${id}`)}
+              />
             </div>
           )}
         </CardContent>
