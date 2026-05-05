@@ -12,6 +12,9 @@ import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  Accordion, AccordionContent, AccordionItem, AccordionTrigger,
+} from "@/components/ui/accordion";
+import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import {
@@ -137,7 +140,7 @@ export default function CalculatorPage() {
   // ── Section 3: Customs & Local Costs ──
   const [customsCosts, setCustomsCosts] = useState<CustomsCostLine[]>(defaultCustomsCosts());
   const [includeVAT, setIncludeVAT] = useState(true);
-  const VAT_RATE = 17; // Israel VAT
+  const VAT_RATE = 18; // Israel VAT
 
   // ── Section 4: Profit Simulation ──
   const [targetSellingPricePerKg, setTargetSellingPricePerKg] = useState(0);
@@ -333,18 +336,25 @@ export default function CalculatorPage() {
         {/* ── LEFT: Input Sections ── */}
         <div className="flex-1 space-y-4 min-w-0">
 
-          {/* ══════════════ SECTION 1: Shipment Info ══════════════ */}
-          <Card>
-            <CardHeader className="pb-2">
-              <SectionHeader
-                id="shipment"
-                icon={<Ship className="w-4 h-4" />}
-                title="Shipment Information"
-                subtitle="Route, carrier, freight & insurance"
-              />
-            </CardHeader>
-            {!collapsed.shipment && (
-              <CardContent className="space-y-4">
+          {/* ══════════════ SECTION 1: Shipment Metadata (collapsed by default) ══════════════ */}
+          <Accordion type="single" collapsible className="w-full">
+            <AccordionItem
+              value="shipment"
+              className="rounded-xl border bg-card shadow-sm overflow-hidden border-b-0"
+            >
+              <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-gray-50/60 [&>svg]:text-gray-400">
+                <div className="flex items-center gap-3 text-left">
+                  <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 text-blue-600 shrink-0">
+                    <Ship className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900">Shipment Metadata <span className="font-normal text-gray-400">(Optional)</span></p>
+                    <p className="text-xs text-gray-500">Route, carrier, freight &amp; insurance</p>
+                  </div>
+                </div>
+              </AccordionTrigger>
+
+              <AccordionContent className="px-6 pb-5 space-y-4">
                 {/* Route Templates */}
                 <div className="rounded-lg border border-dashed border-blue-200 bg-blue-50/50 p-3 space-y-2">
                   <div className="flex items-center gap-2 text-xs font-medium text-blue-700">
@@ -439,9 +449,9 @@ export default function CalculatorPage() {
                     <Input className="h-9" type="number" min={0} step={0.1} max={10} value={insurancePercent || ""} onChange={(e) => setInsurancePercent(Number(e.target.value))} />
                   </div>
                 </div>
-              </CardContent>
-            )}
-          </Card>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
 
           {/* ══════════════ SECTION 2: Product Details ══════════════ */}
           <Card>
@@ -476,8 +486,8 @@ export default function CalculatorPage() {
                         />
                       </div>
                       <div className="space-y-1">
-                        <Label className="text-xs">HS Code</Label>
-                        <Input className="h-8 text-xs" value={pl.hsCode} onChange={(e) => updateProductLine(pl.id, "hsCode", e.target.value)} placeholder="Auto-filled" />
+                        <Label className="text-[11px] text-gray-400">HS Code <span className="font-normal">(optional)</span></Label>
+                        <Input className="h-8 text-xs text-gray-400 placeholder:text-gray-300" value={pl.hsCode} onChange={(e) => updateProductLine(pl.id, "hsCode", e.target.value)} placeholder="Auto-filled" />
                       </div>
                       <div className="space-y-1">
                         <Label className="text-xs">Quantity (Units)</Label>
