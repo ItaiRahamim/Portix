@@ -58,8 +58,9 @@ export function EditContainerDialog({ container, onSuccess }: Props) {
   const [saving, setSaving] = useState(false);
 
   // Form state — pre-filled from current container data
+  // Carrier uses "_none_" sentinel because Radix Select rejects value=""
   const [blNumber, setBlNumber] = useState(container.bill_of_lading_number ?? "");
-  const [carrier, setCarrier] = useState(container.carrier ?? "");
+  const [carrier, setCarrier] = useState(container.carrier ?? "_none_");
   const [vessel, setVessel] = useState(container.vessel_name ?? "");
   const [etd, setEtd] = useState(toDateInputValue(container.etd));
   const [eta, setEta] = useState(toDateInputValue(container.eta));
@@ -67,7 +68,7 @@ export function EditContainerDialog({ container, onSuccess }: Props) {
   function handleOpen() {
     // Re-sync state with latest container prop when dialog opens
     setBlNumber(container.bill_of_lading_number ?? "");
-    setCarrier(container.carrier ?? "");
+    setCarrier(container.carrier ?? "_none_");
     setVessel(container.vessel_name ?? "");
     setEtd(toDateInputValue(container.etd));
     setEta(toDateInputValue(container.eta));
@@ -84,7 +85,7 @@ export function EditContainerDialog({ container, onSuccess }: Props) {
     setSaving(true);
     const ok = await updateContainerDetails(container.id, container.shipment_id, {
       bill_of_lading_number: blNumber,
-      carrier: carrier || null,
+      carrier: carrier === "_none_" ? null : carrier,
       vessel_name: vessel,
       etd,
       eta,
@@ -133,7 +134,7 @@ export function EditContainerDialog({ container, onSuccess }: Props) {
                   <SelectValue placeholder="Select carrier…" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">Unknown / Not listed</SelectItem>
+                  <SelectItem value="_none_">Unknown / Not listed</SelectItem>
                   {(Object.entries(CARRIER_LABELS) as [CarrierKey, string][]).map(
                     ([key, label]) => (
                       <SelectItem key={key} value={key}>{label}</SelectItem>
