@@ -44,6 +44,7 @@ import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/li
 import { getTrackingLink, CARRIER_LABELS } from "@/lib/tracking";
 import type { CarrierKey } from "@/lib/tracking";
 import { toast } from "sonner";
+import { EditContainerDialog } from "@/components/edit-container-dialog";
 
 interface ContainerDetailPageProps {
   role: "importer" | "supplier" | "customs-agent";
@@ -955,6 +956,14 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <div className="mt-4 pt-4 border-t flex items-center gap-3 flex-wrap">
             <span className="text-xs text-gray-500">Status:</span>
             <ContainerStatusBadge status={container.status} />
+
+            {/* Manual override — importer and supplier only */}
+            {(role === "importer" || role === "supplier") && (
+              <EditContainerDialog
+                container={container}
+                onSuccess={loadData}
+              />
+            )}
 
             {/* Customs agent: advance container through clearance flow */}
             {role === "customs-agent" && container.status === "ready_for_clearance" && (

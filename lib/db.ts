@@ -107,6 +107,77 @@ export async function updateContainerStatus(
 }
 
 /**
+ * Updates core AI-extracted fields for a container (manual override).
+ * Touches three tables atomically-ish (best-effort — partial failures logged):
+ *   - portix.containers  → carrier, etd, eta
+ *   - portix.shipments   → vessel_name  (via shipmentId FK)
+ *   - portix.documents   → document_number on the bill_of_lading row
+ *
+ * RLS for containers: importer_id=uid() OR supplier_id=uid().
+ * RLS for shipments: created_by=uid() or importer/supplier FK.
+ * RLS for documents: same container ownership rules.
+ */
+export async function updateContainerDetails(
+  containerId: string,
+  shipmentId: string,
+  fields: {
+    carrier?: string | null;
+    etd?: string;
+    eta?: string;
+    vessel_name?: string;
+    bill_of_lading_number?: string;
+  }
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+
+  const { carrier, etd, eta, vessel_name, bill_of_lading_number } = fields;
+
+  // 1. Update containers (carrier, etd, eta)
+  const containerPatch: Record<string, unknown> = {};
+  if (carrier !== undefined) containerPatch.carrier = carrier || null;
+  if (etd) containerPatch.etd = etd;
+  if (eta) containerPatch.eta = eta;
+
+  if (Object.keys(containerPatch).length > 0) {
+    const { error } = await supabase
+      .from("containers")
+      .update(containerPatch)
+      .eq("id", containerId);
+    if (error) {
+      console.error("[db] updateContainerDetails containers:", error.message);
+      return false;
+    }
+  }
+
+  // 2. Update shipments (vessel_name)
+  if (vessel_name !== undefined) {
+    const { error } = await supabase
+      .from("shipments")
+      .update({ vessel_name: vessel_name || null })
+      .eq("id", shipmentId);
+    if (error) {
+      console.error("[db] updateContainerDetails shipments:", error.message);
+      return false;
+    }
+  }
+
+  // 3. Update documents (bill_of_lading document_number)
+  if (bill_of_lading_number !== undefined) {
+    const { error } = await supabase
+      .from("documents")
+      .update({ document_number: bill_of_lading_number || null })
+      .eq("container_id", containerId)
+      .eq("document_type", "bill_of_lading");
+    if (error) {
+      console.error("[db] updateContainerDetails documents:", error.message);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * Updates ETD and/or ETA on a container.
  * RLS allows importer (importer_id = uid) and supplier (supplier_id = uid).
  */
