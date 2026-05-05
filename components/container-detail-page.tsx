@@ -44,8 +44,12 @@ import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/li
 import { getTrackingLink, CARRIER_LABELS } from "@/lib/tracking";
 import type { CarrierKey } from "@/lib/tracking";
 import { toast } from "sonner";
+import {
+  Tabs, TabsContent, TabsList, TabsTrigger,
+} from "@/components/ui/tabs";
 import { EditContainerDialog } from "@/components/edit-container-dialog";
 import { ActivityLog } from "@/components/activity-log";
+import { ContainerFinanceTab } from "@/components/container-finance-tab";
 
 interface ContainerDetailPageProps {
   role: "importer" | "supplier" | "customs-agent";
@@ -1009,6 +1013,20 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         />
       )}
 
+      {/* ── Tabs: Overview / Finance ───────────────────────────── */}
+      <Tabs defaultValue="overview" className="space-y-4">
+        <TabsList className="w-full justify-start h-auto p-1 bg-gray-100 rounded-lg">
+          <TabsTrigger value="overview" className="gap-1.5 text-sm px-4 py-2 data-[state=active]:bg-white data-[state=active]:shadow-sm">
+            Overview
+          </TabsTrigger>
+          <TabsTrigger value="finance" className="gap-1.5 text-sm px-4 py-2 data-[state=active]:bg-white data-[state=active]:shadow-sm">
+            Finance
+          </TabsTrigger>
+        </TabsList>
+
+        {/* ── Overview Tab ─────────────────────────────────────────── */}
+        <TabsContent value="overview" className="space-y-6 mt-0">
+
       {/* Clearance Progress Summary */}
       <Card className="mb-6">
         <CardHeader className="pb-3">
@@ -1306,6 +1324,15 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
 
       {/* Activity Log — audit trail for all roles */}
       <ActivityLog containerId={container.id} />
+
+        </TabsContent>{/* end Overview */}
+
+        {/* ── Finance Tab ──────────────────────────────────────────── */}
+        <TabsContent value="finance" className="mt-0">
+          <ContainerFinanceTab containerId={container.id} role={role} />
+        </TabsContent>
+
+      </Tabs>{/* end Tabs */}
 
       {/* Modals */}
       <DocumentUploadModal

@@ -1724,3 +1724,54 @@ export async function createDraftInvoiceTransaction(opts: {
   }
   return data as AccountTransaction;
 }
+
+// ─── Container Costs (Finance Tab) ────────────────────────────────────────────
+
+export interface ContainerCosts {
+  container_id: string;
+  fob_value: number;
+  freight: number;
+  insurance: number;
+  customs_duty: number;
+  port_handling: number;
+  inland_trucking: number;
+  updated_at: string;
+}
+
+/** Fetch costs row for a container. Returns null when no row exists yet. */
+export async function getContainerCosts(containerId: string): Promise<ContainerCosts | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from('container_costs')
+    .select('*')
+    .eq('container_id', containerId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[db] getContainerCosts:', error.message);
+    return null;
+  }
+  return data as ContainerCosts | null;
+}
+
+/** Upsert costs row. Returns updated row or null on error. */
+export async function upsertContainerCosts(
+  containerId: string,
+  fields: Omit<ContainerCosts, 'container_id' | 'updated_at'>,
+): Promise<ContainerCosts | null> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from('container_costs')
+    .upsert(
+      { container_id: containerId, ...fields, updated_at: new Date().toISOString() },
+      { onConflict: 'container_id' },
+    )
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[db] upsertContainerCosts:', error.message);
+    return null;
+  }
+  return data as ContainerCosts;
+}
