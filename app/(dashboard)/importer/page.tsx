@@ -295,8 +295,8 @@ export default function ImporterDashboardPage() {
             <div className="py-12 text-center text-gray-400 text-sm">Loading containers…</div>
           ) : view === "table" ? (
             /* ── Table view ───────────────────────────────────────── */
-            <div className="overflow-x-auto">
-              <Table>
+            <div className="overflow-x-auto w-full">
+              <Table className="min-w-[900px]">
                 <TableHeader>
                   <TableRow>
                     <TableHead>Bill of Lading</TableHead>

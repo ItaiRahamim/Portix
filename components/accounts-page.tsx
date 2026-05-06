@@ -84,8 +84,8 @@ function CompanySection({
       </CardHeader>
 
       <CardContent className="pt-4">
-        <div className="overflow-x-auto">
-          <Table>
+        <div className="overflow-x-auto w-full">
+          <Table className="min-w-[520px]">
             <TableHeader>
               <TableRow>
                 <TableHead>Company</TableHead>

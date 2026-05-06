@@ -117,8 +117,8 @@ export default function CustomsAgentDashboardPage() {
           {loading ? (
             <div className="py-12 text-center text-gray-400 text-sm">Loading containers…</div>
           ) : (
-            <div className="overflow-x-auto">
-              <Table>
+            <div className="overflow-x-auto w-full">
+              <Table className="min-w-[850px]">
                 <TableHeader>
                   <TableRow>
                     <TableHead>Bill of Lading</TableHead>

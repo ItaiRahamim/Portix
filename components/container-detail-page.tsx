@@ -211,7 +211,8 @@ function LogisticsTimeline({
           </div>
         </CardHeader>
         <CardContent>
-          <div className="relative">
+          <div className="overflow-x-auto w-full pb-2">
+          <div className="relative min-w-[480px]">
             {/* Connector line */}
             <div className="absolute top-5 left-5 right-5 h-0.5 bg-gray-200" />
 
@@ -265,6 +266,7 @@ function LogisticsTimeline({
               })}
             </div>
           </div>
+          </div>{/* end overflow-x-auto */}
         </CardContent>
       </Card>
 
@@ -1115,8 +1117,8 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           </div>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <Table>
+          <div className="overflow-x-auto w-full">
+            <Table className="min-w-[720px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>Document Type</TableHead>
