@@ -962,8 +962,16 @@ export async function createShipmentWithContainers(opts: {
   });
 
   if (error) {
-    console.error("[db] createShipmentWithContainers:", error.message);
-    return null;
+    // Build a maximally informative error message:
+    //   error.message  – high-level description (e.g. "new row violates check constraint")
+    //   error.details  – details block from Postgres (e.g. which column)
+    //   error.hint     – Postgres HINT if any
+    const parts: string[] = [error.message];
+    if ((error as { details?: string }).details) parts.push((error as { details: string }).details);
+    if ((error as { hint?: string }).hint)        parts.push(`Hint: ${(error as { hint: string }).hint}`);
+    const fullMsg = parts.join(" | ");
+    console.error("[db] createShipmentWithContainers:", fullMsg, error);
+    throw new Error(fullMsg);
   }
 
   return data as CreateShipmentResult;

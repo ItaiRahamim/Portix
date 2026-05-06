@@ -296,6 +296,12 @@ export function NewShipmentModal({
   const handleSubmit = async () => {
     setSubmitting(true);
     try {
+      // ── Pre-flight date validation ─────────────────────────
+      if (etd && eta && etd >= eta) {
+        toast.error("ETD must be earlier than ETA. Please fix the dates.");
+        return;
+      }
+
       const profile = await getCurrentProfile();
       if (!profile) {
         toast.error("Could not identify current user. Please log in again.");
@@ -330,7 +336,9 @@ export function NewShipmentModal({
       });
 
       if (!result) {
-        toast.error("Failed to create shipment. Please try again.");
+        // Shouldn't reach here — createShipmentWithContainers now throws on error.
+        // Safety net in case Supabase returns null data without an error object.
+        toast.error("Shipment creation returned no data. Check your Supabase project and migration status.");
         return;
       }
 
@@ -411,6 +419,12 @@ export function NewShipmentModal({
 
       onCreated();
       handleClose();
+    } catch (e) {
+      // Surface the real Supabase / Postgres error message so the user knows
+      // what actually went wrong (constraint, missing column, enum value, etc.)
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(`Create shipment failed: ${msg}`, { duration: 10000 });
+      console.error("[NewShipmentModal] handleSubmit caught:", e);
     } finally {
       setSubmitting(false);
     }
