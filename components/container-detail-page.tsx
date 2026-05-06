@@ -37,6 +37,7 @@ import {
   getCurrentUserId,
   approveDocumentAsImporter,
   approveDocumentAsAgent,
+  logActivity,
   type CargoMedia,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
@@ -778,6 +779,13 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       const results: ClassifyResult[] = body?.results ?? [];
       if (results.some((r) => r.success)) {
         toast.success(`${DOCUMENT_TYPE_LABELS[docType]} uploaded successfully.`);
+        // Activity log — record who uploaded and their role
+        const uploaderLabel = role === "importer" ? "Importer" : "Supplier";
+        await logActivity(
+          container.id,
+          "DOC_UPLOADED",
+          `${DOCUMENT_TYPE_LABELS[docType]} uploaded by ${uploaderLabel}`,
+        );
         loadData();
       } else {
         toast.error("Upload failed. Please try again.");
@@ -1094,8 +1102,8 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         </CardContent>
       </Card>
 
-      {/* Smart Upload Zone — supplier only */}
-      {role === "supplier" && (
+      {/* Smart Upload Zone — supplier and importer */}
+      {(role === "supplier" || role === "importer") && (
         <SmartUploadZone container={container} onDocumentsUpdated={loadData} />
       )}
 
@@ -1104,7 +1112,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <CardTitle className="text-base">Document Checklist</CardTitle>
-            {role === "supplier" && (
+            {(role === "supplier" || role === "importer") && (
               <Button
                 size="sm"
                 className="gap-1.5"
@@ -1197,8 +1205,9 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                       ) : <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
                     <TableCell>
-                      {/* Supplier Actions — direct file picker, no modal */}
-                      {role === "supplier" && doc.status === "missing" && (
+                      {/* ── Upload / Replace — Supplier + Importer ─────────── */}
+                      {(role === "supplier" || role === "importer") &&
+                       (doc.status === "missing" || doc.status === "rejected") && (
                         <>
                           <input
                             type="file"
@@ -1213,49 +1222,30 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                           />
                           <Button
                             variant="outline" size="sm"
+                            className={doc.status === "rejected" ? "text-red-600 border-red-200" : ""}
                             disabled={uploadingRows.has(doc.document_type)}
                             onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
                           >
                             {uploadingRows.has(doc.document_type)
                               ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
                               : <Upload className="w-3.5 h-3.5 mr-1" />}
-                            {uploadingRows.has(doc.document_type) ? "Uploading…" : "Upload"}
-                          </Button>
-                        </>
-                      )}
-                      {role === "supplier" && doc.status === "rejected" && (
-                        <>
-                          <input
-                            type="file"
-                            hidden
-                            accept=".pdf,.jpg,.jpeg,.png,.webp"
-                            ref={(el) => { if (el) rowFileInputsRef.current.set(doc.document_type, el); }}
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (f) handleRowUpload(f, doc.document_type);
-                              e.target.value = "";
-                            }}
-                          />
-                          <Button
-                            variant="outline" size="sm" className="text-red-600 border-red-200"
-                            disabled={uploadingRows.has(doc.document_type)}
-                            onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
-                          >
                             {uploadingRows.has(doc.document_type)
-                              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
-                              : <Upload className="w-3.5 h-3.5 mr-1" />}
-                            {uploadingRows.has(doc.document_type) ? "Uploading…" : "Replace"}
+                              ? "Uploading…"
+                              : doc.status === "rejected" ? "Replace" : "Upload"}
                           </Button>
                         </>
                       )}
-                      {role === "supplier" && doc.status !== "missing" && doc.status !== "rejected" && (
+
+                      {/* Dash when supplier has nothing to do */}
+                      {role === "supplier" &&
+                       doc.status !== "missing" && doc.status !== "rejected" && (
                         <span className="text-xs text-gray-400">—</span>
                       )}
 
-                      {/* Customs Agent Actions */}
-                      {role === "customs-agent" && (doc.status === "uploaded" || doc.status === "under_review") && (
+                      {/* ── Customs Agent — Approve / Reject ────────────────── */}
+                      {role === "customs-agent" &&
+                       (doc.status === "uploaded" || doc.status === "under_review") && (
                         <div className="flex gap-1">
-                          {/* Dual-approval: only show Approve if agent hasn't approved yet */}
                           {(!isDualApproval || !doc.agent_approved_at) && (
                             <Button
                               variant="outline" size="sm" className="text-green-600 border-green-200"
@@ -1278,17 +1268,18 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                           </Button>
                         </div>
                       )}
-                      {role === "customs-agent" && doc.status !== "uploaded" && doc.status !== "under_review" && (
+                      {role === "customs-agent" &&
+                       doc.status !== "uploaded" && doc.status !== "under_review" && (
                         <span className="text-xs text-gray-400">—</span>
                       )}
 
-                      {/* Importer — read-only for standard docs; Approve button for dual-approval docs */}
-                      {role === "importer" && !isDualApproval && (
-                        <span className="text-xs text-gray-400">—</span>
-                      )}
-                      {role === "importer" && isDualApproval && (
+                      {/* ── Importer — dual-approval button or dash ──────────
+                          Upload/Replace already handled above for missing/rejected.
+                          Here we handle the non-upload statuses. */}
+                      {role === "importer" &&
+                       doc.status !== "missing" && doc.status !== "rejected" && (
                         <>
-                          {doc.status !== "missing" && doc.status !== "approved" && !doc.importer_approved_at && (
+                          {isDualApproval && doc.status !== "approved" && !doc.importer_approved_at && (
                             <Button
                               variant="outline" size="sm" className="text-green-600 border-green-200"
                               onClick={() => handleImporterApproveDoc(doc)}
@@ -1296,12 +1287,12 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                               <CheckCircle className="w-3.5 h-3.5 mr-1" />Approve (Importer)
                             </Button>
                           )}
-                          {doc.importer_approved_at && doc.status !== "approved" && (
+                          {isDualApproval && doc.importer_approved_at && doc.status !== "approved" && (
                             <span className="text-xs text-green-600 flex items-center gap-1">
                               <CheckCircle className="w-3 h-3" />You approved
                             </span>
                           )}
-                          {(doc.status === "missing" || doc.status === "approved") && (
+                          {(!isDualApproval || doc.status === "approved") && (
                             <span className="text-xs text-gray-400">—</span>
                           )}
                         </>
