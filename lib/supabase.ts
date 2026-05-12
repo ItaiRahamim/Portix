@@ -90,6 +90,7 @@ export interface Profile {
   phone: string | null
   avatar_url: string | null
   supplier_org_id: string | null
+  preferences: Record<string, unknown> | null  // JSONB; brokerColors: { [agentId]: hexColor }
   created_at: string
   updated_at: string
 }

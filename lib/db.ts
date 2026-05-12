@@ -864,6 +864,62 @@ export async function updateProfile(fields: {
   return true;
 }
 
+// ─── Profile Preferences ──────────────────────────────────────────────────────
+
+/** Reads the current user's preferences JSONB. Returns {} on any error. */
+export async function getMyPreferences(): Promise<Record<string, unknown>> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return {};
+  const { data } = await supabase
+    .from('profiles')
+    .select('preferences')
+    .eq('id', user.id)
+    .maybeSingle();
+  return (data?.preferences as Record<string, unknown> | null) ?? {};
+}
+
+/**
+ * Set or clear a broker color tag.
+ * Stores `preferences.brokerColors[brokerId] = hexColor`.
+ * Pass `null` to remove the color for that broker.
+ */
+export async function updateBrokerColor(
+  brokerId: string,
+  color: string | null,
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return false;
+
+  // Read → merge → write (JSONB patch)
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('preferences')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  const prefs = ((profile?.preferences ?? {}) as Record<string, unknown>);
+  const brokerColors = ({ ...(prefs.brokerColors ?? {}) } as Record<string, string>);
+
+  if (color) {
+    brokerColors[brokerId] = color;
+  } else {
+    delete brokerColors[brokerId];
+  }
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({ preferences: { ...prefs, brokerColors } })
+    .eq('id', user.id);
+
+  if (error) {
+    console.error('[db] updateBrokerColor:', error.message);
+    return false;
+  }
+  return true;
+}
+
 // ─── Cargo Media ──────────────────────────────────────────────────────────────
 
 export interface CargoMedia {

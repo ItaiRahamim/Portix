@@ -19,7 +19,7 @@ import { DashboardLayout } from "@/components/dashboard-layout";
 import { KPICard } from "@/components/kpi-card";
 import { ContainerStatusBadge } from "@/components/status-badge";
 import { NewShipmentModal } from "@/components/new-shipment-modal";
-import { getContainers } from "@/lib/db";
+import { getContainers, getMyPreferences } from "@/lib/db";
 import type { ContainerView, ContainerStatus } from "@/lib/supabase";
 import { getTrackingLink, CARRIER_LABELS, type CarrierKey } from "@/lib/tracking";
 import { EtaCalendarWidget } from "@/components/eta-calendar-widget";
@@ -179,11 +179,13 @@ export default function ImporterDashboardPage() {
   const [showFilters, setShowFilters] = useState(false);
   const [newShipmentOpen, setNewShipmentOpen] = useState(false);
   const [view, setView] = useState<"table" | "board">("table");
+  const [brokerColors, setBrokerColors] = useState<Record<string, string>>({});
 
   const loadContainers = useCallback(async () => {
     setLoading(true);
-    const data = await getContainers();
+    const [data, prefs] = await Promise.all([getContainers(), getMyPreferences()]);
     setContainers(data);
+    setBrokerColors((prefs.brokerColors as Record<string, string> | undefined) ?? {});
     setLoading(false);
   }, []);
 
@@ -330,10 +332,16 @@ export default function ImporterDashboardPage() {
                       if (daysToArrival <= 3 && daysToArrival > 0 && c.status !== "released" && c.status !== "ready_for_clearance")
                         alerts.push("Arriving soon!");
 
+                      // Broker color bar — 4px left border using assigned hex color
+                      const brokerColor = c.customs_agent_id ? brokerColors[c.customs_agent_id] : undefined;
+
                       return (
                         <TableRow
                           key={c.id}
                           className="cursor-pointer hover:bg-gray-50"
+                          style={brokerColor
+                            ? { borderLeft: `4px solid ${brokerColor}` }
+                            : { borderLeft: "4px solid transparent" }}
                           onClick={() => router.push(`/importer/containers/${c.id}`)}
                         >
                           <TableCell className="whitespace-nowrap font-mono text-sm">{c.bill_of_lading_number ?? <span className="text-gray-400">—</span>}</TableCell>

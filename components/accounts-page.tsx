@@ -15,9 +15,20 @@ import {
 import { Eye, Pencil } from "lucide-react";
 import { toast } from "sonner";
 import { DashboardLayout } from "@/components/dashboard-layout";
-import { getPartnerAccounts, getCurrentProfile, updateProfile } from "@/lib/db";
+import { getPartnerAccounts, getCurrentProfile, updateProfile, getMyPreferences, updateBrokerColor } from "@/lib/db";
 import type { PartnerAccount } from "@/lib/db";
 import type { Profile } from "@/lib/supabase";
+
+// ─── Broker color presets ─────────────────────────────────────────────────────
+
+export const BROKER_COLORS: { label: string; hex: string }[] = [
+  { label: "Purple", hex: "#9333ea" },
+  { label: "Blue",   hex: "#3b82f6" },
+  { label: "Green",  hex: "#22c55e" },
+  { label: "Yellow", hex: "#eab308" },
+  { label: "Rose",   hex: "#f43f5e" },
+  { label: "Orange", hex: "#f97316" },
+];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,12 +63,18 @@ function CompanySection({
   accounts,
   basePath,
   router,
+  colorMap,
+  onColorChange,
 }: {
   title: string;
   accounts: PartnerAccount[];
   basePath: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   router: any;
+  /** Current brokerColors mapping { [partnerId]: hexColor } */
+  colorMap?: Record<string, string>;
+  /** Called when user picks/clears a color for a broker row */
+  onColorChange?: (partnerId: string, color: string | null) => void;
 }) {
   const totalInvoiced  = accounts.reduce((s, a) => s + a.total_invoiced,  0);
   const totalPaid      = accounts.reduce((s, a) => s + a.total_paid,      0);
@@ -106,13 +123,47 @@ function CompanySection({
               ) : (
                 accounts.map((account) => {
                   const href = `${basePath}/${account.partner_id}`;
+                  const activeColor = colorMap?.[account.partner_id] ?? null;
                   return (
                     <TableRow
                       key={account.partner_id}
                       className="cursor-pointer hover:bg-gray-50"
+                      style={activeColor ? { borderLeft: `4px solid ${activeColor}` } : undefined}
                       onClick={() => router.push(href)}
                     >
-                      <TableCell className="font-medium text-sm">{account.company_name}</TableCell>
+                      <TableCell className="font-medium text-sm">
+                        <span>{account.company_name}</span>
+                        {/* Color tag picker — only rendered when colorMap/onColorChange provided */}
+                        {onColorChange && (
+                          <div
+                            className="flex items-center gap-1 mt-1.5"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <span className="text-[10px] text-gray-400 mr-0.5">Tag:</span>
+                            {BROKER_COLORS.map((c) => (
+                              <button
+                                key={c.hex}
+                                title={c.label}
+                                onClick={() => onColorChange(account.partner_id, activeColor === c.hex ? null : c.hex)}
+                                className="w-4 h-4 rounded-full border-2 transition-transform hover:scale-110"
+                                style={{
+                                  backgroundColor: c.hex,
+                                  borderColor: activeColor === c.hex ? "#1e293b" : "transparent",
+                                }}
+                              />
+                            ))}
+                            {activeColor && (
+                              <button
+                                title="Clear tag"
+                                onClick={() => onColorChange(account.partner_id, null)}
+                                className="text-[10px] text-gray-400 hover:text-gray-600 ml-0.5 leading-none"
+                              >
+                                ✕
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </TableCell>
                       <TableCell className="text-right text-sm">
                         {account.total_invoiced > 0 ? fmt(account.total_invoiced) : <span className="text-gray-400">—</span>}
                       </TableCell>
@@ -260,19 +311,33 @@ export function AccountsPage({ role }: AccountsPageProps) {
   const router = useRouter();
   const [accounts, setAccounts] = useState<PartnerAccount[]>([]);
   const [loading, setLoading] = useState(true);
+  const [brokerColors, setBrokerColors] = useState<Record<string, string>>({});
 
   const basePath = `/${role}/accounts`;
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const result = await getPartnerAccounts();
-    // Sort: highest outstanding first, then alphabetically
+    const [result, prefs] = await Promise.all([
+      getPartnerAccounts(),
+      getMyPreferences(),
+    ]);
     result.sort((a, b) => {
       const diff = Math.abs(b.current_balance) - Math.abs(a.current_balance);
       return diff !== 0 ? diff : a.company_name.localeCompare(b.company_name);
     });
     setAccounts(result);
+    setBrokerColors((prefs.brokerColors as Record<string, string> | undefined) ?? {});
     setLoading(false);
+  }, []);
+
+  const handleBrokerColorChange = useCallback(async (brokerId: string, color: string | null) => {
+    // Optimistic update
+    setBrokerColors((prev) => {
+      const next = { ...prev };
+      if (color) { next[brokerId] = color; } else { delete next[brokerId]; }
+      return next;
+    });
+    await updateBrokerColor(brokerId, color);
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -310,6 +375,8 @@ export function AccountsPage({ role }: AccountsPageProps) {
                 accounts={brokers}
                 basePath={basePath}
                 router={router}
+                colorMap={brokerColors}
+                onColorChange={handleBrokerColorChange}
               />
               {suppliers.length === 0 && brokers.length === 0 && (
                 <Card>
