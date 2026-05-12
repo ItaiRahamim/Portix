@@ -11,11 +11,12 @@ import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
-  Pencil, ExternalLink, Trash2,
+  Pencil, ExternalLink, Trash2, ShieldCheck, ScanSearch,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useRef } from "react";
@@ -39,10 +40,12 @@ import {
   approveDocumentAsAgent,
   logActivity,
   resetDocumentRecord,
+  runContainerAudit,
   type CargoMedia,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
 import { STORAGE_BUCKETS, getSignedUrl, createBrowserSupabaseClient } from "@/lib/supabase";
+import type { AuditDiscrepancy } from "@/lib/supabase";
 import { getTrackingLink, CARRIER_LABELS } from "@/lib/tracking";
 import type { CarrierKey } from "@/lib/tracking";
 import { toast } from "sonner";
@@ -691,6 +694,11 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const [rejectDoc, setRejectDoc] = useState<Document | null>(null);
   const [advancingStatus, setAdvancingStatus] = useState(false);
 
+  // AI document audit state
+  const [auditRunning, setAuditRunning] = useState(false);
+  const [auditResults, setAuditResults] = useState<AuditDiscrepancy[] | null | undefined>(undefined);
+  // undefined = never run | null = loading | AuditDiscrepancy[] = result
+
   // Row-level direct upload (no modal)
   const rowFileInputsRef = useRef<Map<string, HTMLInputElement>>(new Map());
   const [uploadingRows, setUploadingRows] = useState<Set<string>>(new Set());
@@ -703,6 +711,10 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     ]);
     setContainer(c);
     setDocs(d);
+    // Restore audit results from DB if audit was previously run
+    if (c && c.ai_audit_results !== undefined) {
+      setAuditResults(c.ai_audit_results);
+    }
     setLoading(false);
   }, [containerId, role]);
 
@@ -767,6 +779,26 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       loadData();
     } else {
       toast.error(`Failed to remove ${label}.`);
+    }
+  }
+
+  async function handleRunAudit() {
+    if (!container) return;
+    setAuditRunning(true);
+    setAuditResults(null); // null = loading
+    try {
+      const results = await runContainerAudit(container.id);
+      setAuditResults(results);
+      if (results.length === 0) {
+        toast.success("Audit complete — no discrepancies found.");
+      } else {
+        toast.warning(`Audit found ${results.length} discrepanc${results.length === 1 ? "y" : "ies"}.`);
+      }
+    } catch (e) {
+      setAuditResults(undefined); // revert to "never run"
+      toast.error(`Audit failed: ${(e as Error).message}`, { duration: 10000 });
+    } finally {
+      setAuditRunning(false);
     }
   }
 
@@ -1126,19 +1158,81 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <CardTitle className="text-base">Document Checklist</CardTitle>
-            {(role === "supplier" || role === "importer") && (
+            <div className="flex items-center gap-2">
+              {/* AI Audit button — all roles can trigger */}
               <Button
+                variant="outline"
                 size="sm"
                 className="gap-1.5"
-                onClick={() => { setUploadPreselect({}); setUploadOpen(true); }}
+                onClick={handleRunAudit}
+                disabled={auditRunning}
               >
-                <Upload className="w-4 h-4" />
-                Upload Document
+                {auditRunning ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <ScanSearch className="w-3.5 h-3.5" />
+                )}
+                {auditRunning ? "Auditing…" : "Run Audit"}
               </Button>
-            )}
+              {(role === "supplier" || role === "importer") && (
+                <Button
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={() => { setUploadPreselect({}); setUploadOpen(true); }}
+                >
+                  <Upload className="w-4 h-4" />
+                  Upload Document
+                </Button>
+              )}
+            </div>
           </div>
         </CardHeader>
         <CardContent>
+          {/* ── AI Audit Results banner ─────────────────────────────── */}
+          {auditResults === null && (
+            <div className="flex items-center gap-2 text-sm text-gray-500 mb-4 px-1">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Running document cross-validation…
+            </div>
+          )}
+          {Array.isArray(auditResults) && auditResults.length === 0 && (
+            <Alert className="mb-4 border-emerald-200 bg-emerald-50">
+              <ShieldCheck className="h-4 w-4 text-emerald-600" />
+              <AlertTitle className="text-emerald-700">All Clear</AlertTitle>
+              <AlertDescription className="text-emerald-600">
+                AI cross-validation found no discrepancies across uploaded documents.
+              </AlertDescription>
+            </Alert>
+          )}
+          {Array.isArray(auditResults) && auditResults.length > 0 && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>
+                {auditResults.length} Discrepanc{auditResults.length === 1 ? "y" : "ies"} Found
+              </AlertTitle>
+              <AlertDescription>
+                <ul className="mt-2 space-y-2">
+                  {auditResults.map((d, i) => (
+                    <li key={i} className="text-sm">
+                      <span className={`inline-block mr-2 px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${
+                        d.severity === "high"
+                          ? "bg-red-100 text-red-700"
+                          : d.severity === "medium"
+                          ? "bg-orange-100 text-orange-700"
+                          : "bg-yellow-100 text-yellow-700"
+                      }`}>
+                        {d.severity}
+                      </span>
+                      <strong>{d.field}:</strong> {d.doc1} vs {d.doc2}
+                      {d.description && (
+                        <span className="block ml-5 text-xs text-red-600/80 mt-0.5">{d.description}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          )}
           <div className="overflow-x-auto w-full">
             <Table className="min-w-[720px]">
               <TableHeader>

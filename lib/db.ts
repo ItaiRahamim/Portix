@@ -24,6 +24,7 @@ import type {
   ImportLicenseView,
   Profile,
   UserRole,
+  AuditDiscrepancy,
 } from "@/lib/supabase";
 
 // ─── Current user ─────────────────────────────────────────────────────────────
@@ -1880,4 +1881,32 @@ export async function upsertContainerCosts(
     return null;
   }
   return data as ContainerCosts;
+}
+
+// ─── AI Document Audit ────────────────────────────────────────────────────────
+
+/**
+ * Triggers the audit-documents Edge Function which cross-validates AI-extracted
+ * data across all documents in a container via Gemini.
+ *
+ * Returns the discrepancy array (empty = clean audit).
+ * Throws on network / function error so the caller can show a toast.
+ */
+export async function runContainerAudit(containerId: string): Promise<AuditDiscrepancy[]> {
+  const supabase = createBrowserSupabaseClient();
+
+  const { data, error } = await supabase.functions.invoke('audit-documents', {
+    body: { container_id: containerId },
+  });
+
+  if (error) {
+    throw new Error(error.message ?? 'Audit function failed');
+  }
+
+  // data.ok === false means the function returned a 4xx/5xx
+  if (!data?.ok) {
+    throw new Error(data?.error ?? 'Audit returned an error');
+  }
+
+  return (data.discrepancies ?? []) as AuditDiscrepancy[];
 }

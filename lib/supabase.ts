@@ -128,8 +128,19 @@ export interface Container {
   api_eta: string | null
   tracking_status_raw: Record<string, unknown> | null
   last_tracking_update: string | null
+  // AI cross-validation (populated by audit-documents Edge Function)
+  ai_audit_results: AuditDiscrepancy[] | null
   created_at: string
   updated_at: string
+}
+
+/** Single discrepancy surfaced by the AI document audit. */
+export interface AuditDiscrepancy {
+  field: string         // e.g. "Total Weight"
+  doc1: string          // e.g. "Bill of Lading (28000 kg)"
+  doc2: string          // e.g. "Commercial Invoice (27500 kg)"
+  severity: 'high' | 'medium' | 'low'
+  description: string   // human-readable explanation
 }
 
 // Enriched view type (portix.v_containers)
