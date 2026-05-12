@@ -11,7 +11,7 @@ import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
-  Pencil, ExternalLink,
+  Pencil, ExternalLink, Trash2,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
@@ -38,6 +38,7 @@ import {
   approveDocumentAsImporter,
   approveDocumentAsAgent,
   logActivity,
+  resetDocumentRecord,
   type CargoMedia,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
@@ -756,6 +757,19 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     }
   }
 
+  async function handleRemoveDoc(doc: Document) {
+    if (!container) return;
+    const label = DOCUMENT_TYPE_LABELS[doc.document_type] ?? doc.document_type;
+    if (!window.confirm(`Remove "${label}"? This resets the document back to Missing status.`)) return;
+    const ok = await resetDocumentRecord(doc.id, container.id, label);
+    if (ok) {
+      toast.success(`${label} removed.`);
+      loadData();
+    } else {
+      toast.error(`Failed to remove ${label}.`);
+    }
+  }
+
   async function handleRowUpload(file: File, docType: DocumentType) {
     if (!container) return;
     setUploadingRows((prev) => new Set(prev).add(docType));
@@ -1205,10 +1219,12 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                       ) : <span className="text-xs text-gray-400">—</span>}
                     </TableCell>
                     <TableCell>
-                      {/* ── Upload / Replace — Supplier + Importer ─────────── */}
-                      {(role === "supplier" || role === "importer") &&
-                       (doc.status === "missing" || doc.status === "rejected") && (
-                        <>
+                      {/* ── Upload/Replace/Remove — Supplier + Importer ─────── */}
+                      {(role === "supplier" || role === "importer") && (() => {
+                        const isUploading = uploadingRows.has(doc.document_type);
+
+                        // Hidden file input — shared by Upload and Replace
+                        const fileInput = (
                           <input
                             type="file"
                             hidden
@@ -1220,27 +1236,64 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
                               e.target.value = "";
                             }}
                           />
-                          <Button
-                            variant="outline" size="sm"
-                            className={doc.status === "rejected" ? "text-red-600 border-red-200" : ""}
-                            disabled={uploadingRows.has(doc.document_type)}
-                            onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
-                          >
-                            {uploadingRows.has(doc.document_type)
-                              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
-                              : <Upload className="w-3.5 h-3.5 mr-1" />}
-                            {uploadingRows.has(doc.document_type)
-                              ? "Uploading…"
-                              : doc.status === "rejected" ? "Replace" : "Upload"}
-                          </Button>
-                        </>
-                      )}
+                        );
 
-                      {/* Dash when supplier has nothing to do */}
-                      {role === "supplier" &&
-                       doc.status !== "missing" && doc.status !== "rejected" && (
-                        <span className="text-xs text-gray-400">—</span>
-                      )}
+                        if (doc.status === "missing") {
+                          return (
+                            <>
+                              {fileInput}
+                              <Button
+                                variant="outline" size="sm"
+                                disabled={isUploading}
+                                onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
+                              >
+                                {isUploading ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <Upload className="w-3.5 h-3.5 mr-1" />}
+                                {isUploading ? "Uploading…" : "Upload"}
+                              </Button>
+                            </>
+                          );
+                        }
+
+                        if (doc.status === "rejected" || doc.status === "uploaded") {
+                          return (
+                            <div className="flex items-center gap-1">
+                              {fileInput}
+                              <Button
+                                variant="outline" size="sm"
+                                disabled={isUploading}
+                                onClick={() => rowFileInputsRef.current.get(doc.document_type)?.click()}
+                              >
+                                {isUploading ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <Upload className="w-3.5 h-3.5 mr-1" />}
+                                {isUploading ? "Uploading…" : "Replace"}
+                              </Button>
+                              <Button
+                                variant="ghost" size="sm"
+                                className="text-red-500 hover:text-red-700 hover:bg-red-50 px-2"
+                                disabled={isUploading}
+                                onClick={() => handleRemoveDoc(doc)}
+                                title="Remove document"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </Button>
+                            </div>
+                          );
+                        }
+
+                        // approved / under_review — locked for importer/supplier
+                        if (doc.status === "approved") {
+                          return (
+                            <span className="text-xs text-green-600 flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" />Locked
+                            </span>
+                          );
+                        }
+
+                        // under_review — in customs review, can't touch
+                        return <span className="text-xs text-gray-400">In Review</span>;
+                      })()}
+
+                      {/* Dash when supplier has nothing left to do (shouldn't occur — handled above) */}
+                      {false && <span className="text-xs text-gray-400">—</span>}
 
                       {/* ── Customs Agent — Approve / Reject ────────────────── */}
                       {role === "customs-agent" &&

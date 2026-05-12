@@ -425,6 +425,48 @@ export async function uploadDocumentRecord(opts: {
   return true;
 }
 
+/**
+ * Reset a document back to its original empty state (status = 'missing').
+ * Does NOT delete the row — the pre-seeded row must always exist.
+ * Blocked server-side by RLS: only importer/supplier of the container can reset;
+ * approved documents are excluded from the UPDATE policy.
+ */
+export async function resetDocumentRecord(
+  documentId: string,
+  containerId: string,
+  docLabel: string,
+): Promise<boolean> {
+  const supabase = createBrowserSupabaseClient();
+  const { error } = await supabase
+    .from("documents")
+    .update({
+      status:          "missing",
+      storage_path:    null,
+      file_name:       null,
+      file_size_bytes: null,
+      mime_type:       null,
+      uploaded_by:     null,
+      uploaded_at:     null,
+      document_number: null,
+      issue_date:      null,
+      notes:           null,
+      ai_data:         null,
+      rejection_reason: null,
+      reviewed_by:     null,
+      reviewed_at:     null,
+    })
+    .eq("id", documentId);
+
+  if (error) {
+    console.error("[db] resetDocumentRecord:", error.message);
+    return false;
+  }
+
+  // Best-effort audit trail — never blocks the caller
+  await logActivity(containerId, "DOC_REMOVED", `${docLabel} removed`);
+  return true;
+}
+
 // ─── Invoices ─────────────────────────────────────────────────────────────────
 
 export async function getInvoices(): Promise<Invoice[]> {
