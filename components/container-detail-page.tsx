@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,7 +11,7 @@ import {
   ArrowLeft, FileText, CheckCircle, XCircle, Clock, Upload, Eye,
   AlertTriangle, Camera, ImageIcon, Video, Loader2, PlayCircle, CheckSquare,
   Package, Anchor, Ship, Globe, CheckCheck, Truck, Sparkles, X, MapPin, Signal,
-  Pencil, ExternalLink, Trash2, ShieldCheck, ScanSearch,
+  Pencil, ExternalLink, Trash2, ShieldCheck, ScanSearch, MessageSquare, Plus,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
@@ -19,6 +19,10 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
 import { useRef } from "react";
 import { CustomsAgentSelector } from "@/components/customs-agent-selector";
 import { DashboardLayout } from "@/components/dashboard-layout";
@@ -26,7 +30,7 @@ import { DocStatusBadge, ContainerStatusBadge } from "@/components/status-badge"
 import { DocumentUploadModal } from "@/components/document-upload-modal";
 import { RejectDocumentModal } from "@/components/reject-document-modal";
 import { DOCUMENT_TYPE_LABELS, DUAL_APPROVAL_DOC_TYPES } from "@/lib/supabase";
-import type { Document, DocumentType, ContainerView } from "@/lib/supabase";
+import type { Document, DocumentType, ContainerView, Claim } from "@/lib/supabase";
 import {
   getContainerById,
   getDocumentsForContainer,
@@ -41,6 +45,8 @@ import {
   logActivity,
   resetDocumentRecord,
   runContainerAudit,
+  getClaimsForContainer,
+  createClaim,
   type CargoMedia,
 } from "@/lib/db";
 import { processFileForUpload, triggerMakeWebhook } from "@/lib/compress";
@@ -77,6 +83,34 @@ interface TimelineStep {
   icon: React.ElementType;
   description: string;
 }
+
+// ─── Claim label maps ────────────────────────────────────────────────────────
+
+const CLAIM_STATUS_STYLES: Record<string, string> = {
+  open:         "bg-blue-100 text-blue-700",
+  under_review: "bg-yellow-100 text-yellow-700",
+  negotiation:  "bg-orange-100 text-orange-700",
+  resolved:     "bg-green-100 text-green-700",
+  closed:       "bg-gray-200 text-gray-600",
+};
+
+const CLAIM_STATUS_LABELS: Record<string, string> = {
+  open:         "Open",
+  under_review: "Under Review",
+  negotiation:  "Negotiation",
+  resolved:     "Resolved",
+  closed:       "Closed",
+};
+
+const CLAIM_TYPE_LABELS: Record<string, string> = {
+  damaged_goods:        "Damaged Goods",
+  missing_goods:        "Missing Goods",
+  short_shipment:       "Short Shipment",
+  quality_issue:        "Quality Issue",
+  documentation_error:  "Documentation Error",
+  delay:                "Delay",
+  other:                "Other",
+};
 
 // Chronological import process order for the Document Checklist table.
 // Supplementary / unlisted types fall to the bottom (rank = Infinity).
@@ -681,7 +715,11 @@ function SmartUploadZone({
 export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const containerId = params.containerId as string;
+
+  // Default tab from ?tab= query param (used by global claims page deep-link)
+  const initialTab = searchParams.get("tab") ?? "overview";
 
   const [container, setContainer] = useState<ContainerView | null>(null);
   const [docs, setDocs] = useState<Document[]>([]);
@@ -698,6 +736,15 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const [auditRunning, setAuditRunning] = useState(false);
   const [auditResults, setAuditResults] = useState<AuditDiscrepancy[] | null | undefined>(undefined);
   // undefined = never run | null = loading | AuditDiscrepancy[] = result
+
+  // Claims tab state
+  const [containerClaims, setContainerClaims] = useState<Claim[]>([]);
+  const [claimsLoading, setClaimsLoading] = useState(false);
+  const [claimCreateOpen, setClaimCreateOpen] = useState(false);
+  const [claimType, setClaimType] = useState("");
+  const [claimDescription, setClaimDescription] = useState("");
+  const [claimAmount, setClaimAmount] = useState("");
+  const [claimSaving, setClaimSaving] = useState(false);
 
   // Row-level direct upload (no modal)
   const rowFileInputsRef = useRef<Map<string, HTMLInputElement>>(new Map());
@@ -719,6 +766,48 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   }, [containerId, role]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  const loadClaims = useCallback(async () => {
+    setClaimsLoading(true);
+    const data = await getClaimsForContainer(containerId);
+    setContainerClaims(data);
+    setClaimsLoading(false);
+  }, [containerId]);
+
+  // Eagerly load claims if deep-linked to claims tab
+  useEffect(() => {
+    if (initialTab === "claims") loadClaims();
+  }, [initialTab, loadClaims]);
+
+  function resetClaimForm() {
+    setClaimType("");
+    setClaimDescription("");
+    setClaimAmount("");
+  }
+
+  async function handleCreateClaim() {
+    if (!container || !claimType || !claimDescription.trim()) return;
+    setClaimSaving(true);
+    try {
+      const claim = await createClaim({
+        containerId: container.id,
+        supplierId: container.supplier_id,
+        claimType,
+        description: claimDescription.trim(),
+        amount: claimAmount ? parseFloat(claimAmount) : undefined,
+        currency: "USD",
+      });
+      if (!claim) throw new Error("Failed to create claim");
+      toast.success(`Claim filed for ${container.container_number}.`);
+      setClaimCreateOpen(false);
+      resetClaimForm();
+      loadClaims();
+    } catch (e) {
+      toast.error((e as Error).message ?? "Failed to create claim.");
+    } finally {
+      setClaimSaving(false);
+    }
+  }
 
   async function handleApproveDoc(doc: Document) {
     // Dual-approval docs: agent sets agent_approved_at; DB trigger auto-approves when both set
@@ -1070,13 +1159,26 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       )}
 
       {/* ── Tabs: Overview / Finance ───────────────────────────── */}
-      <Tabs defaultValue="overview" className="space-y-4">
+      <Tabs defaultValue={initialTab} className="space-y-4">
         <TabsList className="w-full justify-start h-auto p-1 bg-gray-100 rounded-lg">
           <TabsTrigger value="overview" className="gap-1.5 text-sm px-4 py-2 data-[state=active]:bg-white data-[state=active]:shadow-sm">
             Overview
           </TabsTrigger>
           <TabsTrigger value="finance" className="gap-1.5 text-sm px-4 py-2 data-[state=active]:bg-white data-[state=active]:shadow-sm">
             Finance
+          </TabsTrigger>
+          <TabsTrigger
+            value="claims"
+            className="gap-1.5 text-sm px-4 py-2 data-[state=active]:bg-white data-[state=active]:shadow-sm"
+            onClick={() => { if (containerClaims.length === 0 && !claimsLoading) loadClaims(); }}
+          >
+            <MessageSquare className="w-3.5 h-3.5" />
+            Claims
+            {containerClaims.length > 0 && (
+              <span className="ml-1 bg-blue-600 text-white text-[10px] rounded-full px-1.5 py-0.5 leading-none">
+                {containerClaims.length}
+              </span>
+            )}
           </TabsTrigger>
         </TabsList>
 
@@ -1472,7 +1574,151 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           <ContainerFinanceTab containerId={container.id} role={role} />
         </TabsContent>
 
+        {/* ── Claims Tab ───────────────────────────────────────────── */}
+        <TabsContent value="claims" className="mt-0 space-y-4">
+          {claimsLoading ? (
+            <div className="py-16 text-center text-gray-400 text-sm flex items-center justify-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading claims…
+            </div>
+          ) : containerClaims.length === 0 ? (
+            /* Empty state */
+            <Card>
+              <CardContent className="py-16 text-center">
+                <MessageSquare className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+                <p className="text-sm font-medium text-gray-600 mb-1">No claims filed for this container</p>
+                <p className="text-xs text-gray-400 mb-5">
+                  File a claim if you&apos;ve experienced damaged goods, shortages, or documentation issues.
+                </p>
+                {role === "importer" && (
+                  <Button size="sm" className="gap-1.5" onClick={() => setClaimCreateOpen(true)}>
+                    <Plus className="w-4 h-4" />File a Claim
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          ) : (
+            /* Claims list */
+            <>
+              {role === "importer" && (
+                <div className="flex justify-end">
+                  <Button size="sm" className="gap-1.5" onClick={() => setClaimCreateOpen(true)}>
+                    <Plus className="w-4 h-4" />New Claim
+                  </Button>
+                </div>
+              )}
+              <div className="space-y-3">
+                {containerClaims.map((claim) => {
+                  const detailHref = `/${role}/claims/${claim.id}`;
+                  return (
+                    <Card
+                      key={claim.id}
+                      className="cursor-pointer hover:shadow-sm transition-shadow"
+                      onClick={() => router.push(detailHref)}
+                    >
+                      <CardContent className="pt-4 pb-4">
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap mb-1">
+                              <span className={`text-xs px-2 py-0.5 rounded font-medium ${CLAIM_STATUS_STYLES[claim.status] ?? "bg-gray-100 text-gray-600"}`}>
+                                {CLAIM_STATUS_LABELS[claim.status] ?? claim.status}
+                              </span>
+                              <span className="text-xs text-gray-500">
+                                {CLAIM_TYPE_LABELS[claim.claim_type] ?? claim.claim_type}
+                              </span>
+                              <span className="text-xs text-gray-400">
+                                {new Date(claim.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+                              </span>
+                            </div>
+                            <p className="text-sm text-gray-700 line-clamp-2">{claim.description}</p>
+                          </div>
+                          <div className="text-right shrink-0">
+                            {claim.amount != null && (
+                              <p className="text-sm font-semibold text-gray-800">
+                                ${claim.amount.toLocaleString()} {claim.currency}
+                              </p>
+                            )}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="mt-2 gap-1"
+                              onClick={(e) => { e.stopPropagation(); router.push(detailHref); }}
+                            >
+                              <Eye className="w-3.5 h-3.5" />View
+                            </Button>
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </TabsContent>
+
       </Tabs>{/* end Tabs */}
+
+      {/* New Claim Dialog */}
+      <Dialog open={claimCreateOpen} onOpenChange={(o) => { if (!o) resetClaimForm(); setClaimCreateOpen(o); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>File a Claim</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-1">
+            {container && (
+              <div className="text-xs text-gray-500 bg-gray-50 rounded px-3 py-2">
+                Container: <span className="font-medium text-gray-700">{container.container_number}</span>
+                {" · "}{container.supplier_company}
+              </div>
+            )}
+            <div className="space-y-1.5">
+              <Label>Claim Type <span className="text-red-500">*</span></Label>
+              <Select value={claimType} onValueChange={setClaimType}>
+                <SelectTrigger><SelectValue placeholder="Select type" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="damaged_goods">Damaged Goods</SelectItem>
+                  <SelectItem value="missing_goods">Missing Goods</SelectItem>
+                  <SelectItem value="short_shipment">Short Shipment</SelectItem>
+                  <SelectItem value="quality_issue">Quality Issue</SelectItem>
+                  <SelectItem value="documentation_error">Documentation Error</SelectItem>
+                  <SelectItem value="delay">Delay</SelectItem>
+                  <SelectItem value="other">Other</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Description <span className="text-red-500">*</span></Label>
+              <Textarea
+                placeholder="Describe the issue in detail…"
+                rows={3}
+                value={claimDescription}
+                onChange={(e) => setClaimDescription(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Claim Amount (USD) <span className="text-gray-400 text-xs font-normal">optional</span></Label>
+              <Input
+                type="number"
+                placeholder="0.00"
+                min={0}
+                value={claimAmount}
+                onChange={(e) => setClaimAmount(e.target.value)}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { resetClaimForm(); setClaimCreateOpen(false); }} disabled={claimSaving}>
+              Cancel
+            </Button>
+            <Button
+              disabled={!claimType || !claimDescription.trim() || claimSaving}
+              onClick={handleCreateClaim}
+            >
+              <Plus className="w-4 h-4 mr-1.5" />{claimSaving ? "Filing…" : "File Claim"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Modals */}
       <DocumentUploadModal

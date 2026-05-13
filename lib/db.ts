@@ -515,6 +515,21 @@ export async function getClaims(): Promise<Claim[]> {
   return data ?? [];
 }
 
+export async function getClaimsForContainer(containerId: string): Promise<Claim[]> {
+  const supabase = createBrowserSupabaseClient();
+  const { data, error } = await supabase
+    .from("claims")
+    .select("*")
+    .eq("container_id", containerId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[db] getClaimsForContainer:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
 export async function getClaimById(claimId: string): Promise<Claim | null> {
   const supabase = createBrowserSupabaseClient();
   const { data, error } = await supabase

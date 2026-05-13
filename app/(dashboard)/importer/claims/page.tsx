@@ -186,7 +186,7 @@ export default function ImporterClaimsPage() {
                       <TableRow
                         key={claim.id}
                         className="cursor-pointer hover:bg-gray-50"
-                        onClick={() => router.push(`/importer/claims/${claim.id}`)}
+                        onClick={() => router.push(`/importer/containers/${claim.container_id}?tab=claims`)}
                       >
                         <TableCell className="whitespace-nowrap font-medium">
                           {container?.container_number ?? claim.container_id.slice(0, 8)}
@@ -211,7 +211,7 @@ export default function ImporterClaimsPage() {
                         </TableCell>
                         <TableCell>
                           <div onClick={(e) => e.stopPropagation()}>
-                            <Button variant="outline" size="sm" onClick={() => router.push(`/importer/claims/${claim.id}`)}>
+                            <Button variant="outline" size="sm" onClick={() => router.push(`/importer/containers/${claim.container_id}?tab=claims`)}>
                               <Eye className="w-3.5 h-3.5 mr-1" />View
                             </Button>
                           </div>
