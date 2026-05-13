@@ -65,7 +65,8 @@ async function callGemini(prompt: string): Promise<string> {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
       maxOutputTokens: 1500,
-      temperature: 0.1, // near-deterministic for auditing
+      temperature: 0.1,              // near-deterministic for auditing
+      responseMimeType: "application/json", // force raw JSON — no markdown fences
     },
   });
 
@@ -181,10 +182,11 @@ interface AuditDiscrepancy {
 }
 
 function parseDiscrepancies(raw: string): AuditDiscrepancy[] {
-  // Strip markdown code fences if Gemini wrapped output
+  // Strip ALL markdown code fences (responseMimeType should prevent these,
+  // but older model fallbacks may still wrap output in backticks)
   const cleaned = raw
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```\s*$/, "")
+    .replace(/```json\s*/gi, "")
+    .replace(/```\s*/gi, "")
     .trim();
 
   let parsed: unknown;
