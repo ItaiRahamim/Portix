@@ -301,11 +301,23 @@ async function embedAndInsertDocument(
       return { ok: false, chunks: 0, error: "all chunks failed to embed" };
     }
 
+    // Diagnostic: confirm the service_role key is actually loaded right before
+    // the insert. JWTs always start with "eyJ" — anything else means the
+    // function is running with the wrong key (or no key).
+    console.log(
+      `[backfill-rag] inserting ${rows.length} chunks for doc=${documentId} ` +
+      `(service_key prefix='${SERVICE_KEY.slice(0, 10)}', len=${SERVICE_KEY.length})`,
+    );
+
     const { error: insErr } = await supabaseAdmin
       .from("document_chunks")
       .insert(rows);
 
     if (insErr) {
+      console.error(
+        `[backfill-rag] INSERT failed for doc=${documentId}: ${insErr.message}. ` +
+        `If this is "permission denied", run migration 00342_grant_service_role_portix.sql.`,
+      );
       return { ok: false, chunks: 0, error: `insert failed: ${insErr.message}` };
     }
 
