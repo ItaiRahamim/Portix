@@ -42,6 +42,43 @@ const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_URL   =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse`;
 
+// ─── Embedding model (RAG retrieval query) ───────────────────────────────────
+// Must match the model + dimensionality used to populate document_chunks
+// in embed-document / backfill-rag, otherwise cosine similarity is meaningless.
+
+const EMBED_MODEL      = "gemini-embedding-2";
+const EMBED_OUTPUT_DIM = 768;
+const EMBED_URL        =
+  `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent`;
+
+async function embedQuery(text: string, apiKey: string): Promise<number[] | null> {
+  try {
+    const res = await fetch(`${EMBED_URL}?key=${apiKey}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        model:   `models/${EMBED_MODEL}`,
+        content: { parts: [{ text }] },
+        taskType: "RETRIEVAL_QUERY",       // paired with RETRIEVAL_DOCUMENT at ingest
+        outputDimensionality: EMBED_OUTPUT_DIM,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[global-copilot] embed HTTP ${res.status}: ${body.slice(0, 200)}`);
+      return null;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json = (await res.json()) as any;
+    const values: number[] | undefined = json?.embedding?.values;
+    if (!Array.isArray(values) || values.length !== EMBED_OUTPUT_DIM) return null;
+    return values;
+  } catch (e) {
+    console.error("[global-copilot] embed failed:", (e as Error).message);
+    return null;
+  }
+}
+
 // ─── Message normalization ────────────────────────────────────────────────────
 // Accepts both legacy `{role, content}` and the modern ai-sdk
 // `{role, parts: [{type:'text', text}]}` shapes.
@@ -139,8 +176,55 @@ serve(async (req) => {
     return new Response("GEMINI_API_KEY not set", { status: 500, headers: corsHeaders });
   }
 
+  // ── RAG: embed the last user message and pull top chunks the user can see ─
+  // Failure here is non-fatal — Porty just answers from general knowledge if
+  // retrieval comes back empty or errors out.
+  let contextString = "";
+  const lastUserText = [...messages].reverse().find((m) => m.role === "user");
+  const queryText = lastUserText ? messageText(lastUserText).trim() : "";
+
+  if (queryText) {
+    const queryEmbedding = await embedQuery(queryText, apiKey);
+    if (queryEmbedding) {
+      const { data: chunks, error: rpcErr } = await supabaseAnon
+        .rpc("match_user_document_chunks", {
+          query_embedding: queryEmbedding,
+          match_threshold: 0.5,
+          match_count:     8,
+        });
+
+      if (rpcErr) {
+        console.error(`[global-copilot] RAG RPC error: ${rpcErr.message}`);
+      } else if (Array.isArray(chunks) && chunks.length > 0) {
+        contextString = chunks
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .map((c: any) => {
+            const cid = c.container_id ? String(c.container_id).slice(0, 8) : "?";
+            const sim = typeof c.similarity === "number" ? c.similarity.toFixed(2) : "?";
+            const txt = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 600);
+            return `- [container ${cid}, similarity ${sim}] ${txt}`;
+          })
+          .join("\n");
+        console.log(`[global-copilot] RAG hits=${chunks.length} for user ${user.id}`);
+      } else {
+        console.log(`[global-copilot] RAG no hits for query "${queryText.slice(0, 60)}"`);
+      }
+    }
+  }
+
+  const systemPromptWithRag = contextString
+    ? [
+        PORTY_SYSTEM_PROMPT,
+        "",
+        "Use the retrieved document chunks below to answer the user's question accurately when they ask about THEIR containers, shipments, or documents. If the answer isn't in the chunks, fall back on your general logistics knowledge. Cite the container id (first 8 chars) when you reference a chunk.",
+        "",
+        "RETRIEVED CONTEXT:",
+        contextString,
+      ].join("\n")
+    : PORTY_SYSTEM_PROMPT;
+
   const geminiBody = JSON.stringify({
-    systemInstruction: { parts: [{ text: PORTY_SYSTEM_PROMPT }] },
+    systemInstruction: { parts: [{ text: systemPromptWithRag }] },
     contents:          toGeminiContents(messages),
     generationConfig: {
       maxOutputTokens: 800,
