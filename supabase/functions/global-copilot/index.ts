@@ -65,9 +65,13 @@ function findContainerNumbers(text: string): string[] {
   return [...new Set((text.toUpperCase().match(CONTAINER_NUM_RE) ?? []))];
 }
 
-/** Extract the first Container Number declared inside a chunk body. */
+/** Extract the first Container Number declared inside a chunk body.
+ *  Returns the ISO 6346 code, the literal "ALL" (for multi-container docs
+ *  like invoices/BLs that cover every container in a shipment), or null
+ *  when no Container Number header is present. */
 function chunkContainerNumber(content: string): string | null {
-  const m = content.toUpperCase().match(/CONTAINER NUMBER:\s*([A-Z]{4}\d{7})/);
+  const upper = content.toUpperCase();
+  const m = upper.match(/CONTAINER NUMBER:\s*([A-Z]{4}\d{7}|ALL)/);
   return m ? m[1] : null;
 }
 
@@ -294,16 +298,20 @@ serve(async (req) => {
       } else if (Array.isArray(chunks) && chunks.length > 0) {
         // Post-filter by container number when the query named one(s).
         // Chunk content always starts with "Container Number: <num>" courtesy
-        // of buildRagText() in classify-documents.
+        // of buildRagText() in classify-documents. Multi-container documents
+        // (invoices / B/Ls covering an entire shipment) are tagged
+        // "Container Number: ALL" — those apply to every requested container
+        // and must NOT be filtered out.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let filtered: any[] = chunks;
         if (filterByContainer) {
           const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
           filtered = chunks.filter((c: { content?: string }) => {
             const cn = chunkContainerNumber(String(c.content ?? ""));
-            return cn ? wanted.has(cn) : false;
+            if (!cn) return false;
+            return cn === "ALL" || wanted.has(cn);
           });
-          console.log(`[global-copilot] filtered chunks: ${filtered.length}/${chunks.length}`);
+          console.log(`[global-copilot] filtered chunks: ${filtered.length}/${chunks.length} (incl. ALL)`);
 
           if (filtered.length === 0) {
             // Short-circuit: refuse cleanly instead of letting the model guess
@@ -349,11 +357,21 @@ serve(async (req) => {
     (contextString || "(empty — model will use general knowledge only)"),
   );
 
+  // Build an ALL-semantics instruction tailored to which container(s) the
+  // user actually asked about. Only included when the user named a container.
+  const allClause = filterByContainer
+    ? (requestedContainers.length === 1
+        ? `If a chunk says "Container Number: ALL", it applies to ALL containers in the shared shipment/invoice/B/L — including ${requestedContainers[0]}. Treat data from such chunks as relevant to ${requestedContainers[0]}.`
+        : `If a chunk says "Container Number: ALL", it applies to EVERY container in the shared shipment/invoice/B/L — including ${requestedContainers.join(", ")}. Treat data from such chunks as relevant to each requested container.`)
+    : `If a chunk says "Container Number: ALL", it applies to every container in that shipment/invoice/B/L.`;
+
   const systemPromptWithRag = contextString
     ? [
         PORTY_SYSTEM_PROMPT,
         "",
-        "Use the retrieved document chunks below to answer accurately. Cross-reference the 'Container Number:' line in each chunk against the container the user asked about — quote a fact ONLY when its chunk's Container Number matches. Refer to containers by their ISO container number (e.g. MAEU1234567) — never by internal IDs.",
+        "Use the retrieved document chunks below to answer accurately. Cross-reference the 'Container Number:' line in each chunk against the container the user asked about — quote a fact ONLY when its chunk's Container Number matches, OR when the chunk says 'Container Number: ALL'.",
+        allClause,
+        "Refer to containers by their ISO container number (e.g. MAEU1234567) — never by internal IDs.",
         "",
         "RETRIEVED CONTEXT:",
         contextString,
