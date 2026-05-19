@@ -116,6 +116,11 @@ function PortyAvatar({ size = 44, className = "", showHand = true }: PortyAvatar
 }
 
 // ─── Transport: hits the Supabase Edge Function URL with the user JWT ────────
+// IMPORTANT: build the transport whenever NEXT_PUBLIC_SUPABASE_URL is present,
+// even if the user JWT isn't loaded yet. Returning null here makes useChat
+// fall back to its default '/api/chat' route which doesn't exist in this
+// Next.js app — the request 404s and the chatbot renders the Next 404 HTML
+// page as a "response" (the original symptom).
 
 interface UseChatTransport {
   api: string;
@@ -124,13 +129,33 @@ interface UseChatTransport {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function buildTransport(token: string | null): any | null {
-  if (!token) return null;
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  if (!supabaseUrl) return null;
+  const anonKey     = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !anonKey) {
+    console.error(
+      "[GlobalChatbot] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY missing — Porty cannot reach the edge function.",
+    );
+    return null;
+  }
+
+  // Headers Supabase Edge Functions expect:
+  //   apikey         — required by the gateway for every request
+  //   Authorization  — Bearer <user_jwt> so the function can call
+  //                    supabase.auth.getUser() and resolve auth.uid()
+  //
+  // When the user JWT isn't ready yet, fall back to the anon key so the
+  // gateway still accepts the call. The edge function itself rejects the
+  // request with 401 when getUser() returns null, which surfaces as a clean
+  // error message instead of a 404 HTML page.
+  const headers: Record<string, string> = {
+    apikey:        anonKey,
+    Authorization: `Bearer ${token ?? anonKey}`,
+  };
 
   const transport: UseChatTransport = {
-    api:     `${supabaseUrl}/functions/v1/global-copilot`,
-    headers: { Authorization: `Bearer ${token}` },
+    api: `${supabaseUrl}/functions/v1/global-copilot`,
+    headers,
   };
   // TextStreamChatTransport accepts {api, headers} via constructor options.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -195,7 +220,7 @@ export function GlobalChatbot() {
   function handleSend(e?: React.FormEvent) {
     e?.preventDefault();
     const text = input.trim();
-    if (!text || !transport || isStreaming) return;
+    if (!text || !transport || !token || isStreaming) return;
     setInput("");
     // sendMessage accepts a UIMessage-shaped object
     sendMessage({ text });
@@ -306,8 +331,8 @@ export function GlobalChatbot() {
           <Textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={transport ? "Ask Porty…" : "Sign in to chat with Porty"}
-            disabled={!transport || isStreaming}
+            placeholder={token ? "Ask Porty…" : "Sign in to chat with Porty"}
+            disabled={!transport || !token || isStreaming}
             rows={1}
             className="resize-none min-h-9 max-h-32 text-sm py-2"
             onKeyDown={(e) => {
@@ -332,7 +357,7 @@ export function GlobalChatbot() {
             <Button
               type="submit"
               size="icon"
-              disabled={!input.trim() || !transport}
+              disabled={!input.trim() || !transport || !token}
               className="h-9 w-9 shrink-0"
               aria-label="Send"
             >
