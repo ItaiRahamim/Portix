@@ -4,7 +4,7 @@
 // ONE-OFF backfill: walks portix.documents for rows where ai_data IS NOT NULL
 // but no chunks exist yet in portix.document_chunks, chunks the text with
 // the same logic as the live ingestion pipeline, calls Gemini's
-// text-embedding-004 model directly, and inserts the chunks into
+// gemini-embedding-2 model directly (768-dim output), and inserts the chunks into
 // portix.document_chunks via the service-role client.
 //
 // Earlier version delegated to the embed-document Edge Function via an
@@ -119,7 +119,11 @@ function buildRagText(doc: any): string {
 // chunkText, embedChunk, and the insert payload shape are kept verbatim
 // in sync with supabase/functions/embed-document/index.ts.
 
-const GEMINI_EMBED_MODEL = "text-embedding-004";
+const GEMINI_EMBED_MODEL = "gemini-embedding-2";
+// gemini-embedding-2 defaults to 3072-dim output. We pin 768 so the result
+// fits portix.document_chunks.embedding (vector(768)) — KEEP THIS IN SYNC
+// with the column type and with embed-document/index.ts.
+const EMBED_OUTPUT_DIM = 768;
 const GEMINI_EMBED_URL   =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBED_MODEL}:embedContent`;
 const RETRIABLE = new Set([429, 503]);
@@ -146,6 +150,7 @@ async function embedChunk(text: string): Promise<number[]> {
       model: `models/${GEMINI_EMBED_MODEL}`,
       content: { parts: [{ text }] },
       taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: EMBED_OUTPUT_DIM,
     }),
   }, 2);
 
@@ -156,7 +161,7 @@ async function embedChunk(text: string): Promise<number[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const json = (await res.json()) as any;
   const values: number[] | undefined = json?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== 768) {
+  if (!Array.isArray(values) || values.length !== EMBED_OUTPUT_DIM) {
     throw new Error(`unexpected embedding shape (len=${values?.length ?? "n/a"})`);
   }
   return values;

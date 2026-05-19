@@ -2,7 +2,8 @@
 // Runtime: Deno
 //
 // Chunks document text, generates 768-dim embeddings via Gemini's
-// text-embedding-004 model, and inserts rows into portix.document_chunks.
+// gemini-embedding-2 model (truncated to 768 dims), and inserts rows into
+// portix.document_chunks.
 //
 // Called by:
 //   - classify-documents (fire-and-forget after ai_data is written)
@@ -39,7 +40,11 @@ const supabaseAdmin = createClient(
 
 // ─── Gemini REST ──────────────────────────────────────────────────────────────
 
-const EMBED_MODEL = "text-embedding-004";
+const EMBED_MODEL = "gemini-embedding-2";
+// gemini-embedding-2 defaults to 3072-dim output. We pin 768 so the result
+// fits portix.document_chunks.embedding (vector(768)) — change both the
+// outputDimensionality below AND the column type if you want higher fidelity.
+const EMBED_OUTPUT_DIM = 768;
 const GEMINI_URL  = `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent`;
 const RETRIABLE = new Set([429, 503]);
 
@@ -67,6 +72,7 @@ async function embedChunk(text: string, apiKey: string): Promise<number[]> {
       // RETRIEVAL_DOCUMENT optimizes the vector for storage-side use
       // (paired with RETRIEVAL_QUERY at search time).
       taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: EMBED_OUTPUT_DIM,
     }),
   }, 2);
 
@@ -78,7 +84,7 @@ async function embedChunk(text: string, apiKey: string): Promise<number[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const json = (await res.json()) as any;
   const values: number[] | undefined = json?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== 768) {
+  if (!Array.isArray(values) || values.length !== EMBED_OUTPUT_DIM) {
     throw new Error(`Gemini returned unexpected embedding shape (len=${values?.length ?? "n/a"})`);
   }
   return values;
