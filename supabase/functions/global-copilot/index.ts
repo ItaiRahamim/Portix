@@ -147,10 +147,17 @@ serve(async (req) => {
     return new Response("Unauthorized", { status: 401, headers: corsHeaders });
   }
 
+  // db.schema = 'portix' is REQUIRED — the RAG RPC (and every other table
+  // we care about) lives in the portix schema. Without this option supabase-js
+  // routes RPC calls to public.* and PostgREST 404s with
+  //   "Could not find the function public.match_user_document_chunks in the schema cache".
   const supabaseAnon = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
     Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-    { global: { headers: { Authorization: authHeader } } },
+    {
+      db:     { schema: "portix" },
+      global: { headers: { Authorization: authHeader } },
+    },
   );
 
   const { data: { user } } = await supabaseAnon.auth.getUser();
