@@ -246,17 +246,27 @@ serve(async (req) => {
     return new Response("GEMINI_API_KEY not set", { status: 500, headers: corsHeaders });
   }
 
-  // ── RAG: embed the last user message and pull top chunks the user can see ─
-  // Failure here is non-fatal — Porty just answers from general knowledge if
-  // retrieval comes back empty or errors out (EXCEPT when the user explicitly
-  // names a container number — see short-circuit below).
+  // ── RAG retrieval ─────────────────────────────────────────────────────────
+  // Two retrieval paths run depending on whether the user named a container:
+  //
+  //   A. NO container in query → similarity search via RPC (existing behaviour).
+  //      Failure is non-fatal — Porty falls back to general knowledge.
+  //
+  //   B. Container named (e.g. SEGU9467227) → DIRECT lookup via supabaseAnon:
+  //      fetch chunks where containers.container_number = ANY(requested) AND
+  //      chunks tagged "Container Number: ALL" for the same shipment. This
+  //      bypasses similarity entirely so a Hebrew (or otherwise low-cosine)
+  //      query can't starve the response. Similarity is still run in parallel
+  //      to surface anything tagged ALL that lives under a different container,
+  //      and the two result sets are merged + de-duped before injection.
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type Chunk = { id: string; container_id: string; content: string; similarity?: number };
+
   let contextString = "";
   const lastUserText = [...messages].reverse().find((m) => m.role === "user");
   const queryText = lastUserText ? messageText(lastUserText).trim() : "";
 
-  // Detect ISO 6346 container numbers in the query. When present we tighten
-  // the retrieval contract: only chunks belonging to those containers may
-  // be used, and on zero matches we refuse rather than guess.
   const requestedContainers = queryText ? findContainerNumbers(queryText) : [];
   const filterByContainer   = requestedContainers.length > 0;
 
@@ -265,86 +275,141 @@ serve(async (req) => {
     if (filterByContainer) {
       console.log(`[global-copilot] requested containers: ${JSON.stringify(requestedContainers)}`);
     }
+
+    const merged: Map<string, Chunk> = new Map();
+
+    // PATH B: Direct lookup by container_number (only when filter requested)
+    if (filterByContainer) {
+      try {
+        // 1. Resolve container_numbers → container_ids the caller can see.
+        //    RLS on portix.containers limits to importer/supplier/customs scope.
+        const { data: ctrs, error: ctrErr } = await supabaseAnon
+          .from("containers")
+          .select("id, container_number, shipment_id")
+          .in("container_number", requestedContainers);
+
+        if (ctrErr) {
+          console.error(`[global-copilot] container lookup error: ${ctrErr.message}`);
+        } else {
+          const matchedIds  = (ctrs ?? []).map((c: { id: string }) => c.id);
+          const shipmentIds = [...new Set((ctrs ?? []).map((c: { shipment_id: string | null }) => c.shipment_id).filter(Boolean) as string[])];
+          console.log(`[global-copilot] direct lookup: ${matchedIds.length} container(s) visible to user; shipments=${shipmentIds.length}`);
+
+          if (matchedIds.length === 0) {
+            // User can't see ANY of the requested containers (or they don't exist).
+            // Refuse without burning Gemini.
+            const refusal = requestedContainers.length === 1
+              ? `No information found for container ${requestedContainers[0]}.`
+              : `No information found for containers ${requestedContainers.join(", ")}.`;
+            console.log(`[global-copilot] short-circuit (unknown container): ${refusal}`);
+            return streamFixedText(refusal);
+          }
+
+          // 2a. Direct chunks for the requested container(s).
+          const { data: directChunks, error: dErr } = await supabaseAnon
+            .from("document_chunks")
+            .select("id, container_id, content")
+            .in("container_id", matchedIds)
+            .limit(40);
+
+          if (dErr) {
+            console.error(`[global-copilot] direct chunk lookup error: ${dErr.message}`);
+          } else {
+            for (const c of (directChunks ?? []) as Chunk[]) merged.set(c.id, c);
+            console.log(`[global-copilot] direct chunks (specific): ${directChunks?.length ?? 0}`);
+          }
+
+          // 2b. ALL-tagged chunks in the SAME shipment(s) the user asked about.
+          //     These cover consolidated invoices / master B/Ls that share data
+          //     across every container in the shipment.
+          if (shipmentIds.length > 0) {
+            const { data: siblings, error: sErr } = await supabaseAnon
+              .from("containers")
+              .select("id")
+              .in("shipment_id", shipmentIds);
+
+            if (sErr) {
+              console.error(`[global-copilot] sibling-container lookup error: ${sErr.message}`);
+            } else {
+              const siblingIds = (siblings ?? []).map((c: { id: string }) => c.id);
+              if (siblingIds.length > 0) {
+                const { data: allChunks, error: aErr } = await supabaseAnon
+                  .from("document_chunks")
+                  .select("id, container_id, content")
+                  .in("container_id", siblingIds)
+                  .ilike("content", "%Container Number: ALL%")
+                  .limit(40);
+
+                if (aErr) {
+                  console.error(`[global-copilot] ALL chunk lookup error: ${aErr.message}`);
+                } else {
+                  for (const c of (allChunks ?? []) as Chunk[]) merged.set(c.id, c);
+                  console.log(`[global-copilot] ALL chunks (shipment-wide): ${allChunks?.length ?? 0}`);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[global-copilot] direct-lookup exception: ${(e as Error).message}`);
+      }
+    }
+
+    // PATH A: Similarity search via RPC — augments direct lookup, OR is the
+    // sole retrieval path for non-container questions.
     const queryEmbedding = await embedQuery(queryText, apiKey);
     if (!queryEmbedding) {
-      console.error("[global-copilot] embedQuery returned null — skipping RAG");
+      console.error("[global-copilot] embedQuery returned null — skipping similarity step");
     } else {
       console.log(`[global-copilot] queryEmbedding ready (len=${queryEmbedding.length})`);
-
-      // Pull a deeper pool when filtering so we don't starve after the post-filter.
       const matchCount = filterByContainer ? 20 : 8;
-
-      const { data: chunks, error: rpcErr } = await supabaseAnon
+      const { data: simChunks, error: rpcErr } = await supabaseAnon
         .rpc("match_user_document_chunks", {
           query_embedding: queryEmbedding,
           match_threshold: 0.5,
           match_count:     matchCount,
         });
 
-      console.log(
-        "[global-copilot] RAG Chunks retrieved:",
-        JSON.stringify(
-          (chunks ?? []).map((c: { id?: string; container_id?: string; similarity?: number; content?: string }) => ({
-            id:           c.id,
-            container_id: c.container_id,
-            similarity:   c.similarity,
-            content_head: typeof c.content === "string" ? c.content.slice(0, 120) : null,
-          })),
-        ),
-      );
-
       if (rpcErr) {
-        console.error(`[global-copilot] RAG RPC error: ${rpcErr.message}`);
-      } else if (Array.isArray(chunks) && chunks.length > 0) {
-        // Post-filter by container number when the query named one(s).
-        // Chunk content always starts with "Container Number: <num>" courtesy
-        // of buildRagText() in classify-documents. Multi-container documents
-        // (invoices / B/Ls covering an entire shipment) are tagged
-        // "Container Number: ALL" — those apply to every requested container
-        // and must NOT be filtered out.
+        console.error(`[global-copilot] similarity RPC error: ${rpcErr.message}`);
+      } else if (Array.isArray(simChunks) && simChunks.length > 0) {
+        // Filter similarity hits the same way as direct lookup when container
+        // was named, so we never inject foreign-container data.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let filtered: any[] = chunks;
+        let usableSim: any[] = simChunks;
         if (filterByContainer) {
           const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
-          filtered = chunks.filter((c: { content?: string }) => {
+          usableSim = simChunks.filter((c: { content?: string }) => {
             const cn = chunkContainerNumber(String(c.content ?? ""));
-            if (!cn) return false;
-            return cn === "ALL" || wanted.has(cn);
+            return cn && (cn === "ALL" || wanted.has(cn));
           });
-          console.log(`[global-copilot] filtered chunks: ${filtered.length}/${chunks.length} (incl. ALL)`);
-
-          if (filtered.length === 0) {
-            // Short-circuit: refuse cleanly instead of letting the model guess
-            const refusal = requestedContainers.length === 1
-              ? `No information found for container ${requestedContainers[0]}.`
-              : `No information found for containers ${requestedContainers.join(", ")}.`;
-            console.log(`[global-copilot] short-circuit: ${refusal}`);
-            return streamFixedText(refusal);
-          }
         }
-
-        contextString = filtered
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          .map((c: any) => {
-            const realCn = chunkContainerNumber(String(c.content ?? "")) ?? "unknown";
-            const txt    = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 800);
-            return `- [container ${realCn}] ${txt}`;
-          })
-          .join("\n");
-
-        console.log(`[global-copilot] RAG hits=${filtered.length} for user ${user.id}`);
+        for (const c of usableSim as Chunk[]) merged.set(c.id, c);
+        console.log(`[global-copilot] similarity chunks added: ${usableSim.length}/${simChunks.length}`);
       } else {
-        console.log(`[global-copilot] RAG no hits for query "${queryText.slice(0, 60)}"`);
-        // Same refusal applies if the user named a container and we found nothing at all.
-        if (filterByContainer) {
-          const refusal = requestedContainers.length === 1
-            ? `No information found for container ${requestedContainers[0]}.`
-            : `No information found for containers ${requestedContainers.join(", ")}.`;
-          console.log(`[global-copilot] short-circuit (no hits): ${refusal}`);
-          return streamFixedText(refusal);
-        }
+        console.log("[global-copilot] similarity returned 0 hits");
       }
     }
+
+    // Final assemble
+    const chunksOut = [...merged.values()].slice(0, 30);
+    if (filterByContainer && chunksOut.length === 0) {
+      const refusal = requestedContainers.length === 1
+        ? `No information found for container ${requestedContainers[0]}.`
+        : `No information found for containers ${requestedContainers.join(", ")}.`;
+      console.log(`[global-copilot] short-circuit (no chunks after merge): ${refusal}`);
+      return streamFixedText(refusal);
+    }
+
+    contextString = chunksOut
+      .map((c) => {
+        const realCn = chunkContainerNumber(String(c.content ?? "")) ?? "unknown";
+        const txt    = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 800);
+        return `- [container ${realCn}] ${txt}`;
+      })
+      .join("\n");
+
+    console.log(`[global-copilot] RAG hits=${chunksOut.length} for user ${user.id}`);
   }
 
   // Final scrub — even if a chunk body contains a stray UUID / 8-hex token,
