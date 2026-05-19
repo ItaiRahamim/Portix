@@ -188,6 +188,47 @@ const SUPPLEMENTARY_DOC_TYPES = new Set([
   "import_license_doc",
 ]);
 
+// ── RAG text synthesis ───────────────────────────────────────────────────────
+// Flattens a Gemini-extracted document object into a human-readable text blob
+// suitable for chunking + embedding. Skips empty/null leaves and recursively
+// handles nested objects + arrays. Returns "" when the doc has nothing useful.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function flattenForRag(prefix: string, value: any, lines: string[]): void {
+  if (value === null || value === undefined) return;
+  if (typeof value === "string") {
+    const v = value.trim();
+    if (v) lines.push(`${prefix}: ${v}`);
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    lines.push(`${prefix}: ${String(value)}`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => flattenForRag(`${prefix}[${idx}]`, item, lines));
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      flattenForRag(prefix ? `${prefix}.${k}` : k, v, lines);
+    }
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildRagText(doc: any): string {
+  const lines: string[] = [];
+  if (doc?.document_type) lines.push(`Document Type: ${String(doc.document_type).replace(/_/g, " ")}`);
+  if (doc?.document_number) lines.push(`Document Number: ${doc.document_number}`);
+  if (doc?.container_number) lines.push(`Container Number: ${doc.container_number}`);
+  if (doc?.carrier) lines.push(`Carrier: ${doc.carrier}`);
+  if (doc?.extractedData) {
+    flattenForRag("", doc.extractedData, lines);
+  }
+  return lines.join("\n\n");
+}
+
 // ── Carrier normalization (keep in sync with lib/tracking.ts) ────────────────
 //
 // Maps an arbitrary carrier string from the AI / document (e.g. "Maersk Line",
@@ -553,6 +594,9 @@ serve(async (req) => {
       };
 
       let anySuccess = false;
+      // Track document ids per container so we can fire RAG embedding after persist
+      const successfulDocIds: Array<{ containerId: string; documentId: string }> = [];
+
       for (const cid of targetIds) {
         // Try UPDATE first — only touches rows that aren't yet approved/rejected.
         const { data: updated, error: dbErr } = await supabaseAdmin
@@ -570,6 +614,7 @@ serve(async (req) => {
           );
         } else if (updated && updated.length > 0) {
           anySuccess = true;
+          successfulDocIds.push({ containerId: cid, documentId: updated[0].id });
         } else if (SUPPLEMENTARY_DOC_TYPES.has(doc.document_type)) {
           // UPDATE returned 0 rows — row doesn't exist yet (supplementary type not pre-seeded).
           // Verify it genuinely doesn't exist (vs. being approved/rejected — leave those alone).
@@ -581,9 +626,11 @@ serve(async (req) => {
             .maybeSingle();
 
           if (!existing) {
-            const { error: insertErr } = await supabaseAdmin
+            const { data: inserted, error: insertErr } = await supabaseAdmin
               .from("documents")
-              .insert({ ...patch, container_id: cid, document_type: doc.document_type });
+              .insert({ ...patch, container_id: cid, document_type: doc.document_type })
+              .select("id")
+              .single();
 
             if (insertErr) {
               console.warn(
@@ -592,10 +639,49 @@ serve(async (req) => {
               );
             } else {
               anySuccess = true;
+              if (inserted?.id) {
+                successfulDocIds.push({ containerId: cid, documentId: inserted.id });
+              }
               console.log(`[classify-documents] Created new supplementary row: ${doc.document_type}/${cid}`);
             }
           }
           // If row exists but is approved/rejected → skip (correct behavior)
+        }
+      }
+
+      // ── Fire-and-forget RAG embedding ──────────────────────────────────────
+      // Build a human-readable text blob from the AI-extracted data and ship
+      // it to the embed-document Edge Function. Wrapped in try/catch + .catch()
+      // so any failure here never breaks the document upload flow.
+      if (anySuccess && successfulDocIds.length > 0) {
+        try {
+          const ragText = buildRagText(doc);
+          if (ragText) {
+            const supabaseUrl  = Deno.env.get("SUPABASE_URL") ?? "";
+            const serviceKey   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+            for (const { containerId: cid, documentId: did } of successfulDocIds) {
+              // No await — fire-and-forget. .catch() swallows promise rejections.
+              fetch(`${supabaseUrl}/functions/v1/embed-document`, {
+                method: "POST",
+                headers: {
+                  "Content-Type":  "application/json",
+                  Authorization:   `Bearer ${serviceKey}`,
+                },
+                body: JSON.stringify({
+                  container_id: cid,
+                  document_id:  did,
+                  text:         ragText,
+                }),
+              }).catch((e) => {
+                console.warn(
+                  `[classify-documents] embed-document fire-and-forget failed (${did}):`,
+                  (e as Error).message,
+                );
+              });
+            }
+          }
+        } catch (e) {
+          console.warn("[classify-documents] embed trigger setup failed:", (e as Error).message);
         }
       }
 
