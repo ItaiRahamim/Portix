@@ -178,31 +178,28 @@ function renderMessageText(m: any): string {
   return "";
 }
 
-// ─── Main component ──────────────────────────────────────────────────────────
+// ─── Inner panel — mounted ONLY when a valid user JWT is in hand ─────────────
+// Splitting this out so useChat() initializes with a transport that already
+// carries the Authorization header. Mounting the hook before the token is
+// loaded caused a stale closure in @ai-sdk/react: the internal fetcher kept
+// using the headers from first-render forever, producing UNAUTHORIZED_NO_AUTH_HEADER
+// once the token finally arrived.
+//
+// `token` here is guaranteed JWT-shaped (parent already checks startsWith("eyJ")).
+// `key={token}` on the parent's render of this component remounts cleanly on
+// token rotation (logout → login as a different user), preventing any cross-
+// session message bleed.
 
-export function GlobalChatbot() {
-  const [open, setOpen]   = useState(false);
-  const [token, setToken] = useState<string | null>(null);
+interface PortyChatPanelProps {
+  token: string;
+}
+
+function PortyChatPanel({ token }: PortyChatPanelProps) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Pull the user's access token once on mount. Re-fetch on auth-state change
-  // so a fresh login (or sign-out) is reflected without a page reload.
-  useEffect(() => {
-    const supabase = createBrowserSupabaseClient();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (supabase.auth as any).getSession().then(({ data }: { data: { session: { access_token: string } | null } }) => {
-      setToken(data.session?.access_token ?? null);
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: sub } = (supabase.auth as any).onAuthStateChange(
-      (_event: string, session: { access_token: string } | null) => {
-        setToken(session?.access_token ?? null);
-      },
-    );
-    return () => sub.subscription.unsubscribe();
-  }, []);
-
+  // Transport built once at mount because `token` is already valid here.
+  // useMemo gives it a stable identity for the hook's lifetime.
   const transport = useMemo(() => buildTransport(token), [token]);
 
   const { messages, sendMessage, status, error, stop } = useChat({
@@ -211,7 +208,6 @@ export function GlobalChatbot() {
 
   const isStreaming = status === "submitted" || status === "streaming";
 
-  // Auto-scroll on new content
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -221,54 +217,13 @@ export function GlobalChatbot() {
   function handleSend(e?: React.FormEvent) {
     e?.preventDefault();
     const text = input.trim();
-    if (!text || !transport || !token || isStreaming) return;
+    if (!text || isStreaming) return;
     setInput("");
-    // sendMessage accepts a UIMessage-shaped object
     sendMessage({ text });
   }
 
-  // ── Closed state: floating button ──────────────────────────────────────────
-  if (!open) {
-    return (
-      <button
-        type="button"
-        aria-label="Open Porty AI copilot"
-        onClick={() => setOpen(true)}
-        className="group fixed bottom-6 right-6 z-[9999] w-16 h-16 rounded-full bg-gradient-to-br from-sky-100 to-blue-200 text-white shadow-lg hover:shadow-2xl hover:scale-110 transition-all flex items-center justify-center ring-2 ring-white"
-      >
-        <PortyAvatar size={56} />
-        {/* Online pulse dot */}
-        <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-green-400 ring-2 ring-white">
-          <span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-75" />
-        </span>
-      </button>
-    );
-  }
-
-  // ── Open state: messenger card ─────────────────────────────────────────────
   return (
-    <Card className="fixed bottom-6 right-6 z-[9999] w-[min(92vw,380px)] h-[min(80vh,560px)] flex flex-col shadow-2xl border-gray-200 overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
-        <div className="flex items-center gap-2">
-          <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
-            <PortyAvatar size={36} showHand={false} />
-          </div>
-          <div>
-            <p className="font-semibold text-sm leading-tight">Porty</p>
-            <p className="text-xs text-blue-100">Your logistics copilot</p>
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={() => setOpen(false)}
-          aria-label="Close chat"
-          className="text-white/80 hover:text-white p-1 -mr-1"
-        >
-          <X className="w-5 h-5" />
-        </button>
-      </div>
-
+    <>
       {/* Messages */}
       <ScrollArea className="flex-1 bg-gray-50">
         <div ref={scrollRef} className="px-4 py-4 space-y-3">
@@ -332,8 +287,8 @@ export function GlobalChatbot() {
           <Textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={token ? "Ask Porty…" : "Sign in to chat with Porty"}
-            disabled={!transport || !token || isStreaming}
+            placeholder="Ask Porty…"
+            disabled={isStreaming}
             rows={1}
             className="resize-none min-h-9 max-h-32 text-sm py-2"
             onKeyDown={(e) => {
@@ -358,7 +313,7 @@ export function GlobalChatbot() {
             <Button
               type="submit"
               size="icon"
-              disabled={!input.trim() || !transport || !token}
+              disabled={!input.trim()}
               className="h-9 w-9 shrink-0"
               aria-label="Send"
             >
@@ -367,6 +322,104 @@ export function GlobalChatbot() {
           )}
         </form>
       </CardContent>
+    </>
+  );
+}
+
+// ─── Outer component — owns auth + open state ────────────────────────────────
+
+export function GlobalChatbot() {
+  const [open, setOpen]   = useState(false);
+  const [token, setToken] = useState<string | null>(null);
+  const [authLoaded, setAuthLoaded] = useState(false);
+
+  // Pull the user's access token once on mount. Re-fetch on auth-state change
+  // so a fresh login (or sign-out) is reflected without a page reload.
+  useEffect(() => {
+    const supabase = createBrowserSupabaseClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (supabase.auth as any).getSession().then(({ data }: { data: { session: { access_token: string } | null } }) => {
+      setToken(data.session?.access_token ?? null);
+      setAuthLoaded(true);
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sub } = (supabase.auth as any).onAuthStateChange(
+      (_event: string, session: { access_token: string } | null) => {
+        setToken(session?.access_token ?? null);
+      },
+    );
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // A token is "ready" only when it's a real JWT — never an anon publishable key
+  const validToken = !!token && token.startsWith("eyJ");
+
+  // ── Closed state: floating button ──────────────────────────────────────────
+  if (!open) {
+    return (
+      <button
+        type="button"
+        aria-label="Open Porty AI copilot"
+        onClick={() => setOpen(true)}
+        className="group fixed bottom-6 right-6 z-[9999] w-16 h-16 rounded-full bg-gradient-to-br from-sky-100 to-blue-200 text-white shadow-lg hover:shadow-2xl hover:scale-110 transition-all flex items-center justify-center ring-2 ring-white"
+      >
+        <PortyAvatar size={56} />
+        {/* Online pulse dot */}
+        <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-green-400 ring-2 ring-white">
+          <span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-75" />
+        </span>
+      </button>
+    );
+  }
+
+  // ── Open state: messenger card ─────────────────────────────────────────────
+  return (
+    <Card className="fixed bottom-6 right-6 z-[9999] w-[min(92vw,380px)] h-[min(80vh,560px)] flex flex-col shadow-2xl border-gray-200 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
+        <div className="flex items-center gap-2">
+          <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
+            <PortyAvatar size={36} showHand={false} />
+          </div>
+          <div>
+            <p className="font-semibold text-sm leading-tight">Porty</p>
+            <p className="text-xs text-blue-100">Your logistics copilot</p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          aria-label="Close chat"
+          className="text-white/80 hover:text-white p-1 -mr-1"
+        >
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+
+      {/* Body — only mount the chat panel once we have a real JWT */}
+      {!authLoaded ? (
+        <div className="flex-1 flex items-center justify-center text-gray-400 text-sm gap-2">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Loading session…
+        </div>
+      ) : !validToken ? (
+        <div className="flex-1 flex items-center justify-center px-6 text-center">
+          <div>
+            <div className="group inline-block mb-3">
+              <PortyAvatar size={56} />
+            </div>
+            <p className="text-sm font-medium text-gray-700 mb-1">Sign in to chat with Porty</p>
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Porty pulls answers from your own container documents, so it
+              needs to know who you are before it can help.
+            </p>
+          </div>
+        </div>
+      ) : (
+        // KEY ON TOKEN: any session refresh / re-login fully remounts useChat
+        // so the new Authorization header is captured from the start.
+        <PortyChatPanel key={token} token={token!} />
+      )}
     </Card>
   );
 }
