@@ -31,11 +31,36 @@ const corsHeaders = {
 };
 
 // ─── Supabase admin client ────────────────────────────────────────────────────
+// Try multiple env-var names because Supabase CLI versions vary, and on newer
+// versions secrets prefixed with SUPABASE_ are reserved (must be set via dash
+// or under a non-reserved name). Also explicitly set apikey + Authorization
+// headers — some supabase-js builds only honor one of the two paths, which
+// is the typical root cause of mysterious "permission denied" RLS errors.
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+const SERVICE_KEY  =
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
+  Deno.env.get("SUPABASE_SERVICE_KEY") ||
+  Deno.env.get("SERVICE_ROLE_KEY") ||
+  "";
+
+if (!SERVICE_KEY) {
+  console.error("[embed-document] No service role key in env. Tried SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_KEY, SERVICE_ROLE_KEY.");
+}
 
 const supabaseAdmin = createClient(
-  Deno.env.get("SUPABASE_URL") ?? "",
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-  { db: { schema: "portix" }, auth: { persistSession: false } },
+  SUPABASE_URL,
+  SERVICE_KEY,
+  {
+    db:   { schema: "portix" },
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      headers: {
+        apikey:        SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
+      },
+    },
+  },
 );
 
 // ─── Gemini REST ──────────────────────────────────────────────────────────────

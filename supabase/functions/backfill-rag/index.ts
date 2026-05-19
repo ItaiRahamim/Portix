@@ -51,14 +51,45 @@ const corsHeaders = {
 };
 
 // ─── Admin client ─────────────────────────────────────────────────────────────
+// Supabase Edge Functions auto-inject SUPABASE_SERVICE_ROLE_KEY, but the name
+// has varied across CLI versions and self-hosted setups. Try several fallbacks
+// before giving up — and fail loudly if NONE is set, so the caller sees the
+// real problem instead of a misleading "permission denied" downstream.
 
-const SUPABASE_URL  = Deno.env.get("SUPABASE_URL") ?? "";
-const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 
+const SERVICE_KEY =
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
+  Deno.env.get("SUPABASE_SERVICE_KEY") ||
+  Deno.env.get("SERVICE_ROLE_KEY") ||
+  "";
+
+if (!SERVICE_KEY) {
+  // Logged but not thrown at module load — Deno keeps the function alive even
+  // if module init throws, leading to confusing 503s. The handler itself
+  // re-checks and returns a clean 500 with a clear message.
+  console.error("[backfill-rag] No service role key in env. Tried SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_KEY, SERVICE_ROLE_KEY.");
+} else {
+  console.log(`[backfill-rag] service_role key loaded (len=${SERVICE_KEY.length})`);
+}
+
+// Belt-and-suspenders: explicitly set apikey + Authorization headers in
+// addition to passing the key as the second arg. Some supabase-js versions
+// only honor one of the two paths, and the symptom is exactly the kind of
+// "permission denied" RLS failure we're trying to avoid.
 const supabaseAdmin = createClient(
   SUPABASE_URL,
   SERVICE_KEY,
-  { db: { schema: "portix" }, auth: { persistSession: false } },
+  {
+    db:   { schema: "portix" },
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      headers: {
+        apikey:        SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
+      },
+    },
+  },
 );
 
 // ─── RAG text synthesis ──────────────────────────────────────────────────────
@@ -318,6 +349,16 @@ serve(async (req) => {
   if (!GEMINI_API_KEY) {
     return new Response(
       JSON.stringify({ ok: false, error: "GEMINI_API_KEY secret is not set" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
+
+  if (!SERVICE_KEY) {
+    return new Response(
+      JSON.stringify({
+        ok:    false,
+        error: "Service role key not found in env. Set SUPABASE_SERVICE_ROLE_KEY as a function secret. Note: secrets prefixed SUPABASE_ are reserved on newer CLI versions — you may need to set it as SERVICE_ROLE_KEY instead.",
+      }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   }
