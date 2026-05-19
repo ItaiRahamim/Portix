@@ -275,6 +275,44 @@ export interface ImportLicenseView {
   importer_company: string | null
 }
 
+// ─── RAG: document_chunks table + match RPC ───────────────────────────────────
+// Migration: 00340_setup_pgvector_rag.sql
+//
+// portix.document_chunks stores text fragments + 1536-dim OpenAI embeddings
+// (text-embedding-3-small). Searched via the match_document_chunks RPC,
+// container-scoped, cosine similarity.
+
+export interface DocumentChunk {
+  id: string
+  container_id: string
+  document_id: string | null
+  content: string
+  /** OpenAI text-embedding-3-small (1536 floats). Never sent to the browser. */
+  embedding: number[]
+  token_count: number | null
+  chunk_index: number
+  metadata: Record<string, unknown>
+  created_at: string
+}
+
+/** Shape returned by the match_document_chunks RPC (no embedding column). */
+export interface MatchedChunk {
+  id: string
+  document_id: string | null
+  content: string
+  /** Cosine similarity in [-1, 1]; effectively [0, 1] for L2-normalized vectors. */
+  similarity: number
+  chunk_index: number
+  metadata: Record<string, unknown>
+}
+
+export interface MatchDocumentChunksArgs {
+  query_embedding: number[]      // length 1536
+  match_threshold: number        // 0..1; lower = looser
+  match_count: number            // top-N
+  filter_container_id: string
+}
+
 // ─── The 7 required document types (canonical list — matches seed trigger) ────
 
 export const REQUIRED_DOCUMENT_TYPES: DocumentType[] = [
