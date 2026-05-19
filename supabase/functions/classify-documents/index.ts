@@ -219,12 +219,19 @@ function flattenForRag(prefix: string, value: any, lines: string[]): void {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function buildRagText(doc: any): string {
   const lines: string[] = [];
-  if (doc?.document_type) lines.push(`Document Type: ${String(doc.document_type).replace(/_/g, " ")}`);
+  if (doc?.document_type)   lines.push(`Document Type: ${String(doc.document_type).replace(/_/g, " ")}`);
   if (doc?.document_number) lines.push(`Document Number: ${doc.document_number}`);
   if (doc?.container_number) lines.push(`Container Number: ${doc.container_number}`);
-  if (doc?.carrier) lines.push(`Carrier: ${doc.carrier}`);
+  if (doc?.carrier)          lines.push(`Carrier: ${doc.carrier}`);
   if (doc?.extractedData) {
     flattenForRag("", doc.extractedData, lines);
+  }
+  // Full PDF text is the single most useful thing for RAG — append last so
+  // chunking always preserves it even when metadata pushes earlier chunks out.
+  const rawText = typeof doc?.raw_text === "string" ? doc.raw_text.trim() : "";
+  if (rawText) {
+    lines.push("--- FULL DOCUMENT TEXT ---");
+    lines.push(rawText);
   }
   return lines.join("\n\n");
 }
@@ -294,7 +301,8 @@ Return a JSON object with this EXACT structure:
         "totalAmount": Number,
         "currency": "String (e.g., USD, EUR)",
         "itemCount": Number
-      }
+      },
+      "raw_text": "String. FULL verbatim text content of THIS specific document — every line of every page that belongs to this document. Preserve line breaks between distinct lines. Include item descriptions, quantities, weights, prices, addresses, dates, signatures, footers. Do NOT summarize. Do NOT skip tables — flatten them row by row. This text feeds a downstream RAG search; missing content means the user can't find it later. If the PDF actually contains multiple documents and this entry represents only one of them, return ONLY that document's text."
     }
   ]
 }`;
@@ -313,6 +321,8 @@ interface DocumentFound {
     currency: string | null;
     itemCount: number | null;
   } | null;
+  /** Full verbatim PDF text for this document — fed into RAG embedding. */
+  raw_text?: string | null;
 }
 
 interface ClassifyResult {
@@ -579,6 +589,11 @@ serve(async (req) => {
         targetIds = matched ? [matched.id] : [containerId];
       }
 
+      // Strip raw_text out of ai_data — full PDF text is huge and only
+      // needed downstream by the RAG embedding step (passed via buildRagText).
+      // Storing it on the row would bloat selects and exceed JSON limits.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { raw_text: _rawTextForRag, ...docForAiData } = doc;
       const patch = {
         status:           "uploaded",
         storage_path:     finalStoragePath,
@@ -586,7 +601,7 @@ serve(async (req) => {
         file_size_bytes:  file.size,
         mime_type:        mimeType,
         document_number:  doc.document_number ?? null,
-        ai_data:          { ...doc.extractedData, ...doc },
+        ai_data:          { ...doc.extractedData, ...docForAiData },
         uploaded_at:      new Date().toISOString(),
         rejection_reason: null,
         reviewed_by:      null,
