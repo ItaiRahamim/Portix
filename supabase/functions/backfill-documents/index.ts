@@ -369,13 +369,23 @@ serve(async (req) => {
   const dryRun      = body.dryRun === true;
   const targetIds   = Array.isArray(body.documentIds) ? body.documentIds : null;
 
-  // 1. Pull candidate documents — only those with a file in Storage
+  // Stop the loop a few seconds short of the 150s edge-function timeout so
+  // we can return a clean response with progress stats instead of being
+  // killed mid-batch. Caller just re-invokes — already-backfilled docs are
+  // skipped on the next pass.
+  const startedAt    = Date.now();
+  const TIMEOUT_MS   = 140_000;
+
+  // 1. Pull candidate documents — only those with a file in Storage that
+  //    HAVEN'T already been backfilled with full text.
+  //    A document is considered "done" once any of its chunks contains the
+  //    "--- FULL DOCUMENT TEXT ---" marker (written by buildRagText below).
   let q = supabaseAdmin
     .from("documents")
     .select("id, container_id, document_type, storage_path, mime_type, file_name, ai_data")
     .not("storage_path", "is", null)
     .order("created_at", { ascending: true })
-    .limit(limit);
+    .limit(Math.max(limit, 500));   // overfetch — filter narrows it down
 
   if (targetIds && targetIds.length > 0) q = q.in("id", targetIds);
 
@@ -386,15 +396,48 @@ serve(async (req) => {
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   }
-  const candidates = (docs ?? []) as DocRow[];
+  const allCandidates = (docs ?? []) as DocRow[];
 
-  console.log(`[backfill-documents] candidates=${candidates.length} batchSize=${batchSize} dryRun=${dryRun}`);
+  // Find document_ids that already have a full-text chunk. ilike + DISTINCT
+  // would be ideal but PostgREST doesn't support DISTINCT directly, so we
+  // pull matching rows and dedupe in memory.
+  const FULL_TEXT_MARKER = "--- FULL DOCUMENT TEXT ---";
+  let alreadyDone = new Set<string>();
+  if (allCandidates.length > 0) {
+    const ids = allCandidates.map((d) => d.id);
+    const { data: doneChunks, error: chunkErr } = await supabaseAdmin
+      .from("document_chunks")
+      .select("document_id")
+      .in("document_id", ids)
+      .ilike("content", `%${FULL_TEXT_MARKER}%`);
+    if (chunkErr) {
+      console.warn(`[backfill-documents] done-chunks query failed: ${chunkErr.message}`);
+    } else {
+      alreadyDone = new Set(
+        (doneChunks ?? [])
+          .map((r: { document_id: string | null }) => r.document_id)
+          .filter((id): id is string => !!id),
+      );
+    }
+  }
+
+  // Filter + cap by requested limit. Already-done docs skipped entirely.
+  const candidates = allCandidates
+    .filter((d) => !alreadyDone.has(d.id))
+    .slice(0, limit);
+
+  console.log(
+    `[backfill-documents] fetched=${allCandidates.length} alreadyDone=${alreadyDone.size} ` +
+    `toProcess=${candidates.length} batchSize=${batchSize} dryRun=${dryRun}`,
+  );
 
   if (dryRun) {
     return new Response(
       JSON.stringify({
         ok: true, dryRun: true,
-        candidateCount: candidates.length,
+        fetchedCount:     allCandidates.length,
+        alreadyDoneCount: alreadyDone.size,
+        toProcessCount:   candidates.length,
         sample: candidates.slice(0, 10).map((d) => ({
           id:            d.id,
           document_type: d.document_type,
@@ -406,30 +449,48 @@ serve(async (req) => {
     );
   }
 
-  // 2. Process in batches (bounded concurrency keeps Gemini quota happy)
+  // 2. Process in batches with a runtime guard.
+  //    processOne already inserts per-document inside the loop, so partial
+  //    progress is durable even if we bail out before the loop finishes.
   let successCount = 0;
   let errorCount   = 0;
+  let timedOut     = false;
+  let processed    = 0;
   const errors: Array<{ document_id: string; error: string }> = [];
 
   for (let i = 0; i < candidates.length; i += batchSize) {
+    // Time guard — leave headroom for response serialization
+    if (Date.now() - startedAt > TIMEOUT_MS) {
+      timedOut = true;
+      console.warn(`[backfill-documents] approaching timeout — stopping at ${processed}/${candidates.length}`);
+      break;
+    }
+
     const batch = candidates.slice(i, i + batchSize);
     const results = await Promise.all(batch.map(processOne));
     for (const r of results) {
+      processed++;
       if (r.ok) successCount++;
       else {
         errorCount++;
         errors.push({ document_id: r.id, error: r.error ?? "unknown" });
       }
     }
-    console.log(`[backfill-documents] processed ${Math.min(i + batchSize, candidates.length)}/${candidates.length}`);
+    console.log(`[backfill-documents] processed ${processed}/${candidates.length}`);
   }
 
   return new Response(
     JSON.stringify({
       ok: true,
-      processedCount: candidates.length,
+      processedCount: processed,
       successCount,
       errorCount,
+      remainingCount: Math.max(0, candidates.length - processed),
+      timedOut,
+      elapsedMs:      Date.now() - startedAt,
+      hint: timedOut
+        ? "Edge function ran out of time. Re-invoke — already-backfilled docs are skipped automatically."
+        : undefined,
       errors: errors.slice(0, 50),
     }),
     { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
