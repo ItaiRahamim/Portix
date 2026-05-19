@@ -2,8 +2,15 @@
 // Runtime: Deno
 //
 // ONE-OFF backfill: walks portix.documents for rows where ai_data IS NOT NULL
-// but no chunks exist yet in portix.document_chunks, then invokes the
-// embed-document Edge Function for each so they become RAG-searchable.
+// but no chunks exist yet in portix.document_chunks, chunks the text with
+// the same logic as the live ingestion pipeline, calls Gemini's
+// text-embedding-004 model directly, and inserts the chunks into
+// portix.document_chunks via the service-role client.
+//
+// Earlier version delegated to the embed-document Edge Function via an
+// internal fetch — that consistently 401'd because Supabase's API gateway
+// rejects unverified-JWT inter-function calls. Doing the work inline bypasses
+// the gateway entirely.
 //
 // Invoke via curl (no auth required — see warning below):
 //   curl -X POST "$SUPABASE_URL/functions/v1/backfill-rag" \
@@ -103,31 +110,170 @@ function buildRagText(doc: any): string {
   return lines.join("\n\n");
 }
 
-// ─── Embed-document invocation (service-role bypass of RLS) ───────────────────
+// ─── Inline embedding pipeline ───────────────────────────────────────────────
+// We previously called the embed-document Edge Function via internal fetch,
+// but Supabase's gateway 401s those internal requests (even with service-role
+// bearer). Doing the chunk → Gemini embed → insert work directly here
+// sidesteps the gateway entirely.
+//
+// chunkText, embedChunk, and the insert payload shape are kept verbatim
+// in sync with supabase/functions/embed-document/index.ts.
 
-async function invokeEmbedDocument(
+const GEMINI_EMBED_MODEL = "text-embedding-004";
+const GEMINI_EMBED_URL   =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBED_MODEL}:embedContent`;
+const RETRIABLE = new Set([429, 503]);
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") ?? "";
+
+async function fetchWithRetry(url: string, init: RequestInit, maxRetries = 2): Promise<Response> {
+  let lastRes!: Response;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      const delay = Math.pow(2, attempt - 1) * 500;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    lastRes = await fetch(url, init);
+    if (lastRes.ok || !RETRIABLE.has(lastRes.status)) break;
+  }
+  return lastRes;
+}
+
+async function embedChunk(text: string): Promise<number[]> {
+  const res = await fetchWithRetry(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${GEMINI_EMBED_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_DOCUMENT",
+    }),
+  }, 2);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Gemini embed HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const json = (await res.json()) as any;
+  const values: number[] | undefined = json?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== 768) {
+    throw new Error(`unexpected embedding shape (len=${values?.length ?? "n/a"})`);
+  }
+  return values;
+}
+
+function chunkText(raw: string, maxLength = 800): string[] {
+  const text = (raw ?? "").trim();
+  if (!text) return [];
+
+  const paragraphs = text
+    .split(/\n{2,}/g)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  const chunks: string[] = [];
+  let buf = "";
+
+  for (const p of paragraphs) {
+    if (p.length > maxLength) {
+      if (buf) { chunks.push(buf); buf = ""; }
+      const sentences = p.split(/(?<=[.!?])\s+/g);
+      let sbuf = "";
+      for (const s of sentences) {
+        if (s.length > maxLength) {
+          if (sbuf) { chunks.push(sbuf); sbuf = ""; }
+          for (let i = 0; i < s.length; i += maxLength) {
+            chunks.push(s.slice(i, i + maxLength));
+          }
+          continue;
+        }
+        if (sbuf.length + s.length + 1 > maxLength) {
+          chunks.push(sbuf);
+          sbuf = s;
+        } else {
+          sbuf = sbuf ? `${sbuf} ${s}` : s;
+        }
+      }
+      if (sbuf) chunks.push(sbuf);
+      continue;
+    }
+
+    if (buf.length + p.length + 2 > maxLength) {
+      chunks.push(buf);
+      buf = p;
+    } else {
+      buf = buf ? `${buf}\n\n${p}` : p;
+    }
+  }
+  if (buf) chunks.push(buf);
+  return chunks;
+}
+
+/**
+ * Chunk → embed → insert. Replaces the previous fetch('embed-document').
+ * Returns { ok, chunks, error } so the batch loop can tally outcomes.
+ */
+async function embedAndInsertDocument(
   containerId: string,
   documentId: string,
   text: string,
 ): Promise<{ ok: boolean; chunks: number; error?: string }> {
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/embed-document`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization:  `Bearer ${SERVICE_KEY}`,
-      },
-      body: JSON.stringify({
-        container_id: containerId,
-        document_id:  documentId,
-        text,
-      }),
-    });
-    const payload = await res.json().catch(() => ({}));
-    if (!res.ok || !payload?.ok) {
-      return { ok: false, chunks: 0, error: payload?.error ?? `HTTP ${res.status}` };
+    const chunks = chunkText(text, 800);
+    if (chunks.length === 0) {
+      return { ok: true, chunks: 0, error: "empty text" };
     }
-    return { ok: true, chunks: payload?.chunks_inserted ?? 0 };
+
+    // Idempotency: drop any prior chunks for this document so re-runs replace cleanly
+    {
+      const { error: delErr } = await supabaseAdmin
+        .from("document_chunks")
+        .delete()
+        .eq("document_id", documentId);
+      if (delErr) console.warn(`[backfill-rag] prior-chunk delete failed (${documentId}): ${delErr.message}`);
+    }
+
+    const rows: Array<{
+      container_id: string;
+      document_id:  string;
+      content:      string;
+      embedding:    number[];
+      chunk_index:  number;
+      token_count:  number | null;
+    }> = [];
+
+    // Sequential per-chunk embedding to stay under the Gemini per-minute cap.
+    // (Document-level parallelism still happens via the outer batch.)
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        const embedding = await embedChunk(chunks[i]);
+        rows.push({
+          container_id: containerId,
+          document_id:  documentId,
+          content:      chunks[i],
+          embedding,
+          chunk_index:  i,
+          token_count:  null,
+        });
+      } catch (e) {
+        console.error(`[backfill-rag] chunk ${i} embed failed (${documentId}):`, (e as Error).message);
+        // skip this chunk; partial ingestion is better than total failure
+      }
+    }
+
+    if (rows.length === 0) {
+      return { ok: false, chunks: 0, error: "all chunks failed to embed" };
+    }
+
+    const { error: insErr } = await supabaseAdmin
+      .from("document_chunks")
+      .insert(rows);
+
+    if (insErr) {
+      return { ok: false, chunks: 0, error: `insert failed: ${insErr.message}` };
+    }
+
+    return { ok: true, chunks: rows.length };
   } catch (e) {
     return { ok: false, chunks: 0, error: (e as Error).message };
   }
@@ -163,6 +309,13 @@ serve(async (req) => {
   //       status: 401, headers: corsHeaders,
   //     });
   //   }
+
+  if (!GEMINI_API_KEY) {
+    return new Response(
+      JSON.stringify({ ok: false, error: "GEMINI_API_KEY secret is not set" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
 
   let body: BackfillBody = {};
   try {
@@ -249,12 +402,17 @@ serve(async (req) => {
 
     const results = await Promise.all(
       batch.map(async (doc) => {
-        const text = buildRagText(doc.ai_data ?? {});
-        if (!text) {
-          return { id: doc.id, ok: false, error: "buildRagText produced empty text" };
+        try {
+          const text = buildRagText(doc.ai_data ?? {});
+          if (!text) {
+            return { id: doc.id, ok: false, error: "buildRagText produced empty text" };
+          }
+          const r = await embedAndInsertDocument(doc.container_id, doc.id, text);
+          return { id: doc.id, ok: r.ok, error: r.error, chunks: r.chunks };
+        } catch (e) {
+          // Belt-and-suspenders: never let one bad doc kill the whole batch
+          return { id: doc.id, ok: false, error: (e as Error).message };
         }
-        const r = await invokeEmbedDocument(doc.container_id, doc.id, text);
-        return { id: doc.id, ok: r.ok, error: r.error, chunks: r.chunks };
       }),
     );
 
