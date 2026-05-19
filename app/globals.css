@@ -177,3 +177,48 @@
     line-height: 1.5;
   }
 }
+
+/* ── Porty (global AI copilot) avatar animations ──────────────────────────── */
+
+@keyframes porty-wave {
+  0%, 60%, 100% { transform: rotate(0deg); }
+  10% { transform: rotate(20deg); }
+  20% { transform: rotate(-10deg); }
+  30% { transform: rotate(20deg); }
+  40% { transform: rotate(-10deg); }
+  50% { transform: rotate(15deg); }
+}
+
+@keyframes porty-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95%, 97%      { transform: scaleY(0.1); }
+}
+
+@keyframes porty-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-2px); }
+}
+
+/* Hand defaults to idle; only waves while hover/focus on the group container.
+   transform-origin anchors at top-right shoulder so wave rotates around base. */
+.porty-hand {
+  transform-origin: 30% 80%;
+  transition: transform 0.2s ease;
+}
+.group:hover .porty-hand,
+.group:focus-visible .porty-hand {
+  animation: porty-wave 1.4s ease-in-out infinite;
+}
+
+.porty-eye {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: porty-blink 4.5s ease-in-out infinite;
+}
+
+.porty-body {
+  animation: porty-bob 3.2s ease-in-out infinite;
+}
+.group:hover .porty-body {
+  animation-duration: 1.6s;
+}

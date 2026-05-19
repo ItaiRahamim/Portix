@@ -18,8 +18,102 @@ import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useChat } from "@ai-sdk/react";
 import { TextStreamChatTransport } from "ai";
-import { Container as ContainerIcon, X, Send, Loader2 } from "lucide-react";
+import { X, Send, Loader2 } from "lucide-react";
 import { createBrowserSupabaseClient } from "@/lib/supabase";
+
+// ─── Porty avatar ────────────────────────────────────────────────────────────
+// A humanized shipping-container mascot: ridged body, glasses over big eyes,
+// and a tiny hand that waves on hover (.group:hover triggers .porty-hand
+// keyframes defined in app/globals.css).
+
+interface PortyAvatarProps {
+  size?: number;          // pixel size of the wrapper square
+  className?: string;
+  /** Show the waving hand. Disable for compact header use. */
+  showHand?: boolean;
+}
+
+function PortyAvatar({ size = 44, className = "", showHand = true }: PortyAvatarProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 64 64"
+      className={className}
+      aria-hidden="true"
+    >
+      {/* Container body — gentle bob */}
+      <g className="porty-body">
+        {/* Body shell */}
+        <rect x="8" y="14" width="48" height="38" rx="4" fill="#fde68a" stroke="#92400e" strokeWidth="1.5" />
+        {/* Ridges (vertical lines characteristic of intermodal containers) */}
+        <g stroke="#b45309" strokeWidth="1" opacity="0.55">
+          <line x1="16" y1="18" x2="16" y2="48" />
+          <line x1="22" y1="18" x2="22" y2="48" />
+          <line x1="28" y1="18" x2="28" y2="48" />
+          <line x1="36" y1="18" x2="36" y2="48" />
+          <line x1="42" y1="18" x2="42" y2="48" />
+          <line x1="48" y1="18" x2="48" y2="48" />
+        </g>
+        {/* Top + bottom rails */}
+        <rect x="8" y="14" width="48" height="3" fill="#92400e" opacity="0.35" />
+        <rect x="8" y="49" width="48" height="3" fill="#92400e" opacity="0.35" />
+
+        {/* Eyes (white sclera) */}
+        <ellipse cx="24" cy="30" rx="6" ry="6.5" fill="#ffffff" stroke="#1f2937" strokeWidth="1.2" />
+        <ellipse cx="40" cy="30" rx="6" ry="6.5" fill="#ffffff" stroke="#1f2937" strokeWidth="1.2" />
+        {/* Pupils — blink-animated via CSS */}
+        <circle className="porty-eye" cx="24" cy="31" r="2.2" fill="#1f2937" />
+        <circle className="porty-eye" cx="40" cy="31" r="2.2" fill="#1f2937" />
+        {/* Eye sparkle */}
+        <circle cx="25.2" cy="29.6" r="0.7" fill="#ffffff" />
+        <circle cx="41.2" cy="29.6" r="0.7" fill="#ffffff" />
+
+        {/* Glasses frames + bridge */}
+        <g fill="none" stroke="#1f2937" strokeWidth="1.6" strokeLinecap="round">
+          <circle cx="24" cy="30" r="8" />
+          <circle cx="40" cy="30" r="8" />
+          <line x1="32" y1="30" x2="32" y2="30" strokeWidth="2" />
+          <path d="M 32 30 L 32 30 M 31.5 30 L 32.5 30" />
+          {/* Bridge between lenses */}
+          <line x1="31.5" y1="30" x2="32.5" y2="30" strokeWidth="3" strokeLinecap="butt" />
+          <line x1="31.5" y1="30" x2="32.5" y2="30" strokeWidth="2" />
+          <line x1="16" y1="30" x2="13" y2="29" />
+          <line x1="48" y1="30" x2="51" y2="29" />
+        </g>
+        {/* Mouth — small friendly smile */}
+        <path
+          d="M 27 42 Q 32 46 37 42"
+          fill="none"
+          stroke="#1f2937"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        />
+        {/* Cheek blush */}
+        <circle cx="18" cy="40" r="2" fill="#fb7185" opacity="0.55" />
+        <circle cx="46" cy="40" r="2" fill="#fb7185" opacity="0.55" />
+      </g>
+
+      {/* Waving hand — anchored at top-right corner of body */}
+      {showHand && (
+        <g className="porty-hand">
+          {/* Forearm */}
+          <rect x="51" y="18" width="3.5" height="8" rx="1.5" fill="#fde68a" stroke="#92400e" strokeWidth="1" />
+          {/* Palm */}
+          <circle cx="53" cy="14" r="3.5" fill="#fde68a" stroke="#92400e" strokeWidth="1" />
+          {/* Tiny fingers hint */}
+          <path
+            d="M 51 12 Q 53 10 55 12"
+            fill="none"
+            stroke="#92400e"
+            strokeWidth="0.8"
+            strokeLinecap="round"
+          />
+        </g>
+      )}
+    </svg>
+  );
+}
 
 // ─── Transport: hits the Supabase Edge Function URL with the user JWT ────────
 
@@ -114,11 +208,11 @@ export function GlobalChatbot() {
         type="button"
         aria-label="Open Porty AI copilot"
         onClick={() => setOpen(true)}
-        className="fixed bottom-6 right-6 z-[9999] w-14 h-14 rounded-full bg-gradient-to-br from-blue-600 to-blue-700 text-white shadow-lg hover:shadow-xl hover:scale-110 hover:animate-pulse transition-all flex items-center justify-center group"
+        className="group fixed bottom-6 right-6 z-[9999] w-16 h-16 rounded-full bg-gradient-to-br from-sky-100 to-blue-200 text-white shadow-lg hover:shadow-2xl hover:scale-110 transition-all flex items-center justify-center ring-2 ring-white"
       >
-        <ContainerIcon className="w-7 h-7 group-hover:animate-bounce" />
-        {/* Tiny "online" pulse dot */}
-        <span className="absolute top-1 right-1 w-3 h-3 rounded-full bg-green-400 ring-2 ring-white">
+        <PortyAvatar size={56} />
+        {/* Online pulse dot */}
+        <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-green-400 ring-2 ring-white">
           <span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-75" />
         </span>
       </button>
@@ -131,8 +225,8 @@ export function GlobalChatbot() {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
         <div className="flex items-center gap-2">
-          <div className="w-9 h-9 rounded-full bg-white/20 flex items-center justify-center">
-            <ContainerIcon className="w-5 h-5" />
+          <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
+            <PortyAvatar size={36} showHand={false} />
           </div>
           <div>
             <p className="font-semibold text-sm leading-tight">Porty</p>
@@ -154,7 +248,9 @@ export function GlobalChatbot() {
         <div ref={scrollRef} className="px-4 py-4 space-y-3">
           {messages.length === 0 && (
             <div className="text-center py-10 text-gray-500">
-              <ContainerIcon className="w-10 h-10 mx-auto mb-2 text-blue-400" />
+              <div className="group inline-block mb-2">
+                <PortyAvatar size={64} />
+              </div>
               <p className="text-sm font-medium text-gray-700 mb-1">Ask Porty anything</p>
               <p className="text-xs text-gray-500 px-4 leading-relaxed">
                 Incoterms, Israeli customs codes, B/L vs Sea Waybill, demurrage,
