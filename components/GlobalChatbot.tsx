@@ -144,14 +144,15 @@ function buildTransport(token: string | null): any | null {
   //   Authorization  — Bearer <user_jwt> so the function can call
   //                    supabase.auth.getUser() and resolve auth.uid()
   //
-  // When the user JWT isn't ready yet, fall back to the anon key so the
-  // gateway still accepts the call. The edge function itself rejects the
-  // request with 401 when getUser() returns null, which surfaces as a clean
-  // error message instead of a 404 HTML page.
-  const headers: Record<string, string> = {
-    apikey:        anonKey,
-    Authorization: `Bearer ${token ?? anonKey}`,
-  };
+  // IMPORTANT: don't fall back to the anon key for Authorization. New-format
+  // anon keys (sb_publishable_…) are NOT JWTs and the gateway rejects them
+  // with UNAUTHORIZED_INVALID_JWT_FORMAT. Only attach Authorization when
+  // we have a real user JWT (which always starts with "eyJ").
+  const headers: Record<string, string> = { apikey: anonKey };
+  const cleanToken = (token ?? "").trim();
+  if (cleanToken && cleanToken.startsWith("eyJ")) {
+    headers.Authorization = `Bearer ${cleanToken}`;
+  }
 
   const transport: UseChatTransport = {
     api: `${supabaseUrl}/functions/v1/global-copilot`,
