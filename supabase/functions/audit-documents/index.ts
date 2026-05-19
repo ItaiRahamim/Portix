@@ -181,41 +181,64 @@ interface AuditDiscrepancy {
   description: string;
 }
 
+const PARSE_FALLBACK: AuditDiscrepancy[] = [{
+  field: "AI Parsing Error",
+  doc1: "-",
+  doc2: "-",
+  severity: "high",
+  description: "The AI generated malformed data. Please run the audit again.",
+}];
+
 function parseDiscrepancies(raw: string): AuditDiscrepancy[] {
-  // Strip ALL markdown code fences (responseMimeType should prevent these,
-  // but older model fallbacks may still wrap output in backticks)
+  // 1. Strip ALL markdown code fences.
+  //    responseMimeType should prevent them but fallback models may still wrap.
   const cleaned = raw
     .replace(/```json\s*/gi, "")
     .replace(/```\s*/gi, "")
     .trim();
 
+  // 2. First attempt — direct JSON.parse
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
   } catch {
-    // Try to extract JSON array with regex fallback
+    // 3. Second attempt — extract first [...] block (handles extra prose wrapping)
     const match = cleaned.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error(`Cannot parse Gemini output as JSON array: ${cleaned.slice(0, 300)}`);
-    parsed = JSON.parse(match[0]);
+    if (match) {
+      try {
+        parsed = JSON.parse(match[0]);
+      } catch {
+        // fall through to fallback below
+      }
+    }
   }
 
+  // 4. If still not a valid array → return safe fallback (never throw)
   if (!Array.isArray(parsed)) {
-    throw new Error(`Expected JSON array, got: ${typeof parsed}`);
+    console.error("[audit-documents] Gemini parse failed. Raw output:", cleaned.slice(0, 500));
+    return PARSE_FALLBACK;
   }
 
-  // Validate + normalize each item
-  return (parsed as unknown[]).map((item, i) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const obj = item as any;
-    const severity = ["high", "medium", "low"].includes(obj.severity) ? obj.severity : "medium";
-    return {
-      field: String(obj.field ?? `Unknown field ${i}`),
-      doc1: String(obj.doc1 ?? ""),
-      doc2: String(obj.doc2 ?? ""),
-      severity: severity as "high" | "medium" | "low",
-      description: String(obj.description ?? ""),
-    };
-  });
+  // 5. Validate + normalize each item; skip malformed entries rather than crashing
+  const results: AuditDiscrepancy[] = [];
+  for (let i = 0; i < (parsed as unknown[]).length; i++) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const obj = (parsed as any[])[i];
+      const severity = ["high", "medium", "low"].includes(obj?.severity) ? obj.severity : "medium";
+      results.push({
+        field:       String(obj?.field       ?? `Unknown field ${i}`),
+        doc1:        String(obj?.doc1        ?? ""),
+        doc2:        String(obj?.doc2        ?? ""),
+        severity:    severity as "high" | "medium" | "low",
+        description: String(obj?.description ?? ""),
+      });
+    } catch {
+      // Skip malformed items silently
+    }
+  }
+
+  return results;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -276,7 +299,15 @@ serve(async (req) => {
     console.log(`[audit-documents] Auditing container ${containerId} with ${validDocs.length} docs`);
 
     const rawOutput = await callGemini(prompt);
-    const discrepancies = parseDiscrepancies(rawOutput);
+    // parseDiscrepancies never throws — returns PARSE_FALLBACK on any bad output
+    let discrepancies: AuditDiscrepancy[];
+    try {
+      discrepancies = parseDiscrepancies(rawOutput);
+    } catch {
+      // Belt-and-suspenders: shouldn't reach here, but guarantee 200 regardless
+      console.error("[audit-documents] Unexpected parseDiscrepancies throw; using fallback");
+      discrepancies = PARSE_FALLBACK;
+    }
 
     console.log(`[audit-documents] Found ${discrepancies.length} discrepancy/ies for ${containerId}`);
 
