@@ -254,11 +254,17 @@ function PortyChatPanel({ token }: PortyChatPanelProps) {
                 key={m.id}
                 className={`flex ${isUser ? "justify-end" : "justify-start"}`}
               >
+                {/* dir="auto" lets the browser autodetect direction per message,
+                    so a Hebrew reply flows RTL inside the same bubble while
+                    English replies stay LTR — no broken mixed-script layout.
+                    text-start/end are logical (honour dir), so the alignment
+                    matches the script direction. */}
                 <div
+                  dir="auto"
                   className={`max-w-[80%] rounded-2xl px-3.5 py-2 text-sm whitespace-pre-wrap break-words ${
                     isUser
-                      ? "bg-blue-600 text-white rounded-br-sm"
-                      : "bg-white text-gray-800 border border-gray-200 rounded-bl-sm"
+                      ? "bg-blue-600 text-white rounded-br-sm text-end"
+                      : "bg-white text-gray-800 border border-gray-200 rounded-bl-sm text-start"
                   }`}
                 >
                   {text}

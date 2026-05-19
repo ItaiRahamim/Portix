@@ -32,7 +32,66 @@ const corsHeaders = {
 
 // ─── System prompt (Porty persona) ────────────────────────────────────────────
 
-const PORTY_SYSTEM_PROMPT = `You are "Porty", a helpful, friendly, and hyper-knowledgeable animated shipping container. You are an expert in global supply chain, freight forwarding, Israeli customs regulations, Incoterms, and import logistics. Answer concisely. If asked about general customs rules, answer from your knowledge. Be professional but slightly playful.`;
+const PORTY_SYSTEM_PROMPT = `You are "Porty", a helpful, friendly, and hyper-knowledgeable animated shipping container. You are an expert in global supply chain, freight forwarding, Israeli customs regulations, Incoterms, and import logistics. Answer concisely. Be professional but slightly playful.
+
+STRICT RULES — VIOLATING ANY OF THESE IS A SEVERE ERROR:
+1. NEVER mention internal database IDs, UUIDs (e.g. "e2dc0f20-1234-..."), 8-character hex tokens, document_id values, or any system metadata tag. Refer to containers only by their real ISO 6346 number (4 letters + 7 digits, e.g. MAEU1234567).
+2. When the user asks about a SPECIFIC container number, cross-reference that number against the "Container Number:" line in each retrieved chunk BEFORE quoting any fact. Only quote data from chunks whose Container Number matches the one in the question.
+3. If you are unsure whether a piece of information belongs to the requested container, DO NOT GUESS. Say you don't know.
+4. If the retrieved context is empty or none of the chunks match the requested container, reply EXACTLY: "No information found for container <NUMBER>." — nothing else, no fallback to general knowledge for container-specific questions.
+5. For generic logistics / Incoterms / customs questions that don't reference a specific container, fall back on your general knowledge.`;
+
+// ─── ID scrub + container helpers ────────────────────────────────────────────
+// Belt-and-suspenders against the LLM citing internal UUIDs / 8-char hex
+// prefixes from leaked metadata. We sanitize both the retrieval context
+// before injection AND rely on the system prompt to forbid the model from
+// emitting them anyway.
+
+const UUID_RE         = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const BARE_HEX_RE     = /\b[a-f0-9]{8}\b/g;
+const CONTAINER_NUM_RE = /\b[A-Z]{4}\d{7}\b/g;
+
+function scrubIdentifiers(text: string): string {
+  return text
+    .replace(UUID_RE, "")
+    .replace(BARE_HEX_RE, "")
+    // Tidy up the trailing spaces / double whitespace the substitutions leave
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/ +(\n)/g, "$1");
+}
+
+/** Pull every ISO 6346 container number out of arbitrary text. */
+function findContainerNumbers(text: string): string[] {
+  return [...new Set((text.toUpperCase().match(CONTAINER_NUM_RE) ?? []))];
+}
+
+/** Extract the first Container Number declared inside a chunk body. */
+function chunkContainerNumber(content: string): string | null {
+  const m = content.toUpperCase().match(/CONTAINER NUMBER:\s*([A-Z]{4}\d{7})/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Streams a fixed text response back to the client in the same plain-text
+ * shape the TextStreamChatTransport expects from Gemini. Used to short-circuit
+ * when we know retrieval found nothing relevant — saves Gemini quota AND
+ * eliminates any chance the model invents data.
+ */
+function streamFixedText(text: string): Response {
+  const encoder = new TextEncoder();
+  const stream  = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(encoder.encode(text)); c.close(); },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      ...corsHeaders,
+      "Content-Type":      "text/plain; charset=utf-8",
+      "Cache-Control":     "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
 
 // ─── Gemini streaming ─────────────────────────────────────────────────────────
 // SSE endpoint: returns lines like  data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
@@ -185,27 +244,39 @@ serve(async (req) => {
 
   // ── RAG: embed the last user message and pull top chunks the user can see ─
   // Failure here is non-fatal — Porty just answers from general knowledge if
-  // retrieval comes back empty or errors out.
+  // retrieval comes back empty or errors out (EXCEPT when the user explicitly
+  // names a container number — see short-circuit below).
   let contextString = "";
   const lastUserText = [...messages].reverse().find((m) => m.role === "user");
   const queryText = lastUserText ? messageText(lastUserText).trim() : "";
 
+  // Detect ISO 6346 container numbers in the query. When present we tighten
+  // the retrieval contract: only chunks belonging to those containers may
+  // be used, and on zero matches we refuse rather than guess.
+  const requestedContainers = queryText ? findContainerNumbers(queryText) : [];
+  const filterByContainer   = requestedContainers.length > 0;
+
   if (queryText) {
     console.log(`[global-copilot] RAG query for user ${user.id}: "${queryText.slice(0, 120)}"`);
+    if (filterByContainer) {
+      console.log(`[global-copilot] requested containers: ${JSON.stringify(requestedContainers)}`);
+    }
     const queryEmbedding = await embedQuery(queryText, apiKey);
     if (!queryEmbedding) {
       console.error("[global-copilot] embedQuery returned null — skipping RAG");
     } else {
       console.log(`[global-copilot] queryEmbedding ready (len=${queryEmbedding.length})`);
+
+      // Pull a deeper pool when filtering so we don't starve after the post-filter.
+      const matchCount = filterByContainer ? 20 : 8;
+
       const { data: chunks, error: rpcErr } = await supabaseAnon
         .rpc("match_user_document_chunks", {
           query_embedding: queryEmbedding,
           match_threshold: 0.5,
-          match_count:     8,
+          match_count:     matchCount,
         });
 
-      // Full dump — keeps content truncated so the log line stays readable
-      // but proves what came back from the RPC.
       console.log(
         "[global-copilot] RAG Chunks retrieved:",
         JSON.stringify(
@@ -221,21 +292,57 @@ serve(async (req) => {
       if (rpcErr) {
         console.error(`[global-copilot] RAG RPC error: ${rpcErr.message}`);
       } else if (Array.isArray(chunks) && chunks.length > 0) {
-        contextString = chunks
+        // Post-filter by container number when the query named one(s).
+        // Chunk content always starts with "Container Number: <num>" courtesy
+        // of buildRagText() in classify-documents.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let filtered: any[] = chunks;
+        if (filterByContainer) {
+          const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
+          filtered = chunks.filter((c: { content?: string }) => {
+            const cn = chunkContainerNumber(String(c.content ?? ""));
+            return cn ? wanted.has(cn) : false;
+          });
+          console.log(`[global-copilot] filtered chunks: ${filtered.length}/${chunks.length}`);
+
+          if (filtered.length === 0) {
+            // Short-circuit: refuse cleanly instead of letting the model guess
+            const refusal = requestedContainers.length === 1
+              ? `No information found for container ${requestedContainers[0]}.`
+              : `No information found for containers ${requestedContainers.join(", ")}.`;
+            console.log(`[global-copilot] short-circuit: ${refusal}`);
+            return streamFixedText(refusal);
+          }
+        }
+
+        contextString = filtered
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           .map((c: any) => {
-            const cid = c.container_id ? String(c.container_id).slice(0, 8) : "?";
-            const sim = typeof c.similarity === "number" ? c.similarity.toFixed(2) : "?";
-            const txt = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 600);
-            return `- [container ${cid}, similarity ${sim}] ${txt}`;
+            const realCn = chunkContainerNumber(String(c.content ?? "")) ?? "unknown";
+            const txt    = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 800);
+            return `- [container ${realCn}] ${txt}`;
           })
           .join("\n");
-        console.log(`[global-copilot] RAG hits=${chunks.length} for user ${user.id}`);
+
+        console.log(`[global-copilot] RAG hits=${filtered.length} for user ${user.id}`);
       } else {
         console.log(`[global-copilot] RAG no hits for query "${queryText.slice(0, 60)}"`);
+        // Same refusal applies if the user named a container and we found nothing at all.
+        if (filterByContainer) {
+          const refusal = requestedContainers.length === 1
+            ? `No information found for container ${requestedContainers[0]}.`
+            : `No information found for containers ${requestedContainers.join(", ")}.`;
+          console.log(`[global-copilot] short-circuit (no hits): ${refusal}`);
+          return streamFixedText(refusal);
+        }
       }
     }
   }
+
+  // Final scrub — even if a chunk body contains a stray UUID / 8-hex token,
+  // strip it before the model ever sees it. This is the second line of defence;
+  // the system prompt forbids the model from emitting these strings too.
+  contextString = scrubIdentifiers(contextString);
 
   console.log(
     "[global-copilot] Injected Context (length=" + contextString.length + "):\n" +
@@ -246,7 +353,7 @@ serve(async (req) => {
     ? [
         PORTY_SYSTEM_PROMPT,
         "",
-        "Use the retrieved document chunks below to answer the user's question accurately when they ask about THEIR containers, shipments, or documents. If the answer isn't in the chunks, fall back on your general logistics knowledge. Cite the container id (first 8 chars) when you reference a chunk.",
+        "Use the retrieved document chunks below to answer accurately. Cross-reference the 'Container Number:' line in each chunk against the container the user asked about — quote a fact ONLY when its chunk's Container Number matches. Refer to containers by their ISO container number (e.g. MAEU1234567) — never by internal IDs.",
         "",
         "RETRIEVED CONTEXT:",
         contextString,
