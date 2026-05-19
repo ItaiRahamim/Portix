@@ -68,10 +68,17 @@ function findContainerNumbers(text: string): string[] {
 /** Extract the first Container Number declared inside a chunk body.
  *  Returns the ISO 6346 code, the literal "ALL" (for multi-container docs
  *  like invoices/BLs that cover every container in a shipment), or null
- *  when no Container Number header is present. */
+ *  when no Container Number header is present.
+ *
+ *  Robust to Gemini quirks:
+ *   - case-insensitive (uppercases everything first)
+ *   - whitespace-tolerant inside the ID (e.g. "SEGU 9467227" → SEGU9467227)
+ *   - matches synonyms like "Container No.", "Container #" */
 function chunkContainerNumber(content: string): string | null {
-  const upper = content.toUpperCase();
-  const m = upper.match(/CONTAINER NUMBER:\s*([A-Z]{4}\d{7}|ALL)/);
+  // Collapse all whitespace so "SEGU 9467227" matches as one token
+  const upper = content.toUpperCase().replace(/[ \t]+/g, " ");
+  const compact = upper.replace(/(?<=[A-Z])\s+(?=\d)/g, ""); // drop space between letters and digits
+  const m = compact.match(/CONTAINER\s*(?:NUMBER|NO\.?|#)\s*:?\s*([A-Z]{4}\d{7}|ALL)/);
   return m ? m[1] : null;
 }
 
@@ -271,10 +278,10 @@ serve(async (req) => {
   const filterByContainer   = requestedContainers.length > 0;
 
   if (queryText) {
-    console.log(`[global-copilot] RAG query for user ${user.id}: "${queryText.slice(0, 120)}"`);
-    if (filterByContainer) {
-      console.log(`[global-copilot] requested containers: ${JSON.stringify(requestedContainers)}`);
-    }
+    console.log(`[global-copilot] ============ RAG START ============`);
+    console.log(`[global-copilot] user=${user.id}`);
+    console.log(`[global-copilot] query="${queryText.slice(0, 200)}"`);
+    console.log(`[global-copilot] requestedContainers=${JSON.stringify(requestedContainers)} (count=${requestedContainers.length})`);
 
     const merged: Map<string, Chunk> = new Map();
 
@@ -282,26 +289,27 @@ serve(async (req) => {
     if (filterByContainer) {
       try {
         // 1. Resolve container_numbers → container_ids the caller can see.
-        //    RLS on portix.containers limits to importer/supplier/customs scope.
+        //    Container numbers in DB are uppercase per the create_shipment_with_containers
+        //    RPC convention; requestedContainers are already uppercased by findContainerNumbers.
+        console.log(`[global-copilot] PATH B (direct): containers.in("container_number", ${JSON.stringify(requestedContainers)})`);
         const { data: ctrs, error: ctrErr } = await supabaseAnon
           .from("containers")
           .select("id, container_number, shipment_id")
           .in("container_number", requestedContainers);
 
         if (ctrErr) {
-          console.error(`[global-copilot] container lookup error: ${ctrErr.message}`);
+          console.error(`[global-copilot] PATH B container lookup error: ${ctrErr.message}`);
         } else {
+          console.log(`[global-copilot] PATH B matched containers: ${JSON.stringify((ctrs ?? []).map((c: { id: string; container_number: string }) => ({ id: c.id.slice(0,8), num: c.container_number })))}`);
           const matchedIds  = (ctrs ?? []).map((c: { id: string }) => c.id);
           const shipmentIds = [...new Set((ctrs ?? []).map((c: { shipment_id: string | null }) => c.shipment_id).filter(Boolean) as string[])];
-          console.log(`[global-copilot] direct lookup: ${matchedIds.length} container(s) visible to user; shipments=${shipmentIds.length}`);
+          console.log(`[global-copilot] PATH B matchedIds=${matchedIds.length} shipmentIds=${shipmentIds.length}`);
 
           if (matchedIds.length === 0) {
-            // User can't see ANY of the requested containers (or they don't exist).
-            // Refuse without burning Gemini.
             const refusal = requestedContainers.length === 1
               ? `No information found for container ${requestedContainers[0]}.`
               : `No information found for containers ${requestedContainers.join(", ")}.`;
-            console.log(`[global-copilot] short-circuit (unknown container): ${refusal}`);
+            console.log(`[global-copilot] short-circuit (no visible containers): ${refusal}`);
             return streamFixedText(refusal);
           }
 
@@ -313,15 +321,20 @@ serve(async (req) => {
             .limit(40);
 
           if (dErr) {
-            console.error(`[global-copilot] direct chunk lookup error: ${dErr.message}`);
+            console.error(`[global-copilot] PATH B direct chunk lookup error: ${dErr.message}`);
           } else {
-            for (const c of (directChunks ?? []) as Chunk[]) merged.set(c.id, c);
-            console.log(`[global-copilot] direct chunks (specific): ${directChunks?.length ?? 0}`);
+            const arr = (directChunks ?? []) as Chunk[];
+            for (const c of arr) merged.set(c.id, c);
+            console.log(`[global-copilot] PATH B direct chunks: ${arr.length}`);
+            // Dump first 3 chunks so we can see what the content actually looks like
+            arr.slice(0, 3).forEach((c, i) => {
+              const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
+              const detectedCn = chunkContainerNumber(String(c.content ?? ""));
+              console.log(`[global-copilot]   direct[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
+            });
           }
 
-          // 2b. ALL-tagged chunks in the SAME shipment(s) the user asked about.
-          //     These cover consolidated invoices / master B/Ls that share data
-          //     across every container in the shipment.
+          // 2b. ALL-tagged chunks in the SAME shipment(s).
           if (shipmentIds.length > 0) {
             const { data: siblings, error: sErr } = await supabaseAnon
               .from("containers")
@@ -329,9 +342,10 @@ serve(async (req) => {
               .in("shipment_id", shipmentIds);
 
             if (sErr) {
-              console.error(`[global-copilot] sibling-container lookup error: ${sErr.message}`);
+              console.error(`[global-copilot] PATH B sibling lookup error: ${sErr.message}`);
             } else {
               const siblingIds = (siblings ?? []).map((c: { id: string }) => c.id);
+              console.log(`[global-copilot] PATH B sibling containers in same shipments: ${siblingIds.length}`);
               if (siblingIds.length > 0) {
                 const { data: allChunks, error: aErr } = await supabaseAnon
                   .from("document_chunks")
@@ -341,27 +355,31 @@ serve(async (req) => {
                   .limit(40);
 
                 if (aErr) {
-                  console.error(`[global-copilot] ALL chunk lookup error: ${aErr.message}`);
+                  console.error(`[global-copilot] PATH B ALL chunk lookup error: ${aErr.message}`);
                 } else {
-                  for (const c of (allChunks ?? []) as Chunk[]) merged.set(c.id, c);
-                  console.log(`[global-copilot] ALL chunks (shipment-wide): ${allChunks?.length ?? 0}`);
+                  const arr = (allChunks ?? []) as Chunk[];
+                  for (const c of arr) merged.set(c.id, c);
+                  console.log(`[global-copilot] PATH B ALL chunks: ${arr.length}`);
+                  arr.slice(0, 2).forEach((c, i) => {
+                    const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
+                    console.log(`[global-copilot]   all[${i}] content_head="${head}"`);
+                  });
                 }
               }
             }
           }
         }
       } catch (e) {
-        console.error(`[global-copilot] direct-lookup exception: ${(e as Error).message}`);
+        console.error(`[global-copilot] PATH B exception: ${(e as Error).message}`);
       }
     }
 
-    // PATH A: Similarity search via RPC — augments direct lookup, OR is the
-    // sole retrieval path for non-container questions.
+    // PATH A: Similarity search
     const queryEmbedding = await embedQuery(queryText, apiKey);
     if (!queryEmbedding) {
-      console.error("[global-copilot] embedQuery returned null — skipping similarity step");
+      console.error("[global-copilot] PATH A embedQuery returned null — skipping similarity step");
     } else {
-      console.log(`[global-copilot] queryEmbedding ready (len=${queryEmbedding.length})`);
+      console.log(`[global-copilot] PATH A queryEmbedding ready (len=${queryEmbedding.length})`);
       const matchCount = filterByContainer ? 20 : 8;
       const { data: simChunks, error: rpcErr } = await supabaseAnon
         .rpc("match_user_document_chunks", {
@@ -371,28 +389,40 @@ serve(async (req) => {
         });
 
       if (rpcErr) {
-        console.error(`[global-copilot] similarity RPC error: ${rpcErr.message}`);
-      } else if (Array.isArray(simChunks) && simChunks.length > 0) {
-        // Filter similarity hits the same way as direct lookup when container
-        // was named, so we never inject foreign-container data.
+        console.error(`[global-copilot] PATH A similarity RPC error: ${rpcErr.message}`);
+      } else {
+        const rawArr = (simChunks ?? []) as Chunk[];
+        console.log(`[global-copilot] PATH A similarity returned: ${rawArr.length} (threshold=0.5, count=${matchCount})`);
+        rawArr.slice(0, 3).forEach((c, i) => {
+          const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
+          const detectedCn = chunkContainerNumber(String(c.content ?? ""));
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const sim = (c as any).similarity;
+          console.log(`[global-copilot]   sim[${i}] sim=${typeof sim === "number" ? sim.toFixed(3) : "?"} detectedCn=${detectedCn} content_head="${head}"`);
+        });
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let usableSim: any[] = simChunks;
+        let usableSim: any[] = rawArr;
         if (filterByContainer) {
           const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
-          usableSim = simChunks.filter((c: { content?: string }) => {
+          usableSim = rawArr.filter((c) => {
             const cn = chunkContainerNumber(String(c.content ?? ""));
-            return cn && (cn === "ALL" || wanted.has(cn));
+            return cn && (cn === "ALL" || wanted.has(cn.toUpperCase()));
           });
+          console.log(`[global-copilot] PATH A similarity after container filter: ${usableSim.length}/${rawArr.length}`);
         }
         for (const c of usableSim as Chunk[]) merged.set(c.id, c);
-        console.log(`[global-copilot] similarity chunks added: ${usableSim.length}/${simChunks.length}`);
-      } else {
-        console.log("[global-copilot] similarity returned 0 hits");
       }
     }
 
     // Final assemble
     const chunksOut = [...merged.values()].slice(0, 30);
+    console.log(`[global-copilot] MERGED chunksOut=${chunksOut.length}`);
+    chunksOut.slice(0, 5).forEach((c, i) => {
+      const detectedCn = chunkContainerNumber(String(c.content ?? ""));
+      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn}`);
+    });
+
     if (filterByContainer && chunksOut.length === 0) {
       const refusal = requestedContainers.length === 1
         ? `No information found for container ${requestedContainers[0]}.`
@@ -409,7 +439,7 @@ serve(async (req) => {
       })
       .join("\n");
 
-    console.log(`[global-copilot] RAG hits=${chunksOut.length} for user ${user.id}`);
+    console.log(`[global-copilot] ============ RAG END (hits=${chunksOut.length}) ============`);
   }
 
   // Final scrub — even if a chunk body contains a stray UUID / 8-hex token,
