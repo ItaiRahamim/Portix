@@ -184,14 +184,32 @@ serve(async (req) => {
   const queryText = lastUserText ? messageText(lastUserText).trim() : "";
 
   if (queryText) {
+    console.log(`[global-copilot] RAG query for user ${user.id}: "${queryText.slice(0, 120)}"`);
     const queryEmbedding = await embedQuery(queryText, apiKey);
-    if (queryEmbedding) {
+    if (!queryEmbedding) {
+      console.error("[global-copilot] embedQuery returned null — skipping RAG");
+    } else {
+      console.log(`[global-copilot] queryEmbedding ready (len=${queryEmbedding.length})`);
       const { data: chunks, error: rpcErr } = await supabaseAnon
         .rpc("match_user_document_chunks", {
           query_embedding: queryEmbedding,
           match_threshold: 0.5,
           match_count:     8,
         });
+
+      // Full dump — keeps content truncated so the log line stays readable
+      // but proves what came back from the RPC.
+      console.log(
+        "[global-copilot] RAG Chunks retrieved:",
+        JSON.stringify(
+          (chunks ?? []).map((c: { id?: string; container_id?: string; similarity?: number; content?: string }) => ({
+            id:           c.id,
+            container_id: c.container_id,
+            similarity:   c.similarity,
+            content_head: typeof c.content === "string" ? c.content.slice(0, 120) : null,
+          })),
+        ),
+      );
 
       if (rpcErr) {
         console.error(`[global-copilot] RAG RPC error: ${rpcErr.message}`);
@@ -211,6 +229,11 @@ serve(async (req) => {
       }
     }
   }
+
+  console.log(
+    "[global-copilot] Injected Context (length=" + contextString.length + "):\n" +
+    (contextString || "(empty — model will use general knowledge only)"),
+  );
 
   const systemPromptWithRag = contextString
     ? [

@@ -15,7 +15,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { ScrollArea } from "@/components/ui/scroll-area";
+// Native overflow-y-auto used instead of shadcn ScrollArea — Radix's viewport
+// wrapper inside a flex column doesn't always propagate height correctly,
+// leaving the message list non-scrollable for long answers.
 import { useChat } from "@ai-sdk/react";
 import { TextStreamChatTransport } from "ai";
 import { X, Send, Loader2 } from "lucide-react";
@@ -224,9 +226,12 @@ function PortyChatPanel({ token }: PortyChatPanelProps) {
 
   return (
     <>
-      {/* Messages */}
-      <ScrollArea className="flex-1 bg-gray-50">
-        <div ref={scrollRef} className="px-4 py-4 space-y-3">
+      {/* Messages — flex-1 + min-h-0 lets the column shrink and scroll;
+          overflow-y-auto is what actually triggers the scroll. */}
+      <div
+        ref={scrollRef}
+        className="flex-1 min-h-0 overflow-y-auto bg-gray-50 px-4 py-4 space-y-3"
+      >
           {messages.length === 0 && (
             <div className="text-center py-10 text-gray-500">
               <div className="group inline-block mb-2">
@@ -278,8 +283,7 @@ function PortyChatPanel({ token }: PortyChatPanelProps) {
               {error.message ?? "Something went wrong."}
             </div>
           )}
-        </div>
-      </ScrollArea>
+      </div>
 
       {/* Input */}
       <CardContent className="p-3 border-t bg-white">
