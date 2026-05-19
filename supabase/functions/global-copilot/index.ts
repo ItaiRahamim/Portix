@@ -347,11 +347,18 @@ serve(async (req) => {
               const siblingIds = (siblings ?? []).map((c: { id: string }) => c.id);
               console.log(`[global-copilot] PATH B sibling containers in same shipments: ${siblingIds.length}`);
               if (siblingIds.length > 0) {
+                // Catch header variants: "Container Number: ALL",
+                // "Container No: ALL", "Container No.: ALL", "Container #: ALL"
                 const { data: allChunks, error: aErr } = await supabaseAnon
                   .from("document_chunks")
                   .select("id, container_id, content")
                   .in("container_id", siblingIds)
-                  .ilike("content", "%Container Number: ALL%")
+                  .or([
+                    "content.ilike.%Container Number: ALL%",
+                    "content.ilike.%Container No: ALL%",
+                    "content.ilike.%Container No.: ALL%",
+                    "content.ilike.%Container #: ALL%",
+                  ].join(","))
                   .limit(40);
 
                 if (aErr) {
@@ -406,8 +413,26 @@ serve(async (req) => {
         if (filterByContainer) {
           const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
           usableSim = rawArr.filter((c) => {
-            const cn = chunkContainerNumber(String(c.content ?? ""));
-            return cn && (cn === "ALL" || wanted.has(cn.toUpperCase()));
+            const content = String(c.content ?? "");
+            const upper   = content.toUpperCase();
+            const cn      = chunkContainerNumber(content);
+
+            // Match in any of three ways:
+            //   1. Chunk header says ALL — applies to every container.
+            //   2. Chunk header matches a requested container number.
+            //   3. Header extraction failed (cn === null) BUT the chunk body
+            //      literally contains one of the requested numbers OR the
+            //      word "ALL" — common when buildRagText output drifted
+            //      (e.g. legacy chunks with no header line) but the data
+            //      mentions the container in-line.
+            if (cn === "ALL") return true;
+            if (cn && wanted.has(cn)) return true;
+            if (!cn) {
+              const bodyHasContainer = requestedContainers.some((rc) => upper.includes(rc));
+              const bodyHasAll       = /\bCONTAINER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*ALL\b/.test(upper);
+              if (bodyHasContainer || bodyHasAll) return true;
+            }
+            return false;
           });
           console.log(`[global-copilot] PATH A similarity after container filter: ${usableSim.length}/${rawArr.length}`);
         }
