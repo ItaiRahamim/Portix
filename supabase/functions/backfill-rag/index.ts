@@ -5,9 +5,8 @@
 // but no chunks exist yet in portix.document_chunks, then invokes the
 // embed-document Edge Function for each so they become RAG-searchable.
 //
-// Invoke via curl with the service-role key:
+// Invoke via curl (no auth required — see warning below):
 //   curl -X POST "$SUPABASE_URL/functions/v1/backfill-rag" \
-//        -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
 //        -H "Content-Type: application/json" \
 //        -d '{ "limit": 500, "batchSize": 5, "dryRun": false }'
 //
@@ -16,8 +15,18 @@
 //   batchSize  — concurrent embed-document calls per batch (default 5)
 //   dryRun     — when true, return the candidate list without invoking embeddings
 //
-// Auth: requires service_role bearer in the Authorization header. We do NOT
-// gate on user JWT — this is an admin tool.
+// !!! TEMP — AUTH DISABLED !!!
+// The Authorization header check is intentionally removed to make the
+// one-off backfill easier to trigger. Anyone hitting this URL can burn our
+// Gemini quota by spamming requests. **Re-enable auth OR delete this
+// function immediately after backfill completes** — see git history
+// (commit "feat(rag): one-off backfill...") for the original auth gate.
+//
+// IMPORTANT — Supabase's gateway still rejects requests without a JWT by
+// default. To make the function actually publicly callable, deploy with:
+//   npx supabase functions deploy backfill-rag --no-verify-jwt
+// Without that flag, callers will get a 401 from the gateway BEFORE our
+// handler runs, regardless of the code-level check being removed.
 //
 // Env vars:
 //   SUPABASE_URL              (auto-injected)
@@ -145,15 +154,15 @@ serve(async (req) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
-  // Service-role auth gate
-  const authHeader = req.headers.get("Authorization") ?? "";
-  if (!authHeader.toLowerCase().startsWith("bearer ") ||
-      authHeader.slice(7).trim() !== SERVICE_KEY) {
-    return new Response("Unauthorized — service role required", {
-      status: 401,
-      headers: corsHeaders,
-    });
-  }
+  // ⚠️ AUTH TEMPORARILY DISABLED — see header comment.
+  // Re-add this block (or delete the function) right after backfill is done:
+  //   const authHeader = req.headers.get("Authorization") ?? "";
+  //   if (!authHeader.toLowerCase().startsWith("bearer ") ||
+  //       authHeader.slice(7).trim() !== SERVICE_KEY) {
+  //     return new Response("Unauthorized — service role required", {
+  //       status: 401, headers: corsHeaders,
+  //     });
+  //   }
 
   let body: BackfillBody = {};
   try {
