@@ -313,24 +313,34 @@ serve(async (req) => {
             return streamFixedText(refusal);
           }
 
-          // 2a. Direct chunks for the requested container(s).
-          const { data: directChunks, error: dErr } = await supabaseAnon
+          // 2a. CONTENT-BASED lookup — chunks whose body literally mentions
+          // one of the requested container numbers. This sidesteps the
+          // single-FK relational mismatch: a Bill of Lading covering containers
+          // A+B+C is stored with container_id = A in the DB, but its chunks
+          // all reference B's tare/gross weights too. RLS on document_chunks
+          // (migration 00340) scopes results to chunks under containers the
+          // user can already see, so querying by content can't leak data.
+          const orClauses = requestedContainers
+            .map((rc) => `content.ilike.%${rc}%`)
+            .join(",");
+          console.log(`[global-copilot] PATH B byContent OR: ${orClauses}`);
+
+          const { data: byContent, error: bcErr } = await supabaseAnon
             .from("document_chunks")
             .select("id, container_id, content")
-            .in("container_id", matchedIds)
+            .or(orClauses)
             .limit(40);
 
-          if (dErr) {
-            console.error(`[global-copilot] PATH B direct chunk lookup error: ${dErr.message}`);
+          if (bcErr) {
+            console.error(`[global-copilot] PATH B byContent lookup error: ${bcErr.message}`);
           } else {
-            const arr = (directChunks ?? []) as Chunk[];
+            const arr = (byContent ?? []) as Chunk[];
             for (const c of arr) merged.set(c.id, c);
-            console.log(`[global-copilot] PATH B direct chunks: ${arr.length}`);
-            // Dump first 3 chunks so we can see what the content actually looks like
+            console.log(`[global-copilot] PATH B byContent chunks: ${arr.length}`);
             arr.slice(0, 3).forEach((c, i) => {
               const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
               const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-              console.log(`[global-copilot]   direct[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
+              console.log(`[global-copilot]   byContent[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
             });
           }
 
@@ -411,28 +421,17 @@ serve(async (req) => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let usableSim: any[] = rawArr;
         if (filterByContainer) {
-          const wanted = new Set(requestedContainers.map((s) => s.toUpperCase()));
+          // Content-membership filter (matches the PATH B retrieval contract):
+          //   Keep a chunk when its body mentions any requested container
+          //   number OR is tagged as covering all containers ("Container ... ALL").
+          // We deliberately ignore detectedCn here — chunks for a multi-container
+          // BL routinely have detectedCn pointing at the document's primary
+          // container while the body lists data for siblings too.
+          const wanted = requestedContainers.map((s) => s.toUpperCase());
           usableSim = rawArr.filter((c) => {
-            const content = String(c.content ?? "");
-            const upper   = content.toUpperCase();
-            const cn      = chunkContainerNumber(content);
-
-            // Match in any of three ways:
-            //   1. Chunk header says ALL — applies to every container.
-            //   2. Chunk header matches a requested container number.
-            //   3. Header extraction failed (cn === null) BUT the chunk body
-            //      literally contains one of the requested numbers OR the
-            //      word "ALL" — common when buildRagText output drifted
-            //      (e.g. legacy chunks with no header line) but the data
-            //      mentions the container in-line.
-            if (cn === "ALL") return true;
-            if (cn && wanted.has(cn)) return true;
-            if (!cn) {
-              const bodyHasContainer = requestedContainers.some((rc) => upper.includes(rc));
-              const bodyHasAll       = /\bCONTAINER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*ALL\b/.test(upper);
-              if (bodyHasContainer || bodyHasAll) return true;
-            }
-            return false;
+            const upper = String(c.content ?? "").toUpperCase();
+            return wanted.some((w) => upper.includes(w))
+                || /\bCONTAINER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*ALL\b/.test(upper);
           });
           console.log(`[global-copilot] PATH A similarity after container filter: ${usableSim.length}/${rawArr.length}`);
         }
@@ -444,8 +443,10 @@ serve(async (req) => {
     const chunksOut = [...merged.values()].slice(0, 30);
     console.log(`[global-copilot] MERGED chunksOut=${chunksOut.length}`);
     chunksOut.slice(0, 5).forEach((c, i) => {
+      const upper      = String(c.content ?? "").toUpperCase();
       const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn}`);
+      const bodyHits   = requestedContainers.filter((rc) => upper.includes(rc));
+      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} bodyMentions=${JSON.stringify(bodyHits)}`);
     });
 
     if (filterByContainer && chunksOut.length === 0) {
