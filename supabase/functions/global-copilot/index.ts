@@ -285,13 +285,20 @@ serve(async (req) => {
 
     const merged: Map<string, Chunk> = new Map();
 
-    // PATH B: Direct lookup by container_number (only when filter requested)
+    // Track which chunks came via the SHIPMENT-LEVEL lookup. Those chunks
+    // bypass the content-membership filter on PATH A (similarity) — needed
+    // because a single PDF gets split across pages: container ID on Page 1,
+    // weights on Page 3. Strict text-filter would drop Page 3 even though
+    // it logically belongs to the same document.
+    const shipmentChunkIds = new Set<string>();
+
+    // PATH B: SHIPMENT-LEVEL retrieval — primary path when filter requested
     if (filterByContainer) {
       try {
-        // 1. Resolve container_numbers → container_ids the caller can see.
-        //    Container numbers in DB are uppercase per the create_shipment_with_containers
-        //    RPC convention; requestedContainers are already uppercased by findContainerNumbers.
-        console.log(`[global-copilot] PATH B (direct): containers.in("container_number", ${JSON.stringify(requestedContainers)})`);
+        // 1. Resolve container_numbers → matched container rows (+ shipment_id).
+        //    Container numbers in DB are uppercase per create_shipment_with_containers;
+        //    requestedContainers are already uppercased by findContainerNumbers().
+        console.log(`[global-copilot] PATH B (shipment-level): containers.in("container_number", ${JSON.stringify(requestedContainers)})`);
         const { data: ctrs, error: ctrErr } = await supabaseAnon
           .from("containers")
           .select("id, container_number, shipment_id")
@@ -313,38 +320,11 @@ serve(async (req) => {
             return streamFixedText(refusal);
           }
 
-          // 2a. CONTENT-BASED lookup — chunks whose body literally mentions
-          // one of the requested container numbers. This sidesteps the
-          // single-FK relational mismatch: a Bill of Lading covering containers
-          // A+B+C is stored with container_id = A in the DB, but its chunks
-          // all reference B's tare/gross weights too. RLS on document_chunks
-          // (migration 00340) scopes results to chunks under containers the
-          // user can already see, so querying by content can't leak data.
-          const orClauses = requestedContainers
-            .map((rc) => `content.ilike.%${rc}%`)
-            .join(",");
-          console.log(`[global-copilot] PATH B byContent OR: ${orClauses}`);
-
-          const { data: byContent, error: bcErr } = await supabaseAnon
-            .from("document_chunks")
-            .select("id, container_id, content")
-            .or(orClauses)
-            .limit(40);
-
-          if (bcErr) {
-            console.error(`[global-copilot] PATH B byContent lookup error: ${bcErr.message}`);
-          } else {
-            const arr = (byContent ?? []) as Chunk[];
-            for (const c of arr) merged.set(c.id, c);
-            console.log(`[global-copilot] PATH B byContent chunks: ${arr.length}`);
-            arr.slice(0, 3).forEach((c, i) => {
-              const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
-              const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-              console.log(`[global-copilot]   byContent[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
-            });
-          }
-
-          // 2b. ALL-tagged chunks in the SAME shipment(s).
+          // 2. Sibling expansion: every container that shares a shipment_id
+          //    with one of the matched containers. RLS scopes the result to
+          //    siblings the caller can actually see — anything the user
+          //    doesn't own is silently dropped at the row-security layer.
+          let siblingIds: string[] = matchedIds;
           if (shipmentIds.length > 0) {
             const { data: siblings, error: sErr } = await supabaseAnon
               .from("containers")
@@ -354,36 +334,35 @@ serve(async (req) => {
             if (sErr) {
               console.error(`[global-copilot] PATH B sibling lookup error: ${sErr.message}`);
             } else {
-              const siblingIds = (siblings ?? []).map((c: { id: string }) => c.id);
-              console.log(`[global-copilot] PATH B sibling containers in same shipments: ${siblingIds.length}`);
-              if (siblingIds.length > 0) {
-                // Catch header variants: "Container Number: ALL",
-                // "Container No: ALL", "Container No.: ALL", "Container #: ALL"
-                const { data: allChunks, error: aErr } = await supabaseAnon
-                  .from("document_chunks")
-                  .select("id, container_id, content")
-                  .in("container_id", siblingIds)
-                  .or([
-                    "content.ilike.%Container Number: ALL%",
-                    "content.ilike.%Container No: ALL%",
-                    "content.ilike.%Container No.: ALL%",
-                    "content.ilike.%Container #: ALL%",
-                  ].join(","))
-                  .limit(40);
-
-                if (aErr) {
-                  console.error(`[global-copilot] PATH B ALL chunk lookup error: ${aErr.message}`);
-                } else {
-                  const arr = (allChunks ?? []) as Chunk[];
-                  for (const c of arr) merged.set(c.id, c);
-                  console.log(`[global-copilot] PATH B ALL chunks: ${arr.length}`);
-                  arr.slice(0, 2).forEach((c, i) => {
-                    const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
-                    console.log(`[global-copilot]   all[${i}] content_head="${head}"`);
-                  });
-                }
-              }
+              siblingIds = [...new Set([...matchedIds, ...(siblings ?? []).map((c: { id: string }) => c.id)])];
             }
+          }
+          console.log(`[global-copilot] PATH B shipment-scope container_ids: ${siblingIds.length}`);
+
+          // 3. Fetch EVERY chunk under any of those sibling containers — no
+          //    text gating. The point is to give the LLM the full document
+          //    across page breaks so it can cross-reference Page 1 (container
+          //    number) with Page 3 (weights/tare).
+          const { data: shipChunks, error: scErr } = await supabaseAnon
+            .from("document_chunks")
+            .select("id, container_id, content")
+            .in("container_id", siblingIds)
+            .limit(80);                                          // generous; merged cap is 40
+
+          if (scErr) {
+            console.error(`[global-copilot] PATH B shipment-chunk lookup error: ${scErr.message}`);
+          } else {
+            const arr = (shipChunks ?? []) as Chunk[];
+            for (const c of arr) {
+              merged.set(c.id, c);
+              shipmentChunkIds.add(c.id);
+            }
+            console.log(`[global-copilot] PATH B shipment chunks: ${arr.length}`);
+            arr.slice(0, 3).forEach((c, i) => {
+              const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
+              const detectedCn = chunkContainerNumber(String(c.content ?? ""));
+              console.log(`[global-copilot]   ship[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
+            });
           }
         }
       } catch (e) {
@@ -391,7 +370,9 @@ serve(async (req) => {
       }
     }
 
-    // PATH A: Similarity search
+    // PATH A: Similarity search — supplemental, especially for the
+    // non-container case AND for picking up chunks that may live OUTSIDE the
+    // shipment scope (e.g. a generic logistics question, or a stray reference).
     const queryEmbedding = await embedQuery(queryText, apiKey);
     if (!queryEmbedding) {
       console.error("[global-copilot] PATH A embedQuery returned null — skipping similarity step");
@@ -411,42 +392,46 @@ serve(async (req) => {
         const rawArr = (simChunks ?? []) as Chunk[];
         console.log(`[global-copilot] PATH A similarity returned: ${rawArr.length} (threshold=0.5, count=${matchCount})`);
         rawArr.slice(0, 3).forEach((c, i) => {
-          const head = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
+          const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
           const detectedCn = chunkContainerNumber(String(c.content ?? ""));
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const sim = (c as any).similarity;
+          const sim        = (c as any).similarity;
           console.log(`[global-copilot]   sim[${i}] sim=${typeof sim === "number" ? sim.toFixed(3) : "?"} detectedCn=${detectedCn} content_head="${head}"`);
         });
 
+        // Filter logic:
+        //   - If container was named AND chunk wasn't already pulled via the
+        //     shipment-level lookup, keep it only when its body contains a
+        //     requested number / "ALL" marker. This prevents leakage from
+        //     OTHER shipments the user can see.
+        //   - Chunks already in shipmentChunkIds pass through unconditionally
+        //     (they're shipment-scoped — page-break safe).
+        //   - No container in query → keep everything.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let usableSim: any[] = rawArr;
         if (filterByContainer) {
-          // Content-membership filter (matches the PATH B retrieval contract):
-          //   Keep a chunk when its body mentions any requested container
-          //   number OR is tagged as covering all containers ("Container ... ALL").
-          // We deliberately ignore detectedCn here — chunks for a multi-container
-          // BL routinely have detectedCn pointing at the document's primary
-          // container while the body lists data for siblings too.
           const wanted = requestedContainers.map((s) => s.toUpperCase());
           usableSim = rawArr.filter((c) => {
+            if (shipmentChunkIds.has(c.id)) return true;
             const upper = String(c.content ?? "").toUpperCase();
             return wanted.some((w) => upper.includes(w))
                 || /\bCONTAINER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*ALL\b/.test(upper);
           });
-          console.log(`[global-copilot] PATH A similarity after container filter: ${usableSim.length}/${rawArr.length}`);
+          console.log(`[global-copilot] PATH A similarity after filter: ${usableSim.length}/${rawArr.length}`);
         }
         for (const c of usableSim as Chunk[]) merged.set(c.id, c);
       }
     }
 
-    // Final assemble
-    const chunksOut = [...merged.values()].slice(0, 30);
+    // Final assemble — cap at 40 so the model gets the full doc set.
+    const chunksOut = [...merged.values()].slice(0, 40);
     console.log(`[global-copilot] MERGED chunksOut=${chunksOut.length}`);
     chunksOut.slice(0, 5).forEach((c, i) => {
       const upper      = String(c.content ?? "").toUpperCase();
       const detectedCn = chunkContainerNumber(String(c.content ?? ""));
       const bodyHits   = requestedContainers.filter((rc) => upper.includes(rc));
-      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} bodyMentions=${JSON.stringify(bodyHits)}`);
+      const viaShip    = shipmentChunkIds.has(c.id);
+      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id.slice(0,8)} detectedCn=${detectedCn} viaShip=${viaShip} bodyMentions=${JSON.stringify(bodyHits)}`);
     });
 
     if (filterByContainer && chunksOut.length === 0) {
@@ -490,7 +475,13 @@ serve(async (req) => {
     ? [
         PORTY_SYSTEM_PROMPT,
         "",
-        "Use the retrieved document chunks below to answer accurately. Cross-reference the 'Container Number:' line in each chunk against the container the user asked about — quote a fact ONLY when its chunk's Container Number matches, OR when the chunk says 'Container Number: ALL'.",
+        "You will be provided with document chunks for the ENTIRE shipment that contains the requested container — not just chunks that mention the container number verbatim. PDFs are split across pages, so the container number may appear on Page 1 while its tare/gross weights, seal, or HS code appear on Page 3 in a separate chunk. You MUST read across chunks and reason about the document as a whole: match Bill of Lading numbers, document numbers, and positional order to connect a container ID in one chunk to the figures in another.",
+        "",
+        "Cross-referencing rules:",
+        "1. If a chunk explicitly says 'Container Number: X' (or 'ALL'), data in that chunk belongs to container X (or to every container in the document).",
+        "2. If a chunk has no container header but is part of the same Bill of Lading / invoice / packing list as a chunk that does identify the container, treat the figures as belonging to that container UNLESS another container number appears between them.",
+        "3. When a multi-container document lists per-container rows (e.g. a table with container number + tare + cargo weight per row), match the requested container to its specific row.",
+        "4. If after cross-referencing you still cannot confidently attribute a figure to the requested container, say so honestly — do not guess.",
         allClause,
         "Refer to containers by their ISO container number (e.g. MAEU1234567) — never by internal IDs.",
         "",
