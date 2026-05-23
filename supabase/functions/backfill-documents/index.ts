@@ -340,6 +340,7 @@ interface BackfillBody {
   limit?:     number;
   batchSize?: number;
   dryRun?:    boolean;
+  force?:     boolean;      // bypass the "skip done docs" filter
   documentIds?: string[];   // optional: target specific docs only
 }
 
@@ -367,6 +368,7 @@ serve(async (req) => {
   const limit       = Math.max(1, Math.min(body.limit ?? 100, 2000));
   const batchSize   = Math.max(1, Math.min(body.batchSize ?? 3, 10));
   const dryRun      = body.dryRun === true;
+  const force       = body.force === true;
   const targetIds   = Array.isArray(body.documentIds) ? body.documentIds : null;
 
   // Stop the loop a few seconds short of the 150s edge-function timeout so
@@ -401,9 +403,14 @@ serve(async (req) => {
   // Find document_ids that already have a full-text chunk. ilike + DISTINCT
   // would be ideal but PostgREST doesn't support DISTINCT directly, so we
   // pull matching rows and dedupe in memory.
+  //
+  // When force=true we skip this query entirely and reprocess every candidate.
+  // Safe to do because processOne is idempotent (delete-then-insert per
+  // document_id) — re-running just rebuilds the chunks with the latest text
+  // extraction + the current container_id linkage from portix.documents.
   const FULL_TEXT_MARKER = "--- FULL DOCUMENT TEXT ---";
   let alreadyDone = new Set<string>();
-  if (allCandidates.length > 0) {
+  if (!force && allCandidates.length > 0) {
     const ids = allCandidates.map((d) => d.id);
     const { data: doneChunks, error: chunkErr } = await supabaseAdmin
       .from("document_chunks")
@@ -421,14 +428,15 @@ serve(async (req) => {
     }
   }
 
-  // Filter + cap by requested limit. Already-done docs skipped entirely.
-  const candidates = allCandidates
-    .filter((d) => !alreadyDone.has(d.id))
-    .slice(0, limit);
+  // Filter + cap by requested limit. When force=true the alreadyDone set
+  // stays empty so every candidate is reprocessed.
+  const candidates = force
+    ? allCandidates.slice(0, limit)
+    : allCandidates.filter((d) => !alreadyDone.has(d.id)).slice(0, limit);
 
   console.log(
     `[backfill-documents] fetched=${allCandidates.length} alreadyDone=${alreadyDone.size} ` +
-    `toProcess=${candidates.length} batchSize=${batchSize} dryRun=${dryRun}`,
+    `toProcess=${candidates.length} batchSize=${batchSize} dryRun=${dryRun} force=${force}`,
   );
 
   if (dryRun) {
