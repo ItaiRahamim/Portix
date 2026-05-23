@@ -362,49 +362,51 @@ serve(async (req) => {
             });
           }
 
-          // 3b. Documents-pivot: even when chunks.container_id is wrong/null,
-          //     the document_id still points at portix.documents, which always
-          //     has the right container_id. Walk:
-          //       documents (container_id IN siblings) → doc_ids
+          // 3b. Documents-pivot via SHIPMENT_ID. Shipment-level uploads have
+          //     documents.container_id = NULL (or unrelated) — they live on
+          //     the document row via shipment_id directly. Walk:
+          //       documents (shipment_id IN shipmentIds) → doc_ids
           //       chunks (document_id IN doc_ids)
-          //     This catches chunks whose container_id linkage drifted from
-          //     the underlying document (e.g. shipment-level uploads where
-          //     the original document.container_id was reassigned).
-          const { data: shipDocs, error: sdErr } = await supabaseAnon
-            .from("documents")
-            .select("id, container_id")
-            .in("container_id", siblingIds);
+          //     This catches everything the container-side pivot misses:
+          //     master B/Ls, consolidated invoices, packing lists uploaded
+          //     against the shipment header rather than a single container.
+          if (shipmentIds.length > 0) {
+            const { data: shipDocs, error: sdErr } = await supabaseAnon
+              .from("documents")
+              .select("id, container_id, shipment_id")
+              .in("shipment_id", shipmentIds);
 
-          if (sdErr) {
-            console.error(`[global-copilot] PATH B documents lookup error: ${sdErr.message}`);
-          } else {
-            const docIds = (shipDocs ?? []).map((d: { id: string }) => d.id);
-            console.log(`[global-copilot] PATH B documents in shipment: ${docIds.length}`);
-            if (docIds.length > 0) {
-              const { data: docChunks, error: dcErr } = await supabaseAnon
-                .from("document_chunks")
-                .select("id, container_id, document_id, content")
-                .in("document_id", docIds)
-                .limit(80);
+            if (sdErr) {
+              console.error(`[global-copilot] PATH B documents lookup error: ${sdErr.message}`);
+            } else {
+              const docIds = (shipDocs ?? []).map((d: { id: string }) => d.id);
+              console.log(`[global-copilot] PATH B documents in shipment: ${docIds.length}`);
+              if (docIds.length > 0) {
+                const { data: docChunks, error: dcErr } = await supabaseAnon
+                  .from("document_chunks")
+                  .select("id, container_id, document_id, content")
+                  .in("document_id", docIds)
+                  .limit(80);
 
-              if (dcErr) {
-                console.error(`[global-copilot] PATH B shipment-chunk (by document) error: ${dcErr.message}`);
-              } else {
-                const arr = (docChunks ?? []) as Chunk[];
-                let added = 0;
-                for (const c of arr) {
-                  if (!merged.has(c.id)) added++;
-                  merged.set(c.id, c);
-                  shipmentChunkIds.add(c.id);
+                if (dcErr) {
+                  console.error(`[global-copilot] PATH B shipment-chunk (by document) error: ${dcErr.message}`);
+                } else {
+                  const arr = (docChunks ?? []) as Chunk[];
+                  let added = 0;
+                  for (const c of arr) {
+                    if (!merged.has(c.id)) added++;
+                    merged.set(c.id, c);
+                    shipmentChunkIds.add(c.id);
+                  }
+                  console.log(`[global-copilot] PATH B chunks via document_id: ${arr.length} (new=${added})`);
+                  arr.slice(0, 3).forEach((c, i) => {
+                    const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
+                    const detectedCn = chunkContainerNumber(String(c.content ?? ""));
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const did        = (c as any).document_id ? String((c as any).document_id).slice(0,8) : "?";
+                    console.log(`[global-copilot]   ship-bydoc[${i}] document_id=${did} container_id=${c.container_id?.slice(0,8) ?? "null"} detectedCn=${detectedCn} content_head="${head}"`);
+                  });
                 }
-                console.log(`[global-copilot] PATH B chunks via document_id: ${arr.length} (new=${added})`);
-                arr.slice(0, 3).forEach((c, i) => {
-                  const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
-                  const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  const did        = (c as any).document_id ? String((c as any).document_id).slice(0,8) : "?";
-                  console.log(`[global-copilot]   ship-bydoc[${i}] document_id=${did} container_id=${c.container_id?.slice(0,8) ?? "null"} detectedCn=${detectedCn} content_head="${head}"`);
-                });
               }
             }
           }
