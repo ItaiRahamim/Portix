@@ -338,35 +338,25 @@ serve(async (req) => {
           }
           console.log(`[global-copilot] REL 1b shipmentIds=${shipmentIds.length} containerIds(incl.siblings)=${containerIds.length}`);
 
-          // 1c. Documents in the shipment scope (via documents.container_id)
-          const { data: docs, error: dErr } = await supabaseAnon
-            .from("documents")
-            .select("id, container_id")
-            .in("container_id", containerIds);
-          let docIds: string[] = [];
-          if (dErr) {
-            console.error(`[global-copilot] REL 1c documents lookup error: ${dErr.message}`);
-          } else {
-            docIds = (docs ?? []).map((d: { id: string }) => d.id);
-          }
-          console.log(`[global-copilot] REL 1c documents in shipment-scope: ${docIds.length}`);
-
-          // 1d. All chunks for those documents — no text filter
-          if (docIds.length > 0) {
+          // 1c. Chunks directly via chunks.container_id — skip documents pivot.
+          //     Logs confirmed chunks already carry the correct container_id
+          //     from ingest; the documents table either RLS-blocks or doesn't
+          //     have rows that line up. One less hop, zero data dependencies.
+          if (containerIds.length > 0) {
             const { data: relChunks, error: rcErr } = await supabaseAnon
               .from("document_chunks")
               .select("id, container_id, document_id, content")
-              .in("document_id", docIds)
+              .in("container_id", containerIds)
               .limit(60);
             if (rcErr) {
-              console.error(`[global-copilot] REL 1d chunk lookup error: ${rcErr.message}`);
+              console.error(`[global-copilot] REL 1c chunk lookup error: ${rcErr.message}`);
             } else {
               const arr = (relChunks ?? []) as Chunk[];
               for (const c of arr) {
                 merged.set(c.id, c);
                 expandedChunkIds.add(c.id);
               }
-              console.log(`[global-copilot] REL 1d relational chunks: ${arr.length} (across ${docIds.length} docs)`);
+              console.log(`[global-copilot] REL 1c relational chunks: ${arr.length} (across ${containerIds.length} containers)`);
               arr.slice(0, 3).forEach((c, i) => {
                 const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
                 const detectedCn = chunkContainerNumber(String(c.content ?? ""));
