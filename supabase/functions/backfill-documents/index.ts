@@ -368,8 +368,10 @@ serve(async (req) => {
   const limit       = Math.max(1, Math.min(body.limit ?? 100, 2000));
   const batchSize   = Math.max(1, Math.min(body.batchSize ?? 3, 10));
   const dryRun      = body.dryRun === true;
-  const force       = body.force === true;
   const targetIds   = Array.isArray(body.documentIds) ? body.documentIds : null;
+  // When the caller explicitly names document_ids we ALWAYS reprocess them —
+  // the orchestrator script depends on this for retry safety.
+  const force       = body.force === true || (targetIds !== null && targetIds.length > 0);
 
   // Stop the loop a few seconds short of the 150s edge-function timeout so
   // we can return a clean response with progress stats instead of being
