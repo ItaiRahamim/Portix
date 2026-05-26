@@ -5,22 +5,31 @@
 // Streams Gemini's text generation back to the browser as plain text deltas
 // so it pairs cleanly with @ai-sdk/react useChat + TextStreamChatTransport.
 //
+// Architecture: AGENTIC RAG via Gemini function calling.
+//   • Phase 1 (non-streaming :generateContent, up to 3 rounds): the model
+//     decides whether to call get_live_containers_summary and/or
+//     search_container_documents. We execute the calls and feed results
+//     back as functionResponse parts until the model produces final text.
+//   • Phase 2 (:streamGenerateContent?alt=sse): the same conversation
+//     including all tool calls + responses is re-sent for streaming,
+//     so the answer streams to the UI under the same plain-text contract
+//     TextStreamChatTransport already expects.
+//
 // Request body:
 //   { messages: [{ role: 'user' | 'assistant' | 'system', content?: string,
 //                  parts?: [{ type: 'text', text: string }] }] }
 //
 // Auth: must include Authorization: Bearer <supabase_user_jwt> so anonymous
-//       callers can't burn our Gemini quota. The JWT is validated by reading
-//       the user via supabase.auth.getUser(); we don't actually need the user
-//       data — just proof of a valid signed-in session.
+//       callers can't burn our Gemini quota.
 //
 // Env vars:
-//   SUPABASE_URL              (auto-injected)
-//   SUPABASE_ANON_KEY         (auto-injected)
-//   GEMINI_API_KEY            Set in Dashboard → Edge Functions → Secrets
+//   SUPABASE_URL                (auto-injected)
+//   SUPABASE_ANON_KEY           (auto-injected)
+//   SUPABASE_SERVICE_ROLE_KEY   (auto-injected)
+//   GEMINI_API_KEY              Set in Dashboard → Edge Functions → Secrets
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -30,22 +39,35 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ─── System prompt (Porty persona) ────────────────────────────────────────────
+// ─── System prompt (Porty persona, tool-using mode) ──────────────────────────
 
 const PORTY_SYSTEM_PROMPT = `You are "Porty", a helpful, friendly, and hyper-knowledgeable animated shipping container. You are an expert in global supply chain, freight forwarding, Israeli customs regulations, Incoterms, and import logistics. Answer concisely. Be professional but slightly playful.
 
 STRICT RULES — VIOLATING ANY OF THESE IS A SEVERE ERROR:
 1. NEVER mention internal database IDs, UUIDs (e.g. "e2dc0f20-1234-..."), 8-character hex tokens, document_id values, or any system metadata tag. Refer to containers only by their real ISO 6346 number (4 letters + 7 digits, e.g. MAEU1234567).
-2. When the user asks about a SPECIFIC container number, cross-reference that number against the "Container Number:" line in each retrieved chunk BEFORE quoting any fact. Only quote data from chunks whose Container Number matches the one in the question.
+2. When the user asks about a SPECIFIC container number, only quote data from chunks whose Container Number matches that one (or "ALL" for shipment-wide chunks).
 3. If you are unsure whether a piece of information belongs to the requested container, DO NOT GUESS. Say you don't know.
-4. If the retrieved context is empty or none of the chunks match the requested container, reply EXACTLY: "No information found for container <NUMBER>." — nothing else, no fallback to general knowledge for container-specific questions.
-5. For generic logistics / Incoterms / customs questions that don't reference a specific container, fall back on your general knowledge.`;
+4. For generic logistics / Incoterms / customs questions that don't reference the user's data, answer directly from your general knowledge — no tool call needed.
+
+TOOL USE — you have two tools available:
+
+• get_live_containers_summary — call FIRST whenever the question involves counting, listing, filtering, status overviews, vessels, ETAs, ports, importers, suppliers, or anything about the user's container fleet at a high level. Returns every container the caller can see, with product / vessel / status / ETA / ETD / ports / importer name / supplier name. Counting, listing and filtering MUST be answered from this tool's output — never from document chunks (chunks are incomplete).
+
+• search_container_documents — call when the user asks about granular document content: cargo weights, tare weights, gross weights, carton/pallet counts, supplier names, HS codes, invoice amounts, seal numbers, certificate dates, missing documents, or any specific fact extracted from PDFs. Pass container_numbers to scope to one or more ISO codes. Omit container_numbers for fleet-wide semantic search.
+
+CONTEXTUAL DEDUCTION — never blindly translate or guess at product/commodity names. When the user asks about a product (in any language, slang, or abbreviation), ALWAYS call get_live_containers_summary FIRST to see the exact product names that exist in the database. Use your native trade knowledge and linguistic intelligence to map the user's informal term to the closest matching database value. Only then call search_container_documents with the correct canonical term you observed in the live data.
+
+ZOOM OUT FALLBACK — if your first specific search_query (e.g., "net weight", "N.W") yields chunks that do not contain the answer, do NOT just try more synonyms. Instead, zoom out: your next search_query should name the TYPE of document where this data lives (e.g., search_query: "Bill of Lading, Packing List, Commercial Invoice"). This retrieves raw document chunks so you can scan them directly for the missing value. One specific attempt + one zoom-out attempt is sufficient before stopping.
+
+FAIL-SAFE — if you cannot find the exact requested data after the zoom-out scan, stop searching. Politely inform the user that you scanned the relevant documents (name the document types you checked, e.g., "I scanned the Packing Lists and Bill of Lading") but the specific data point is missing or not legible in the uploaded documents. Never invent numbers.
+
+Hybrid questions ("list my red onion containers and their tare weights") require TWO calls: first get_live_containers_summary to identify which containers match, then search_container_documents with those container_numbers to get the weights.
+
+If a tool returns { "error": "No visible containers ..." } or { "error": "No documents found ..." }, surface that message verbatim to the user — do not invent data and do not fall back to general knowledge for that specific container.
+
+Never emit UUIDs, document_ids, shipment_ids, or any 8-character hex prefix. Refer to containers only by their ISO 6346 number.`;
 
 // ─── ID scrub + container helpers ────────────────────────────────────────────
-// Belt-and-suspenders against the LLM citing internal UUIDs / 8-char hex
-// prefixes from leaked metadata. We sanitize both the retrieval context
-// before injection AND rely on the system prompt to forbid the model from
-// emitting them anyway.
 
 const UUID_RE         = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const BARE_HEX_RE     = /\b[a-f0-9]{8}\b/g;
@@ -55,7 +77,6 @@ function scrubIdentifiers(text: string): string {
   return text
     .replace(UUID_RE, "")
     .replace(BARE_HEX_RE, "")
-    // Tidy up the trailing spaces / double whitespace the substitutions leave
     .replace(/[ \t]{2,}/g, " ")
     .replace(/ +(\n)/g, "$1");
 }
@@ -65,29 +86,34 @@ function findContainerNumbers(text: string): string[] {
   return [...new Set((text.toUpperCase().match(CONTAINER_NUM_RE) ?? []))];
 }
 
-/** Extract the first Container Number declared inside a chunk body.
- *  Returns the ISO 6346 code, the literal "ALL" (for multi-container docs
- *  like invoices/BLs that cover every container in a shipment), or null
- *  when no Container Number header is present.
- *
- *  Robust to Gemini quirks:
- *   - case-insensitive (uppercases everything first)
- *   - whitespace-tolerant inside the ID (e.g. "SEGU 9467227" → SEGU9467227)
- *   - matches synonyms like "Container No.", "Container #" */
+/**
+ * Extract meaningful keywords from a search_query for the relational pull
+ * ilike filter. Returns at most 5 tokens (stop-words stripped). Used to
+ * prioritise chunks that actually contain the answer over T&C boilerplate.
+ */
+function extractRelKeywords(query: string): string[] {
+  const STOP = new Set([
+    "the", "and", "for", "what", "this", "that", "with", "from", "are",
+    "have", "its", "per", "how", "much", "many", "can", "you", "show",
+    "tell", "give", "get", "all", "any", "whats", "please",
+  ]);
+  const tokens = query
+    .toLowerCase()
+    .split(/[\s,./\\()\[\]{}:;'"!?]+/)
+    .filter((t) => t.length > 2 && !STOP.has(t))
+    .slice(0, 5);
+  return [...new Set(tokens)];
+}
+
+/** Extract the first Container Number declared inside a chunk body. */
 function chunkContainerNumber(content: string): string | null {
-  // Collapse all whitespace so "SEGU 9467227" matches as one token
   const upper = content.toUpperCase().replace(/[ \t]+/g, " ");
-  const compact = upper.replace(/(?<=[A-Z])\s+(?=\d)/g, ""); // drop space between letters and digits
+  const compact = upper.replace(/(?<=[A-Z])\s+(?=\d)/g, "");
   const m = compact.match(/CONTAINER\s*(?:NUMBER|NO\.?|#)\s*:?\s*([A-Z]{4}\d{7}|ALL)/);
   return m ? m[1] : null;
 }
 
-/**
- * Streams a fixed text response back to the client in the same plain-text
- * shape the TextStreamChatTransport expects from Gemini. Used to short-circuit
- * when we know retrieval found nothing relevant — saves Gemini quota AND
- * eliminates any chance the model invents data.
- */
+/** Stream a fixed text response (used for handler-level error fallbacks). */
 function streamFixedText(text: string): Response {
   const encoder = new TextEncoder();
   const stream  = new ReadableStream<Uint8Array>({
@@ -104,17 +130,13 @@ function streamFixedText(text: string): Response {
   });
 }
 
-// ─── Gemini streaming ─────────────────────────────────────────────────────────
-// SSE endpoint: returns lines like  data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-// We parse each event and re-emit just the text delta.
+// ─── Gemini endpoints + embedding ────────────────────────────────────────────
 
-const GEMINI_MODEL = "gemini-2.5-flash";
-const GEMINI_URL   =
+const GEMINI_MODEL      = "gemini-2.5-flash";
+const GEMINI_STREAM_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse`;
-
-// ─── Embedding model (RAG retrieval query) ───────────────────────────────────
-// Must match the model + dimensionality used to populate document_chunks
-// in embed-document / backfill-rag, otherwise cosine similarity is meaningless.
+const GEMINI_NONSTREAM_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 const EMBED_MODEL      = "gemini-embedding-2";
 const EMBED_OUTPUT_DIM = 768;
@@ -129,7 +151,7 @@ async function embedQuery(text: string, apiKey: string): Promise<number[] | null
       body:    JSON.stringify({
         model:   `models/${EMBED_MODEL}`,
         content: { parts: [{ text }] },
-        taskType: "RETRIEVAL_QUERY",       // paired with RETRIEVAL_DOCUMENT at ingest
+        taskType: "RETRIEVAL_QUERY",
         outputDimensionality: EMBED_OUTPUT_DIM,
       }),
     });
@@ -150,8 +172,6 @@ async function embedQuery(text: string, apiKey: string): Promise<number[] | null
 }
 
 // ─── Message normalization ────────────────────────────────────────────────────
-// Accepts both legacy `{role, content}` and the modern ai-sdk
-// `{role, parts: [{type:'text', text}]}` shapes.
 
 interface ClientMessage {
   role: "user" | "assistant" | "system";
@@ -170,22 +190,23 @@ function messageText(m: ClientMessage): string {
   return "";
 }
 
-function toGeminiContents(messages: ClientMessage[]) {
-  // Gemini expects roles 'user' | 'model'. We drop 'system' messages (the
-  // system prompt is sent via systemInstruction) and remap 'assistant' → 'model'.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type GeminiPart = { text?: string; functionCall?: { name: string; args?: any }; functionResponse?: { name: string; response: any } };
+type GeminiContent = { role: "user" | "model"; parts: GeminiPart[] };
+
+function toGeminiContents(messages: ClientMessage[]): GeminiContent[] {
   return messages
     .filter((m) => m.role !== "system")
     .map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: messageText(m) }],
+      role: (m.role === "assistant" ? "model" : "user") as "user" | "model",
+      parts: [{ text: messageText(m) }] as GeminiPart[],
     }))
-    .filter((c) => c.parts[0].text.trim().length > 0);
+    .filter((c) => (c.parts[0].text ?? "").trim().length > 0);
 }
 
-// ─── SSE delta extractor ──────────────────────────────────────────────────────
+// ─── SSE delta extractor (phase 2 only — pure text) ──────────────────────────
 
 function extractDelta(sseLine: string): string {
-  // Format: "data: {json}" — strip prefix, parse, pull text out
   if (!sseLine.startsWith("data:")) return "";
   const payload = sseLine.slice(5).trim();
   if (!payload || payload === "[DONE]") return "";
@@ -204,6 +225,318 @@ function extractDelta(sseLine: string): string {
   }
 }
 
+// ─── Tool declarations (sent to Gemini, drive function calling) ──────────────
+
+const TOOL_DECLARATIONS = {
+  functionDeclarations: [
+    {
+      name: "get_live_containers_summary",
+      description:
+        "Use this FIRST for any question about how many containers, which containers, status overviews, vessels, ETAs, ports, importers, suppliers, or anything that asks about the user's container fleet as a whole. Returns ALL containers the caller can see. Counting / listing / filtering MUST be answered from this data — never from document chunks.",
+      parameters: {
+        type: "OBJECT",
+        properties: {},
+        required: [] as string[],
+      },
+    },
+    {
+      name: "search_container_documents",
+      description:
+        "Use this for granular document-level details: cargo weights, tare/gross weights, carton or pallet counts, supplier names, HS codes, invoice amounts, seal numbers, certificate dates, missing documents, or any specific fact extracted from PDFs. Pass container_numbers to scope to specific ISO codes (recommended whenever the user named a container). Omit container_numbers for fleet-wide semantic search. Use your trade expertise to formulate the best search_query — shipping documents use varied terminology and abbreviations, so include synonyms and alternate forms to maximise recall.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          search_query: {
+            type: "STRING",
+            description:
+              "Natural-language question / topic to retrieve. Used both for vector search and as the user-intent anchor.",
+          },
+          container_numbers: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+            description:
+              "Optional. ISO 6346 codes (4 letters + 7 digits) to restrict the search. If empty/omitted, search spans every container the caller can see.",
+          },
+        },
+        required: ["search_query"],
+      },
+    },
+  ],
+};
+
+// ─── Tool runners ─────────────────────────────────────────────────────────────
+
+async function toolGetLiveContainers(
+  supabaseAnon: SupabaseClient,
+): Promise<unknown> {
+  // Use v_containers — the pre-joined dashboard view (shipments + profiles).
+  // Avoids the column-not-found crashes that hit when querying containers
+  // directly (e.g. there is no `product` or `vessel` column on containers
+  // — those live as `product_name` on containers and `vessel_name` on
+  // shipments). The view also already carries the carrier (00331) and
+  // bl_number (00327) fields, which may help future questions.
+  const { data, error } = await supabaseAnon
+    .from("v_containers")
+    .select(
+      `container_number, product_name, hs_code, vessel_name, status,
+       eta, etd, port_of_loading, port_of_destination, origin_country,
+       importer_company, supplier_company, shipment_number`,
+    )
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) {
+    console.error(`[global-copilot] toolGetLiveContainers error: ${error.message}`);
+    return { error: error.message };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rows = (data ?? []) as any[];
+  return {
+    count: rows.length,
+    containers: rows.map((c) => ({
+      container_number: c.container_number,
+      product:          c.product_name,
+      hs_code:          c.hs_code,
+      vessel:           c.vessel_name,
+      status:           c.status,
+      etd:              c.etd,
+      eta:              c.eta,
+      port_of_loading:      c.port_of_loading,
+      port_of_destination:  c.port_of_destination,
+      origin_country:       c.origin_country,
+      importer:             c.importer_company,
+      supplier:             c.supplier_company,
+      shipment_number:      c.shipment_number,
+    })),
+  };
+}
+
+async function toolSearchDocuments(
+  args: { search_query?: string; container_numbers?: string[] },
+  supabaseAnon: SupabaseClient,
+  supabaseAdmin: SupabaseClient,
+  apiKey: string,
+): Promise<unknown> {
+  const q = String(args?.search_query ?? "").trim();
+  if (!q) return { error: "search_query is required" };
+
+  const requested = (args?.container_numbers ?? [])
+    .map((s) => String(s ?? "").toUpperCase())
+    .filter((s) => /^[A-Z]{4}\d{7}$/.test(s));
+
+  // Privacy boundary: resolve container_numbers → live UUIDs via supabaseAnon.
+  let containerIds: string[] = [];
+  if (requested.length > 0) {
+    const { data: matched, error: mErr } = await supabaseAnon
+      .from("containers")
+      .select("id, container_number, shipment_id")
+      .in("container_number", requested);
+    if (mErr) {
+      console.error(`[global-copilot] toolSearchDocuments resolve error: ${mErr.message}`);
+      return { error: mErr.message };
+    }
+    if (!matched || matched.length === 0) {
+      return {
+        error:
+          `No visible containers matching: ${requested.join(", ")}. ` +
+          `Surface this verbatim to the user.`,
+      };
+    }
+    // Expand to siblings in same shipment(s) for cross-document page-split coverage.
+    const shipIds = [
+      ...new Set(
+        (matched as Array<{ shipment_id: string | null }>)
+          .map((m) => m.shipment_id)
+          .filter(Boolean) as string[],
+      ),
+    ];
+    containerIds = (matched as Array<{ id: string }>).map((m) => m.id);
+    if (shipIds.length > 0) {
+      const { data: sibs } = await supabaseAnon
+        .from("containers")
+        .select("id")
+        .in("shipment_id", shipIds);
+      containerIds = [
+        ...new Set([
+          ...containerIds,
+          ...(((sibs ?? []) as Array<{ id: string }>).map((s) => s.id)),
+        ]),
+      ];
+    }
+    console.log(
+      `[global-copilot] toolSearchDocuments scoped: requested=${requested.length} containerIds(w/siblings)=${containerIds.length}`,
+    );
+  }
+
+  const embedding = await embedQuery(q, apiKey);
+  if (!embedding) return { error: "embedding failed" };
+
+  // Similarity RPC — RPC enforces auth.uid() server-side; scoped to caller.
+  const { data: simChunks, error: rpcErr } = await supabaseAnon.rpc(
+    "match_user_document_chunks",
+    {
+      query_embedding: embedding,
+      match_threshold: 0.4,
+      match_count: containerIds.length > 0 ? 30 : 12,
+    },
+  );
+  if (rpcErr) {
+    console.error(`[global-copilot] toolSearchDocuments RPC error: ${rpcErr.message}`);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let results = ((simChunks ?? []) as any[]).map((c) => ({
+    id: c.id as string,
+    container_id: c.container_id as string,
+    document_id: c.document_id as string,
+    content: String(c.content ?? ""),
+    similarity: typeof c.similarity === "number" ? c.similarity : 0,
+  }));
+
+  // Relational pull (two-pass): if container_numbers given, pull chunks from
+  // those containers. A blind LIMIT grabs T&C boilerplate first and buries
+  // the weight/measurement chunks. Fix: keyword-filtered Pass 1 first so the
+  // most relevant chunks always make the 60-chunk cap.
+  if (containerIds.length > 0) {
+    const relKeywords = extractRelKeywords(q);
+    const seenRel = new Set(results.map((r) => r.id));
+
+    // Pass 1 — targeted: fetch chunks whose content matches the query keywords.
+    // Uses OR ilike across all tokens so any matching chunk is included.
+    if (relKeywords.length > 0) {
+      const filterExpr = relKeywords.map((k) => `content.ilike.%${k}%`).join(",");
+      const { data: targeted, error: tErr } = await supabaseAdmin
+        .from("document_chunks")
+        .select("id, container_id, document_id, content")
+        .in("container_id", containerIds)
+        .or(filterExpr)
+        .limit(40);
+      if (tErr) {
+        console.error(`[global-copilot] toolSearchDocuments rel targeted error: ${tErr.message}`);
+      } else {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for (const c of ((targeted ?? []) as any[])) {
+          if (!seenRel.has(c.id)) {
+            results.push({
+              id: c.id,
+              container_id: c.container_id,
+              document_id: c.document_id,
+              content: String(c.content ?? ""),
+              similarity: 0.01, // rank above unfiltered fallback chunks
+            });
+            seenRel.add(c.id);
+          }
+        }
+      }
+    }
+
+    // Pass 2 — unfiltered fallback: fill remaining slots with general chunks.
+    // Over-fetch by seenRel.size to compensate for dedup losses.
+    const remaining = 60 - results.length;
+    if (remaining > 0) {
+      const { data: fallback, error: fErr } = await supabaseAdmin
+        .from("document_chunks")
+        .select("id, container_id, document_id, content")
+        .in("container_id", containerIds)
+        .limit(remaining + seenRel.size);
+      if (fErr) {
+        console.error(`[global-copilot] toolSearchDocuments rel fallback error: ${fErr.message}`);
+      } else {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for (const c of ((fallback ?? []) as any[])) {
+          if (!seenRel.has(c.id) && results.length < 60) {
+            results.push({
+              id: c.id,
+              container_id: c.container_id,
+              document_id: c.document_id,
+              content: String(c.content ?? ""),
+              similarity: 0,
+            });
+            seenRel.add(c.id);
+          }
+        }
+      }
+    }
+
+    results = results.slice(0, 60);
+  }
+
+  if (results.length === 0) {
+    return requested.length > 0
+      ? { error: `No documents found for ${requested.join(", ")}. Surface this verbatim to the user.` }
+      : { chunk_count: 0, chunks: [] };
+  }
+
+  console.log(`[global-copilot] toolSearchDocuments returning chunks=${results.length}`);
+
+  return {
+    chunk_count: results.length,
+    chunks: results.map((c) => ({
+      container_number: chunkContainerNumber(c.content) ?? "unknown",
+      content: scrubIdentifiers(c.content).slice(0, 800),
+      similarity: c.similarity,
+    })),
+  };
+}
+
+// ─── Phase 1: non-streaming generateContent + function-calling loop ──────────
+
+interface ToolCallContext {
+  supabaseAnon: SupabaseClient;
+  supabaseAdmin: SupabaseClient;
+  apiKey: string;
+}
+
+async function executeFunctionCall(
+  name: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  args: any,
+  ctx: ToolCallContext,
+): Promise<unknown> {
+  console.log(`[global-copilot] tool call: ${name} args=${JSON.stringify(args).slice(0, 200)}`);
+  if (name === "get_live_containers_summary") {
+    return await toolGetLiveContainers(ctx.supabaseAnon);
+  }
+  if (name === "search_container_documents") {
+    return await toolSearchDocuments(args ?? {}, ctx.supabaseAnon, ctx.supabaseAdmin, ctx.apiKey);
+  }
+  return { error: `Unknown tool: ${name}` };
+}
+
+async function geminiNonStreaming(
+  apiKey: string,
+  systemInstruction: string,
+  contents: GeminiContent[],
+): Promise<{ ok: true; content: GeminiContent } | { ok: false; status: number; body: string }> {
+  const res = await fetch(`${GEMINI_NONSTREAM_URL}?key=${apiKey}`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      contents,
+      tools: [TOOL_DECLARATIONS],
+      toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+      generationConfig: {
+        maxOutputTokens: 2048,
+        temperature:     0.7,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    return { ok: false, status: res.status, body: body.slice(0, 400) };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const json = (await res.json()) as any;
+  const cand = json?.candidates?.[0];
+  const role: "model" = "model";
+  const parts: GeminiPart[] = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
+  return { ok: true, content: { role, parts } };
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 serve(async (req) => {
@@ -211,16 +544,12 @@ serve(async (req) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
-  // 1. Auth gate — must have a valid Supabase JWT
+  // 1. Auth gate
   const authHeader = req.headers.get("Authorization") ?? "";
   if (!authHeader.toLowerCase().startsWith("bearer ")) {
     return new Response("Unauthorized", { status: 401, headers: corsHeaders });
   }
 
-  // db.schema = 'portix' is REQUIRED — the RAG RPC (and every other table
-  // we care about) lives in the portix schema. Without this option supabase-js
-  // routes RPC calls to public.* and PostgREST 404s with
-  //   "Could not find the function public.match_user_document_chunks in the schema cache".
   const supabaseAnon = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
     Deno.env.get("SUPABASE_ANON_KEY") ?? "",
@@ -228,6 +557,15 @@ serve(async (req) => {
       db:     { schema: "portix" },
       global: { headers: { Authorization: authHeader } },
     },
+  );
+
+  // Service-role client: used ONLY inside toolSearchDocuments for chunk fetch
+  // after ownership has been verified via supabaseAnon. Bypasses RLS on
+  // document_chunks; safe because containerIds are pre-filtered.
+  const supabaseAdmin = createClient(
+    Deno.env.get("SUPABASE_URL") ?? "",
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+    { db: { schema: "portix" } },
   );
 
   const { data: { user } } = await supabaseAnon.auth.getUser();
@@ -247,276 +585,111 @@ serve(async (req) => {
     return new Response("messages array is required", { status: 400, headers: corsHeaders });
   }
 
-  // 3. Call Gemini streaming
   const apiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
   if (!apiKey) {
     return new Response("GEMINI_API_KEY not set", { status: 500, headers: corsHeaders });
   }
 
-  // ── RAG retrieval ─────────────────────────────────────────────────────────
-  // Two retrieval paths run depending on whether the user named a container:
-  //
-  //   A. NO container in query → similarity search via RPC (existing behaviour).
-  //      Failure is non-fatal — Porty falls back to general knowledge.
-  //
-  //   B. Container named (e.g. SEGU9467227) → DIRECT lookup via supabaseAnon:
-  //      fetch chunks where containers.container_number = ANY(requested) AND
-  //      chunks tagged "Container Number: ALL" for the same shipment. This
-  //      bypasses similarity entirely so a Hebrew (or otherwise low-cosine)
-  //      query can't starve the response. Similarity is still run in parallel
-  //      to surface anything tagged ALL that lives under a different container,
-  //      and the two result sets are merged + de-duped before injection.
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  type Chunk = { id: string; container_id: string; document_id?: string | null; content: string; similarity?: number };
-
-  let contextString = "";
+  // 3. Diagnostic header
   const lastUserText = [...messages].reverse().find((m) => m.role === "user");
-  const queryText = lastUserText ? messageText(lastUserText).trim() : "";
+  const queryText    = lastUserText ? messageText(lastUserText).trim() : "";
+  console.log(`[global-copilot] ============ AGENTIC START ============`);
+  console.log(`[global-copilot] user=${user.id}`);
+  console.log(`[global-copilot] query="${queryText.slice(0, 200)}"`);
+  console.log(`[global-copilot] containersInQuery=${JSON.stringify(findContainerNumbers(queryText))}`);
 
-  const requestedContainers = queryText ? findContainerNumbers(queryText) : [];
-  const filterByContainer   = requestedContainers.length > 0;
+  // 4. Phase 1: tool-calling loop (max 3 rounds)
+  const ctx: ToolCallContext = { supabaseAnon, supabaseAdmin, apiKey };
+  const contents: GeminiContent[] = toGeminiContents(messages);
+  const MAX_ROUNDS = 3;
+  let producedText = false;
 
-  if (queryText) {
-    console.log(`[global-copilot] ============ RAG START ============`);
-    console.log(`[global-copilot] user=${user.id}`);
-    console.log(`[global-copilot] query="${queryText.slice(0, 200)}"`);
-    console.log(`[global-copilot] requestedContainers=${JSON.stringify(requestedContainers)} (count=${requestedContainers.length})`);
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const resp = await geminiNonStreaming(apiKey, PORTY_SYSTEM_PROMPT, contents);
+    if (!resp.ok) {
+      console.error(`[global-copilot] phase1 round=${round} Gemini HTTP ${resp.status}: ${resp.body}`);
+      return streamFixedText("I hit a temporary error reaching my brain. Please try again in a moment.");
+    }
 
-    const merged: Map<string, Chunk> = new Map();
-
-    // Chunks pulled via DOCUMENT EXPANSION bypass the content-membership
-    // filter on PATH A (similarity). Reason: a single PDF gets split across
-    // pages — container ID on Page 1, weights on Page 3. Strict text-filter
-    // would drop Page 3 even though it lives inside the same document_id.
-    const expandedChunkIds = new Set<string>();
-
-    // ── RELATIONAL SHIPMENT WALK (only when user named a container) ─────────
-    //    containers → siblings (same shipment) → documents → chunks
-    //    No text matching. No reliance on chunks.container_id accuracy.
-    //    Pure FK walk via the schema:
-    //        portix.containers.shipment_id
-    //        portix.documents.container_id
-    //        portix.document_chunks.document_id
-    //    Result chunks bypass the PATH A content filter (expandedChunkIds).
-    if (filterByContainer) {
-      try {
-        // 1a. Resolve + precheck (privacy boundary)
-        console.log(`[global-copilot] REL 1a: containers.in("container_number", ${JSON.stringify(requestedContainers)})`);
-        const { data: matched, error: mErr } = await supabaseAnon
-          .from("containers")
-          .select("id, container_number, shipment_id")
-          .in("container_number", requestedContainers);
-
-        if (mErr) {
-          console.error(`[global-copilot] REL 1a container lookup error: ${mErr.message}`);
-        } else {
-          const matchedArr = matched ?? [];
-          console.log(`[global-copilot] REL 1a matched: ${JSON.stringify(matchedArr.map((m: { id: string; container_number: string; shipment_id: string | null }) => ({ id: m.id.slice(0,8), num: m.container_number, ship: m.shipment_id?.slice(0,8) ?? null })))}`);
-
-          if (matchedArr.length === 0) {
-            const refusal = requestedContainers.length === 1
-              ? `No information found for container ${requestedContainers[0]}.`
-              : `No information found for containers ${requestedContainers.join(", ")}.`;
-            console.log(`[global-copilot] short-circuit (no visible containers): ${refusal}`);
-            return streamFixedText(refusal);
-          }
-
-          // 1b. Shipment-wide container expansion
-          const shipmentIds = [...new Set(matchedArr.map((m: { shipment_id: string | null }) => m.shipment_id).filter(Boolean) as string[])];
-          let containerIds: string[] = matchedArr.map((m: { id: string }) => m.id);
-          if (shipmentIds.length > 0) {
-            const { data: siblings, error: sErr } = await supabaseAnon
-              .from("containers")
-              .select("id")
-              .in("shipment_id", shipmentIds);
-            if (sErr) {
-              console.error(`[global-copilot] REL 1b sibling lookup error: ${sErr.message}`);
-            } else {
-              containerIds = [...new Set([...containerIds, ...(siblings ?? []).map((s: { id: string }) => s.id)])];
-            }
-          }
-          console.log(`[global-copilot] REL 1b shipmentIds=${shipmentIds.length} containerIds(incl.siblings)=${containerIds.length}`);
-
-          // 1c. Chunks directly via chunks.container_id — skip documents pivot.
-          //     Logs confirmed chunks already carry the correct container_id
-          //     from ingest; the documents table either RLS-blocks or doesn't
-          //     have rows that line up. One less hop, zero data dependencies.
-          if (containerIds.length > 0) {
-            const { data: relChunks, error: rcErr } = await supabaseAnon
-              .from("document_chunks")
-              .select("id, container_id, document_id, content")
-              .in("container_id", containerIds)
-              .limit(60);
-            if (rcErr) {
-              console.error(`[global-copilot] REL 1c chunk lookup error: ${rcErr.message}`);
-            } else {
-              const arr = (relChunks ?? []) as Chunk[];
-              for (const c of arr) {
-                merged.set(c.id, c);
-                expandedChunkIds.add(c.id);
-              }
-              console.log(`[global-copilot] REL 1c relational chunks: ${arr.length} (across ${containerIds.length} containers)`);
-              arr.slice(0, 3).forEach((c, i) => {
-                const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 250);
-                const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const did        = (c as any).document_id ? String((c as any).document_id).slice(0,8) : "?";
-                console.log(`[global-copilot]   rel[${i}] document_id=${did} container_id=${c.container_id?.slice(0,8) ?? "null"} detectedCn=${detectedCn} content_head="${head}"`);
-              });
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[global-copilot] REL walk exception: ${(e as Error).message}`);
+    const modelTurn = resp.content;
+    const functionCalls: Array<{ name: string; args: unknown }> = [];
+    let textInTurn = "";
+    for (const p of modelTurn.parts) {
+      if (p.functionCall?.name) {
+        functionCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {} });
+      }
+      if (typeof p.text === "string") {
+        textInTurn += p.text;
       }
     }
 
-    // ── PATH A: Similarity search (always runs, supplemental) ───────────────
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let simRaw: any[] = [];
-    const queryEmbedding = await embedQuery(queryText, apiKey);
-    if (!queryEmbedding) {
-      console.error("[global-copilot] embedQuery returned null — skipping similarity step");
-    } else {
-      console.log(`[global-copilot] queryEmbedding ready (len=${queryEmbedding.length})`);
-      const matchCount = filterByContainer ? 20 : 8;
-      const { data: simChunks, error: rpcErr } = await supabaseAnon
-        .rpc("match_user_document_chunks", {
-          query_embedding: queryEmbedding,
-          match_threshold: 0.5,
-          match_count:     matchCount,
-        });
-      if (rpcErr) {
-        console.error(`[global-copilot] similarity RPC error: ${rpcErr.message}`);
-      } else {
-        simRaw = simChunks ?? [];
-        console.log(`[global-copilot] similarity returned: ${simRaw.length} (threshold=0.5, count=${matchCount})`);
-        simRaw.slice(0, 3).forEach((c: { content?: string; container_id?: string; similarity?: number }, i: number) => {
-          const head       = String(c.content ?? "").replace(/\s+/g, " ").slice(0, 200);
-          const detectedCn = chunkContainerNumber(String(c.content ?? ""));
-          console.log(`[global-copilot]   sim[${i}] sim=${typeof c.similarity === "number" ? c.similarity.toFixed(3) : "?"} container_id=${c.container_id?.slice(0,8)} detectedCn=${detectedCn} content_head="${head}"`);
-        });
-      }
+    console.log(
+      `[global-copilot] phase1 round=${round} functionCalls=${JSON.stringify(functionCalls.map((c) => c.name))} textLen=${textInTurn.length}`,
+    );
+
+    if (functionCalls.length === 0) {
+      // Model has finished tool calls and is ready to answer.
+      // DO NOT push modelTurn — contents must end at the last functionResponse
+      // (or the initial user prompt if no tools were used). Phase 2 will
+      // re-generate and stream the final answer fresh. Pushing the model's
+      // pre-generated text here causes Phase 2 to receive a conversation that
+      // already ends with the answer, so Gemini emits an empty stream.
+      producedText = textInTurn.length > 0;
+      break;
     }
 
-    // ── Merge similarity hits with filter rule.
-    //    Filter rule (when container requested):
-    //      - chunk already in expandedChunkIds → bypass (page-break safe)
-    //      - else require body match for a requested container OR
-    //        "Container … ALL" — prevents leakage from unrelated shipments
-    //        the user can see.
-    //    No container in query → keep everything.
-    const applyContentFilter = (c: { id: string; content?: string }): boolean => {
-      if (!filterByContainer) return true;
-      if (expandedChunkIds.has(c.id)) return true;
-      const upper = String(c.content ?? "").toUpperCase();
-      return requestedContainers.some((w) => upper.includes(w))
-          || /\bCONTAINER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*ALL\b/.test(upper);
-    };
+    // Append the model turn (with functionCall parts) — required for Gemini's
+    // multi-turn function-calling contract.
+    contents.push(modelTurn);
 
-    let simAdded = 0;
-    for (const c of simRaw as Chunk[]) {
-      if (!applyContentFilter(c)) continue;
-      if (!merged.has(c.id)) simAdded++;
-      merged.set(c.id, c);
+    // Execute every requested call (parallel function calling), collect responses.
+    const responseParts: GeminiPart[] = [];
+    for (const fc of functionCalls) {
+      const result = await executeFunctionCall(fc.name, fc.args, ctx);
+      responseParts.push({
+        functionResponse: { name: fc.name, response: result as Record<string, unknown> },
+      });
     }
-    console.log(`[global-copilot] merged: +sim=${simAdded} (expanded already ${expandedChunkIds.size})`);
+    contents.push({ role: "user", parts: responseParts });
 
-    // Final assemble — cap at 60 so a full multi-doc shipment fits.
-    const chunksOut = [...merged.values()].slice(0, 60);
-    console.log(`[global-copilot] MERGED chunksOut=${chunksOut.length}`);
-    chunksOut.slice(0, 5).forEach((c, i) => {
-      const upper       = String(c.content ?? "").toUpperCase();
-      const detectedCn  = chunkContainerNumber(String(c.content ?? ""));
-      const bodyHits    = requestedContainers.filter((rc) => upper.includes(rc));
-      const viaExpand   = expandedChunkIds.has(c.id);
-      console.log(`[global-copilot]   merged[${i}] container_id=${c.container_id?.slice(0,8) ?? "null"} detectedCn=${detectedCn} viaExpand=${viaExpand} bodyMentions=${JSON.stringify(bodyHits)}`);
-    });
-
-    if (filterByContainer && chunksOut.length === 0) {
-      const refusal = requestedContainers.length === 1
-        ? `No information found for container ${requestedContainers[0]}.`
-        : `No information found for containers ${requestedContainers.join(", ")}.`;
-      console.log(`[global-copilot] short-circuit (no chunks after merge): ${refusal}`);
-      return streamFixedText(refusal);
+    if (round === MAX_ROUNDS) {
+      // Nudge the model to stop tool-calling on the next pass — phase 2 will
+      // re-issue the same conversation in streaming mode.
+      console.log(`[global-copilot] phase1 hit MAX_ROUNDS=${MAX_ROUNDS}, forcing answer`);
+      contents.push({
+        role: "user",
+        parts: [{ text: "Now answer the user using the data above. Do not call any more tools." }],
+      });
     }
-
-    contextString = chunksOut
-      .map((c) => {
-        const realCn = chunkContainerNumber(String(c.content ?? "")) ?? "unknown";
-        const txt    = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 800);
-        return `- [container ${realCn}] ${txt}`;
-      })
-      .join("\n");
-
-    console.log(`[global-copilot] ============ RAG END (hits=${chunksOut.length}) ============`);
   }
 
-  // Final scrub — even if a chunk body contains a stray UUID / 8-hex token,
-  // strip it before the model ever sees it. This is the second line of defence;
-  // the system prompt forbids the model from emitting these strings too.
-  contextString = scrubIdentifiers(contextString);
-
-  console.log(
-    "[global-copilot] Injected Context (length=" + contextString.length + "):\n" +
-    (contextString || "(empty — model will use general knowledge only)"),
-  );
-
-  // Build an ALL-semantics instruction tailored to which container(s) the
-  // user actually asked about. Only included when the user named a container.
-  const allClause = filterByContainer
-    ? (requestedContainers.length === 1
-        ? `If a chunk says "Container Number: ALL", it applies to ALL containers in the shared shipment/invoice/B/L — including ${requestedContainers[0]}. Treat data from such chunks as relevant to ${requestedContainers[0]}.`
-        : `If a chunk says "Container Number: ALL", it applies to EVERY container in the shared shipment/invoice/B/L — including ${requestedContainers.join(", ")}. Treat data from such chunks as relevant to each requested container.`)
-    : `If a chunk says "Container Number: ALL", it applies to every container in that shipment/invoice/B/L.`;
-
-  const systemPromptWithRag = contextString
-    ? [
-        PORTY_SYSTEM_PROMPT,
-        "",
-        "You will be provided with document chunks for the ENTIRE shipment that contains the requested container — not just chunks that mention the container number verbatim. PDFs are split across pages, so the container number may appear on Page 1 while its tare/gross weights, seal, or HS code appear on Page 3 in a separate chunk. You MUST read across chunks and reason about the document as a whole: match Bill of Lading numbers, document numbers, and positional order to connect a container ID in one chunk to the figures in another.",
-        "",
-        "Cross-referencing rules:",
-        "1. If a chunk explicitly says 'Container Number: X' (or 'ALL'), data in that chunk belongs to container X (or to every container in the document).",
-        "2. If a chunk has no container header but is part of the same Bill of Lading / invoice / packing list as a chunk that does identify the container, treat the figures as belonging to that container UNLESS another container number appears between them.",
-        "3. When a multi-container document lists per-container rows (e.g. a table with container number + tare + cargo weight per row), match the requested container to its specific row.",
-        "4. If after cross-referencing you still cannot confidently attribute a figure to the requested container, say so honestly — do not guess.",
-        allClause,
-        "Refer to containers by their ISO container number (e.g. MAEU1234567) — never by internal IDs.",
-        "",
-        "RETRIEVED CONTEXT:",
-        contextString,
-      ].join("\n")
-    : PORTY_SYSTEM_PROMPT;
-
-  const geminiBody = JSON.stringify({
-    systemInstruction: { parts: [{ text: systemPromptWithRag }] },
-    contents:          toGeminiContents(messages),
-    generationConfig: {
-      maxOutputTokens: 800,
-      temperature:     0.7,
-    },
-  });
-
-  const upstream = await fetch(`${GEMINI_URL}&key=${apiKey}`, {
+  // 5. Phase 2: stream final answer using the same conversation
+  void producedText; // diagnostic only — phase 2 re-renders regardless
+  const streamRes = await fetch(`${GEMINI_STREAM_URL}&key=${apiKey}`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    geminiBody,
+    body:    JSON.stringify({
+      systemInstruction: { parts: [{ text: PORTY_SYSTEM_PROMPT }] },
+      contents,
+      // Disable tool calling on phase 2 — we want plain text only.
+      toolConfig: { functionCallingConfig: { mode: "NONE" } },
+      generationConfig: {
+        maxOutputTokens: 2048,
+        temperature:     0.7,
+      },
+    }),
   });
 
-  if (!upstream.ok || !upstream.body) {
-    const errBody = await upstream.text();
-    console.error(`[global-copilot] Gemini HTTP ${upstream.status}: ${errBody.slice(0, 400)}`);
-    return new Response(`Upstream error: ${upstream.status}`, {
+  if (!streamRes.ok || !streamRes.body) {
+    const errBody = await streamRes.text();
+    console.error(`[global-copilot] phase2 Gemini HTTP ${streamRes.status}: ${errBody.slice(0, 400)}`);
+    return new Response(`Upstream error: ${streamRes.status}`, {
       status: 502,
       headers: corsHeaders,
     });
   }
 
-  // 4. Re-emit Gemini SSE as a plain text stream of deltas.
-  //    @ai-sdk/react TextStreamChatTransport just concatenates the chunks.
-  const reader  = upstream.body.getReader();
+  const reader  = streamRes.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
@@ -529,20 +702,16 @@ serve(async (req) => {
           if (done) break;
           pending += decoder.decode(value, { stream: true });
 
-          // SSE events are separated by blank lines (\n\n). Each event may
-          // contain multiple "data:" lines but Gemini only sends one per event.
           let idx: number;
           while ((idx = pending.indexOf("\n\n")) !== -1) {
             const eventBlock = pending.slice(0, idx);
             pending = pending.slice(idx + 2);
-            // Each line of the block — handle "data:" prefixed entries
             for (const line of eventBlock.split("\n")) {
               const delta = extractDelta(line.trim());
               if (delta) controller.enqueue(encoder.encode(delta));
             }
           }
         }
-        // Drain any final unterminated event
         if (pending.trim()) {
           for (const line of pending.split("\n")) {
             const delta = extractDelta(line.trim());
@@ -550,12 +719,14 @@ serve(async (req) => {
           }
         }
       } catch (e) {
-        console.error("[global-copilot] stream error:", (e as Error).message);
+        console.error("[global-copilot] phase2 stream error:", (e as Error).message);
       } finally {
         controller.close();
       }
     },
   });
+
+  console.log(`[global-copilot] ============ AGENTIC END (streaming phase2) ============`);
 
   return new Response(stream, {
     status: 200,
