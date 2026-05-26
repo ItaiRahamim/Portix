@@ -525,6 +525,64 @@ useEffect(() => {
 
 ---
 
+### [2026-05-26] Vercel build failed — `next/typescript` missing from ESLint config
+
+**File:** `.eslintrc.json`
+
+**What happened:** `npm run build` on Vercel failed with `Error: Definition for rule '@typescript-eslint/no-explicit-any' was not found.` for every file that contained `// eslint-disable-next-line @typescript-eslint/no-explicit-any` comments.
+
+**Root cause:** Project lacked `.eslintrc.json` entirely. Initial fix extending only `["next/core-web-vitals"]` reproduced the error because that preset does not load the `@typescript-eslint` plugin — the disable-comments referenced an unloaded rule.
+
+**Fix:** Extend both presets:
+```json
+{ "extends": ["next/core-web-vitals", "next/typescript"] }
+```
+`next/typescript` loads `@typescript-eslint/eslint-plugin` so the disable comments resolve. `npm run lint` now passes (warnings only, no errors).
+
+---
+
+### [2026-05-26] Migration 00344 push blocked — `CREATE OR REPLACE VIEW` column drift
+
+**File:** `supabase/migrations/00344_security_and_rls_fixes.sql`
+
+**What happened:** `supabase db push` failed with `ERROR: cannot change name of view column "shipment_number" to "ai_audit_results" (SQLSTATE 42P16)` when applying the `v_containers` recreation.
+
+**Root cause:** Remote `portix.containers` table column order had drifted from local schema (e.g. new `ai_audit_results` column). The view uses `SELECT c.*, …` so the expanded column ordering differed between local and remote. Postgres `CREATE OR REPLACE VIEW` can only **append** columns — it cannot reorder or rename existing ones.
+
+**Fix:** Replaced `CREATE OR REPLACE VIEW` with `DROP VIEW IF EXISTS portix.v_containers CASCADE; CREATE VIEW …` for all three views (`v_containers`, `v_documents_public`, `v_import_licenses`). CASCADE handles dependent objects; recreation rebuilds them cleanly. Migration applied successfully.
+
+**Rule:** Any view migration that uses `SELECT t.*` from a table that may have drifted MUST use `DROP VIEW IF EXISTS … CASCADE` + `CREATE VIEW`, never `CREATE OR REPLACE VIEW`.
+
+---
+
+### [2026-05-26] Remote migration history empty — `supabase db push` would re-run 43 migrations
+
+**Issue:** `supabase migration list` showed `Remote` column blank for every migration 00301–00343 (existing live DB had all schema applied but no migration history rows in `supabase_migrations.schema_migrations`). Running `supabase db push` would attempt to re-apply all 43, including destructive ones.
+
+**Fix:** Sync history without executing SQL:
+```bash
+for v in 00301 00302 ... 00343; do
+  npx supabase migration repair --status applied $v
+done
+```
+After repair, `supabase db push` correctly only sent the one new migration (00344).
+
+---
+
+### [2026-05-26] Migration 00344 — Security & RLS hardening (applied)
+
+**File:** `supabase/migrations/00344_security_and_rls_fixes.sql`
+
+Three live-DB security fixes applied:
+
+1. **`security_invoker = true` on views** (`v_containers`, `v_documents_public`, `v_import_licenses`). Previously the views ran with default `SECURITY DEFINER` semantics so RLS on underlying tables was bypassed (view owner's permissions used). Now RLS is enforced against the calling user — fixes a privilege escalation vector where any authenticated user could read all containers/documents/licenses via the views.
+
+2. **`portix.activity_logs` INSERT policy tightened.** Was `WITH CHECK (true)` → any authenticated user could forge log rows for any container. Now requires `container_id` in the caller's owned containers OR (for `customs_agent`) in shipments where `customs_agent_id = auth.uid()`.
+
+3. **`portix.container_costs` customs_agent SELECT tightened.** Was role-check only → agents could see every container's costs across the platform. Now restricted to containers whose parent shipment is assigned to that agent (`shipments.customs_agent_id = auth.uid()`).
+
+---
+
 ### [2026-05-26] Phase 2 Empty Stream (Agentic RAG)
 
 **File:** `supabase/functions/global-copilot/index.ts`
