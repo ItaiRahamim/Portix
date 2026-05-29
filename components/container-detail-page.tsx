@@ -733,9 +733,12 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
   const [advancingStatus, setAdvancingStatus] = useState(false);
 
   // AI document audit state
+  // Single source of truth for "loading" is auditRunning. auditResults only ever
+  // holds a real array (audit complete) or null (never run / failed). Conflating
+  // null with "loading" used to wedge the UI into a permanent spinner when the
+  // DB column defaulted to NULL for non-audited containers.
   const [auditRunning, setAuditRunning] = useState(false);
-  const [auditResults, setAuditResults] = useState<AuditDiscrepancy[] | null | undefined>(undefined);
-  // undefined = never run | null = loading | AuditDiscrepancy[] = result
+  const [auditResults, setAuditResults] = useState<AuditDiscrepancy[] | null>(null);
 
   // Claims tab state
   const [containerClaims, setContainerClaims] = useState<Claim[]>([]);
@@ -758,9 +761,13 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
     ]);
     setContainer(c);
     setDocs(d);
-    // Restore audit results from DB if audit was previously run
-    if (c && c.ai_audit_results !== undefined) {
+    // Restore audit results from DB ONLY when a real audit ran (array present).
+    // SQL NULL → JS null is the default for never-audited containers; never treat
+    // it as "loading" here. The audit panel only renders when there's an array.
+    if (c && Array.isArray(c.ai_audit_results)) {
       setAuditResults(c.ai_audit_results);
+    } else {
+      setAuditResults(null);
     }
     setLoading(false);
   }, [containerId, role]);
@@ -873,8 +880,12 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
 
   async function handleRunAudit() {
     if (!container) return;
+    // auditRunning is the SOLE loading signal — do not null out auditResults
+    // here. The previous "stale results then spinner" sequence used to leave
+    // the spinner visible if the request silently hung; with auditRunning
+    // gating the spinner, the existing results stay visible until the new
+    // ones (or an error) land.
     setAuditRunning(true);
-    setAuditResults(null); // null = loading
     try {
       const results = await runContainerAudit(container.id);
       setAuditResults(results);
@@ -884,7 +895,6 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         toast.warning(`Audit found ${results.length} discrepanc${results.length === 1 ? "y" : "ies"}.`);
       }
     } catch (e) {
-      setAuditResults(undefined); // revert to "never run"
       toast.error(`Audit failed: ${(e as Error).message}`, { duration: 10000 });
     } finally {
       setAuditRunning(false);
@@ -1291,13 +1301,15 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
         </CardHeader>
         <CardContent>
           {/* ── AI Audit Results banner ─────────────────────────────── */}
-          {auditResults === null && (
+          {/* Spinner is gated on auditRunning ONLY. Persisted null in DB never
+              counts as "in progress" — that was the bug that pinned the UI.   */}
+          {auditRunning && (
             <div className="flex items-center gap-2 text-sm text-gray-500 mb-4 px-1">
               <Loader2 className="w-4 h-4 animate-spin" />
               Running document cross-validation…
             </div>
           )}
-          {Array.isArray(auditResults) && auditResults.length === 0 && (
+          {!auditRunning && Array.isArray(auditResults) && auditResults.length === 0 && (
             <Alert className="mb-4 border-emerald-200 bg-emerald-50">
               <ShieldCheck className="h-4 w-4 text-emerald-600" />
               <AlertTitle className="text-emerald-700">All Clear</AlertTitle>
@@ -1306,7 +1318,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
               </AlertDescription>
             </Alert>
           )}
-          {Array.isArray(auditResults) && auditResults.length > 0 && (
+          {!auditRunning && Array.isArray(auditResults) && auditResults.length > 0 && (
             <Alert variant="destructive" className="mb-4">
               <AlertTriangle className="h-4 w-4" />
               <AlertTitle>
