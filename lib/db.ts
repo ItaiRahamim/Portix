@@ -272,10 +272,9 @@ export async function updateContainerDates(
 // ─── Documents ────────────────────────────────────────────────────────────────
 
 /**
- * Returns all documents for a container, straight off portix.documents (RLS
- * enforces per-role row access).
- * - customs_agent: selects "*" (internal_note included).
- * - importer/supplier: selects the public column list (internal_note excluded).
+ * Returns all documents for a container via the get_container_documents RPC.
+ * The RPC gates access to the container's importer / supplier / assigned
+ * customs agent and nulls internal_note for non-agents (server-side decision).
  */
 /**
  * Result envelope for document fetching. Surfacing the error to callers lets
@@ -292,41 +291,28 @@ export interface GetDocumentsResult {
   } | null;
 }
 
-// Non-sensitive document columns — everything EXCEPT internal_note.
-// Importer/supplier select this explicit list straight off portix.documents so
-// internal_note never leaves the DB for them. Replaces the v_documents_public
-// view, which regressed in migration 00344 (security_invoker flip emptied the
-// importer/supplier read path) and also silently dropped the dual-approval
-// timestamp columns it never listed.
-const DOCUMENT_PUBLIC_COLUMNS =
-  "id, container_id, document_type, status, storage_path, file_name, " +
-  "file_size_bytes, mime_type, uploaded_by, reviewed_by, rejection_reason, " +
-  "document_number, issue_date, notes, uploaded_at, reviewed_at, " +
-  "created_at, updated_at, importer_approved_at, agent_approved_at";
-
 export async function getDocumentsForContainer(
   containerId: string,
-  includeInternalNote = false
+  // Kept for call-site compatibility. internal_note visibility is now decided
+  // server-side by the RPC (assigned customs agent only), not by this flag —
+  // a route-derived flag was spoofable anyway.
+  _includeInternalNote = false
 ): Promise<GetDocumentsResult> {
   const supabase = createBrowserSupabaseClient();
 
-  // Always read the canonical portix.documents table (RLS-enforced per role).
-  // Customs agents get internal_note; importer/supplier get the public column
-  // list only. No view in the read path → no security_invoker view quirks.
-  const columns = includeInternalNote ? "*" : DOCUMENT_PUBLIC_COLUMNS;
-
-  const { data, error } = await supabase
-    .from("documents")
-    .select(columns)
-    .eq("container_id", containerId)
-    .order("document_type");
+  // Read through the get_container_documents RPC (SECURITY DEFINER, gated by an
+  // explicit ownership check). This deliberately does NOT depend on documents
+  // RLS: migration 00344 enforced RLS on the read path (via the security_invoker
+  // view) and that returns zero rows on production even for the container owner,
+  // blanking the checklist. The RPC restores the months-long working behavior
+  // while still gating access and hiding internal_note from non-agents.
+  const { data, error } = await supabase.rpc("get_container_documents", {
+    p_container_id: containerId,
+  });
 
   if (error) {
-    // Log the full payload so the actual root cause is visible in the console
-    // (Postgres error code, hint, details — not just .message).
-    console.error("[db] getDocumentsForContainer failed:", {
-      table: "documents",
-      includeInternalNote,
+    console.error("[db] getDocumentsForContainer RPC failed:", {
+      fn: "get_container_documents",
       containerId,
       message: error.message,
       code:    error.code,
@@ -344,7 +330,7 @@ export async function getDocumentsForContainer(
     };
   }
 
-  return { docs: data ?? [], error: null };
+  return { docs: (data ?? []) as Document[], error: null };
 }
 
 export async function updateDocumentStatus(
