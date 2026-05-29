@@ -276,10 +276,25 @@ export async function updateContainerDates(
  * - customs_agent: queries 'documents' table directly (has internal_note via RLS)
  * - importer/supplier: queries 'v_documents_public' (internal_note excluded)
  */
+/**
+ * Result envelope for document fetching. Surfacing the error to callers lets
+ * the UI render a real banner instead of pretending "no documents" — which
+ * masked a "permission denied for view v_documents_public" failure for hours.
+ */
+export interface GetDocumentsResult {
+  docs: Document[];
+  error: {
+    message: string;
+    code?: string;
+    details?: string;
+    hint?: string;
+  } | null;
+}
+
 export async function getDocumentsForContainer(
   containerId: string,
   includeInternalNote = false
-): Promise<Document[]> {
+): Promise<GetDocumentsResult> {
   const supabase = createBrowserSupabaseClient();
   const view = includeInternalNote ? "documents" : "v_documents_public";
 
@@ -290,10 +305,28 @@ export async function getDocumentsForContainer(
     .order("document_type");
 
   if (error) {
-    console.error("[db] getDocumentsForContainer:", error.message);
-    return [];
+    // Log the full payload so the actual root cause is visible in the console
+    // (Postgres error code, hint, details — not just .message).
+    console.error("[db] getDocumentsForContainer failed:", {
+      view,
+      containerId,
+      message: error.message,
+      code:    error.code,
+      details: error.details,
+      hint:    error.hint,
+    });
+    return {
+      docs:  [],
+      error: {
+        message: error.message,
+        code:    error.code,
+        details: error.details ?? undefined,
+        hint:    error.hint    ?? undefined,
+      },
+    };
   }
-  return data ?? [];
+
+  return { docs: data ?? [], error: null };
 }
 
 export async function updateDocumentStatus(

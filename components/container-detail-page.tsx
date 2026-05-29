@@ -723,6 +723,7 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
 
   const [container, setContainer] = useState<ContainerView | null>(null);
   const [docs, setDocs] = useState<Document[]>([]);
+  const [docsError, setDocsError] = useState<{ message: string; code?: string; hint?: string; details?: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadPreselect, setUploadPreselect] = useState<{
@@ -760,7 +761,8 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
       getDocumentsForContainer(containerId, role === "customs-agent"),
     ]);
     setContainer(c);
-    setDocs(d);
+    setDocs(d.docs);
+    setDocsError(d.error);
     // Restore audit results from DB ONLY when a real audit ran (array present).
     // SQL NULL → JS null is the default for never-audited containers; never treat
     // it as "loading" here. The audit panel only renders when there's an array.
@@ -1300,6 +1302,28 @@ export function ContainerDetailPage({ role }: ContainerDetailPageProps) {
           </div>
         </CardHeader>
         <CardContent>
+          {/* ── Documents fetch error banner ─────────────────────────── */}
+          {/* Surfaces DB / RLS / grant failures instead of pretending the
+              container has zero documents. Shows the real Postgres message,
+              code, and hint so the issue is diagnosable from the live app.   */}
+          {docsError && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Failed to load documents</AlertTitle>
+              <AlertDescription>
+                <div className="text-sm font-medium">{docsError.message}</div>
+                {docsError.code && (
+                  <div className="text-xs mt-1 opacity-80">Code: {docsError.code}</div>
+                )}
+                {docsError.hint && (
+                  <div className="text-xs mt-1 opacity-80">Hint: {docsError.hint}</div>
+                )}
+                {docsError.details && (
+                  <div className="text-xs mt-1 opacity-80">Details: {docsError.details}</div>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
           {/* ── AI Audit Results banner ─────────────────────────────── */}
           {/* Spinner is gated on auditRunning ONLY. Persisted null in DB never
               counts as "in progress" — that was the bug that pinned the UI.   */}
