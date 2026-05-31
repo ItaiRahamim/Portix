@@ -278,16 +278,59 @@ portix.media_type:       'image' | 'video' | 'document'
 5. DB-enforced: rejected document must have reason (CHECK constraint). importer ≠ supplier (CHECK). etd < eta (CHECK).
 6. Column-level RLS on `documents.internal_note`: only `customs_agent` can read (via `documents_public` view).
 
-### RLS Policy Matrix
+### CORE ARCHITECTURE RULE — Company-Level Access
 
-| Table | Importer | Supplier | Customs Agent |
+**Access control in Portix is COMPANY-LEVEL, not User-Level.**
+
+Never use strict `auth.uid() = owner_id` checks for business objects. Multiple users from the same company must be able to see and act on their company's data (containers, documents, claims, invoices, etc.).
+
+**Identity signals:**
+- **Importers**: match via `profiles.company_name` (TEXT, guarded `!= ''` to prevent empty-string default from matching all unregistered users)
+- **Suppliers**: match via `profiles.supplier_org_id` (UUID FK, guarded `IS NOT NULL` to prevent null from granting company-level access)
+- **Customs agents**: UNCHANGED — role-based (`is_customs_agent()`) or shipment-assignment FK (`shipments.customs_agent_id`)
+
+**Implemented by** (migration 00350):
+- Two new STABLE SECURITY DEFINER helpers: `portix.get_user_company_name()`, `portix.get_user_supplier_org_id()`
+- Index: `idx_profiles_company_name WHERE company_name != ''`
+- All business-table RLS policies rewritten to include the company gate pattern alongside direct uid match
+
+**Gate pattern in policies:**
+```sql
+-- Importer side (company_name match)
+importer_id IN (
+    SELECT id FROM portix.profiles
+    WHERE id = auth.uid()
+       OR (company_name = portix.get_user_company_name() AND company_name != '')
+)
+
+-- Supplier side (supplier_org_id match)
+supplier_id IN (
+    SELECT id FROM portix.profiles
+    WHERE id = auth.uid()
+       OR (supplier_org_id = portix.get_user_supplier_org_id()
+           AND portix.get_user_supplier_org_id() IS NOT NULL)
+)
+```
+
+No recursion risk: `portix.profiles` has a permissive `FOR SELECT TO authenticated` policy so sub-selects on profiles from within other table policies are safe. Helper functions use SECURITY DEFINER to bypass RLS on profiles entirely.
+
+### RLS Policy Matrix (Company-Level)
+
+| Table | Importer (company) | Supplier (company) | Customs Agent |
 |---|---|---|---|
-| `profiles` | Own row | Own row | Own row |
-| `containers` | `importer_id = uid()` | `supplier_id = uid()` | `status = 'waiting_customs_review'` |
-| `documents` | Read own containers | Read+UPDATE own (not `internal_note`) | Read+UPDATE all in review |
-| `document_chunks` | RLS blocks direct read — use `match_user_document_chunks` RPC | Same | Same |
-| `claims` | Own (`importer_id`) | Own (`supplier_id`) | ❌ No access |
-| `invoices` | Own (`importer_id`) | Own (`supplier_id`) | ❌ No access |
+| `profiles` | Own row only | Own row only | Own row only |
+| `containers` | All where `importer_id` ∈ same `company_name` | All where `supplier_id` ∈ same `supplier_org_id` | All containers (role-based) |
+| `shipments` | Where `created_by` ∈ company OR has container in shipment | Same via supplier_org_id | All (role-based) |
+| `documents` | All docs for company containers | Same | All + `internal_note` (role-based) |
+| `document_chunks` | Via `match_user_document_chunks` RPC (company-scoped) | Same | Same |
+| `claims` | All where `importer_id` ∈ company | All where `supplier_id` ∈ company | ❌ No access |
+| `invoices` | All where `importer_id` ∈ company | All where `supplier_id` ∈ company | All (read-only, role-based) |
+| `payments` | Via invoice → company | Via invoice → company | ❌ No access |
+| `claim_messages` | Via claim → company party | Via claim → company party | ❌ No access |
+| `activity_logs` | Company containers | Company containers | All (role-based) |
+| `container_costs` | Company containers | Company containers | Assigned only (shipment FK) |
+| `pre_loading_media` | Company containers | Company containers | ❌ No access |
+| `import_licenses` | Full access if `importer_id` ∈ company | Read if `supplier_id` ∈ company | ❌ No access |
 
 ### Role Detection in Code
 
@@ -522,6 +565,23 @@ useEffect(() => {
 ## 5. Error Ledger
 
 > Log format: `[YYYY-MM-DD] Title — Root cause + fix.`
+
+---
+
+### [2026-05-31] Empty data for all users — user-level vs company-level RLS mismatch
+
+**Root cause:** The live DB's `auth.uid() = owner_id` policies blocked any user whose profile ID differed from the FK stored on the container/document/invoice. In the live environment, `racheli200025@gmail.com` (session user) and `racheli@portix.test` (the FK `importer_id` on every container) are two separate `auth.users` rows — both employees of the same company "Arie and Hamudi North Fruits LTD". Strict user-level matching returns empty for any teammate account.
+
+**Secondary discovery:** Migration history was repaired (marked as applied) without executing the SQL. This means most business-table RLS policies from 00302 simply didn't exist in the live DB. Containers were effectively wide-open (RLS enabled but no policies = deny-all for authenticated users). This compounded the empty data issue.
+
+**Fix:** Migration 00350 implements company-level access control globally:
+- Two new helper functions: `portix.get_user_company_name()` and `portix.get_user_supplier_org_id()` (STABLE SECURITY DEFINER)
+- Partial index on `profiles.company_name WHERE company_name != ''`
+- All business-table policies rewritten with company gate pattern (direct uid OR company match)
+- `get_container_documents` RPC updated with company-level gate (LANGUAGE sql)
+- `match_user_document_chunks` RPC updated for AI copilot company-scoped queries
+
+**Rule established:** Access is COMPANY-LEVEL in Portix. Importer identity = `company_name` text match (guarded). Supplier identity = `supplier_org_id` UUID FK (guarded). Never strict `uid() = owner_id` for business objects.
 
 ---
 
