@@ -289,30 +289,35 @@ Never use strict `auth.uid() = owner_id` checks for business objects. Multiple u
 - **Suppliers**: match via `profiles.supplier_org_id` (UUID FK, guarded `IS NOT NULL` to prevent null from granting company-level access)
 - **Customs agents**: UNCHANGED — role-based (`is_customs_agent()`) or shipment-assignment FK (`shipments.customs_agent_id`)
 
-**Implemented by** (migration 00350):
-- Two new STABLE SECURITY DEFINER helpers: `portix.get_user_company_name()`, `portix.get_user_supplier_org_id()`
-- Index: `idx_profiles_company_name WHERE company_name != ''`
-- All business-table RLS policies rewritten to include the company gate pattern alongside direct uid match
+**Implemented by** (migrations 00350 → 00352):
 
-**Gate pattern in policies:**
+| Function | Type | Purpose |
+|---|---|---|
+| `portix.get_user_company_name()` | STABLE SECURITY DEFINER | Returns caller's `company_name` |
+| `portix.get_user_supplier_org_id()` | STABLE SECURITY DEFINER | Returns caller's `supplier_org_id` |
+| `portix.get_company_importer_ids()` | STABLE SECURITY DEFINER | All profile UUIDs in caller's importer company |
+| `portix.get_company_supplier_ids()` | STABLE SECURITY DEFINER | All profile UUIDs in caller's supplier org |
+| `portix.is_customs_agent_for_shipment(uuid)` | STABLE SECURITY DEFINER | Is `auth.uid()` the assigned agent for a shipment? |
+| `portix.does_company_own_shipment(uuid)` | STABLE SECURITY DEFINER | Does caller's company own any container in a shipment? |
+
+Index: `idx_profiles_company_name ON portix.profiles(company_name) WHERE company_name != ''`
+
+**Gate pattern in policies (current — 00351/00352):**
 ```sql
--- Importer side (company_name match)
-importer_id IN (
-    SELECT id FROM portix.profiles
-    WHERE id = auth.uid()
-       OR (company_name = portix.get_user_company_name() AND company_name != '')
-)
+-- Importer side: call SECURITY DEFINER set-returning function (bypasses profiles RLS)
+importer_id = ANY(ARRAY(SELECT portix.get_company_importer_ids()))
 
--- Supplier side (supplier_org_id match)
-supplier_id IN (
-    SELECT id FROM portix.profiles
-    WHERE id = auth.uid()
-       OR (supplier_org_id = portix.get_user_supplier_org_id()
-           AND portix.get_user_supplier_org_id() IS NOT NULL)
-)
+-- Supplier side
+supplier_id = ANY(ARRAY(SELECT portix.get_company_supplier_ids()))
+
+-- Shipments: use bypass helper to avoid cross-table recursion
+portix.does_company_own_shipment(id)
+
+-- Customs container/document: flat role check (no cross-table joins)
+portix.is_customs_agent()
 ```
 
-No recursion risk: `portix.profiles` has a permissive `FOR SELECT TO authenticated` policy so sub-selects on profiles from within other table policies are safe. Helper functions use SECURITY DEFINER to bypass RLS on profiles entirely.
+**Anti-recursion rule (critical):** NEVER write a raw `SELECT FROM portix.containers` inside a `portix.shipments` RLS policy, or a raw `SELECT FROM portix.shipments` inside a `portix.containers` RLS policy. That creates a `containers ↔ shipments` loop (ERROR 42P17). All cross-table lookups in policies MUST use a SECURITY DEFINER helper function that reads the target table without triggering its RLS.
 
 ### RLS Policy Matrix (Company-Level)
 
@@ -320,7 +325,7 @@ No recursion risk: `portix.profiles` has a permissive `FOR SELECT TO authenticat
 |---|---|---|---|
 | `profiles` | Own row only | Own row only | Own row only |
 | `containers` | All where `importer_id` ∈ same `company_name` | All where `supplier_id` ∈ same `supplier_org_id` | All containers (role-based) |
-| `shipments` | Where `created_by` ∈ company OR has container in shipment | Same via supplier_org_id | All (role-based) |
+| `shipments` | Where `created_by` ∈ company OR `does_company_own_shipment()` | Same | All (role-based) |
 | `documents` | All docs for company containers | Same | All + `internal_note` (role-based) |
 | `document_chunks` | Via `match_user_document_chunks` RPC (company-scoped) | Same | Same |
 | `claims` | All where `importer_id` ∈ company | All where `supplier_id` ∈ company | ❌ No access |
@@ -565,6 +570,37 @@ useEffect(() => {
 ## 5. Error Ledger
 
 > Log format: `[YYYY-MM-DD] Title — Root cause + fix.`
+
+---
+
+### [2026-06-02] RLS infinite recursion (42P17) — containers ↔ shipments loop
+
+**Migrations:** 00351 (partial fix), 00352 (complete fix)
+
+**What happened:** After company-level policies were added, querying `portix.containers` raised `ERROR 42P17: infinite recursion detected in policy for relation "containers"` → all rows denied.
+
+**Root cause:** Two cross-table edges in RLS policy bodies:
+1. `shipments` company policy: `id IN (SELECT shipment_id FROM portix.containers ...)` → triggers **containers** RLS
+2. `containers` customs policy (00313 pattern): `EXISTS (SELECT FROM portix.shipments ...)` → triggers **shipments** RLS
+→ `containers → shipments → containers → ∞`
+
+**Fix:** Created four SECURITY DEFINER helpers (`get_company_importer_ids`, `get_company_supplier_ids`, `is_customs_agent_for_shipment`, `does_company_own_shipment`) that read the target table **without triggering its RLS**. Replaced all raw cross-table SELECTs in policy bodies with calls to these functions. Dropped the recursive customs "assigned" container/document policies; replaced with flat `is_customs_agent()` role check.
+
+**Invariant:** No RLS policy may do a raw `SELECT FROM portix.containers` inside a shipments policy or vice versa. All cross-table lookups in policies must use SECURITY DEFINER helpers.
+
+---
+
+### [2026-06-02] Profiles RLS deny-all broke v_containers + company gate policies
+
+**Migrations:** 00351
+
+**What happened:** Even after company-level policies existed (00350), dashboard showed 0 containers. Not a logic error.
+
+**Root cause:** `portix.profiles` had RLS **enabled** in live DB but the permissive `"any authenticated user can read for display"` policy (from 00302) was **never executed** (migration was repaired-as-applied without running SQL). Two failure paths:
+1. `v_containers` does `INNER JOIN portix.profiles` with `security_invoker=true` → JOIN denied → 0 rows
+2. 00350 policies used inline `SELECT id FROM portix.profiles WHERE ...` — RLS-evaluated, profiles denied → subquery returned `[]` → `importer_id = ANY([])` → FALSE for every row
+
+**Fix:** 00351 restored the permissive profiles SELECT policy and introduced `get_company_importer_ids()` + `get_company_supplier_ids()` as SECURITY DEFINER functions. Rewrote all policy bodies to call these (bypasses profiles RLS entirely).
 
 ---
 
